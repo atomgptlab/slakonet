@@ -16,6 +16,8 @@ setuptools.setup(
         "jarvis-tools>=2021.07.19",
         "torch",
         "h5py",
+        "ase",
+        "spglib",
     ],
     long_description=long_description,
     long_description_content_type="text/markdown",
