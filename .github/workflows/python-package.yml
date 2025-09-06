@@ -28,7 +28,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         python -m pip install uv 
-        pip install numpy scipy jarvis-tools flake8 pytest matplotlib torch h5py
+        pip install numpy scipy jarvis-tools flake8 pytest matplotlib torch h5py ase
         #if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
         pip install -e .
         pytest
