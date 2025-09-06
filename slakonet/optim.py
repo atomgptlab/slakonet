@@ -1502,7 +1502,7 @@ def train_multi_vasp_skf_parameters(
 
 
 def example_multi_vasp_training(
-    vasprun_files=["tests/vasprun-1002.xml", "tests/vasprun-107.xml"]
+    vasprun_files=["tests/vasprun-1002.xml", "tests/vasprun-107.xml"], model=""
 ):
     """Example demonstrating training on multiple VASP calculations"""
 
@@ -1510,12 +1510,12 @@ def example_multi_vasp_training(
     print("MULTI-VASP SKF PARAMETER OPTIMIZATION")
     print("=" * 70)
 
-    multi_optimizer = MultiElementSkfParameterOptimizer.load_model(
-        "tests/slakonet_v1_sic"
-    )
+    # multi_optimizer = MultiElementSkfParameterOptimizer.load_model(
+    #    "tests/slakonet_v1_sic"
+    # )
 
     trained_optimizer, history, data_loader = train_multi_vasp_skf_parameters(
-        multi_element_optimizer=multi_optimizer,
+        multi_element_optimizer=model,
         vasprun_paths=vasprun_files,
         num_epochs=2,
         learning_rate=0.001,
@@ -1617,8 +1617,6 @@ def analyze_multi_vasp_performance(
     return results
 
 
-example_multi_vasp_training()
-
 """
 if __name__ == "__main__":
     # Run multi-VASP training example
@@ -1630,4 +1628,6 @@ if __name__ == "__main__":
     performance_results = analyze_multi_vasp_performance(
         data_loader, trained_optimizer, "multi_vasp_results"
     )
+    example_multi_vasp_training()
+
 """
