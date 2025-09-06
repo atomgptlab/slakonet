@@ -15,8 +15,6 @@ print(f"Test directory: {test_dir}")
 print(f"Model path: {model_path}")
 print(f"Model path exists: {os.path.exists(model_path)}")
 
-if not os.path.exists(model_path):
-    pytest.fail(f"Model directory not found at: {model_path}")
 
 model = MultiElementSkfParameterOptimizer.load_model(
     model_path, method="state_dict"
