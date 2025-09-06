@@ -1295,7 +1295,7 @@ def train_multi_vasp_skf_parameters(
         multi_element_optimizer.parameters(), lr=learning_rate
     )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.8, patience=10, verbose=True
+        optimizer, mode="min", factor=0.8, patience=10
     )
 
     print(f"\nStarting multi-VASP training:")
@@ -1501,61 +1501,23 @@ def train_multi_vasp_skf_parameters(
     return multi_element_optimizer, loss_history, data_loader
 
 
-def example_multi_vasp_training():
+def example_multi_vasp_training(
+    vasprun_files=["tests/vasprun-1002.xml", "tests/vasprun-107.xml"]
+):
     """Example demonstrating training on multiple VASP calculations"""
-
-    # Example geometry (you might want to extract this from the first VASP file)
-    geometry = Geometry(
-        torch.tensor([[14, 6]]),  # Si and C atoms
-        torch.tensor([[[7.4169, 5.2445, 12.8464], [1.0596, 0.7492, 1.8352]]]),
-        torch.tensor(
-            [
-                [
-                    [6.3573, -0.0000, 3.6704],
-                    [2.1191, 5.9937, 3.6704],
-                    [-0.0000, -0.0000, 7.3408],
-                ]
-            ]
-        ),
-    )
 
     print("=" * 70)
     print("MULTI-VASP SKF PARAMETER OPTIMIZATION")
     print("=" * 70)
 
-    # Create multi-element optimizer
-    skf_directory = "tests/"  # Your SKF directory
-    skf_directory = "../../../ParameterSets/complete_set"  # Your SKF directory
-
-    multi_optimizer = MultiElementSkfParameterOptimizer(
-        skf_directory=skf_directory,
-        geometry=geometry,  # Will be overridden by VASP geometries
+    multi_optimizer = MultiElementSkfParameterOptimizer.load_model(
+        "tests/slakonet_v1_sic"
     )
-
-    # Train on multiple VASP files
-    vasprun_patterns = [
-        "tests/vasprun1.xml",
-        "tests/vasprun2.xml",
-        "tests/vasprun*.xml",  # Glob pattern to catch all
-        # Or just: "tests/vasprun*.xml"
-    ]
-
-    # Choose one of these approaches:
-
-    # Approach 1: Explicit list
-    vasprun_files = [
-        "tests/vasprun1.xml",
-        "tests/vasprun2.xml",
-        "tests/vasprun3.xml",
-    ]
-
-    # Approach 2: Glob pattern (easier!)
-    # vasprun_files = "tests/vasprun*.xml"
 
     trained_optimizer, history, data_loader = train_multi_vasp_skf_parameters(
         multi_element_optimizer=multi_optimizer,
         vasprun_paths=vasprun_files,
-        num_epochs=100,
+        num_epochs=2,
         learning_rate=0.001,
         batch_size=None,  # Use all datasets each epoch
         plot_frequency=5,
@@ -1655,6 +1617,9 @@ def analyze_multi_vasp_performance(
     return results
 
 
+example_multi_vasp_training()
+
+"""
 if __name__ == "__main__":
     # Run multi-VASP training example
     trained_optimizer, loss_history, data_loader = (
@@ -1665,3 +1630,4 @@ if __name__ == "__main__":
     performance_results = analyze_multi_vasp_performance(
         data_loader, trained_optimizer, "multi_vasp_results"
     )
+"""
