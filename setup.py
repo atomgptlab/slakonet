@@ -12,6 +12,7 @@ setuptools.setup(
     slakonet=[
         "numpy>=1.22.0",
         "scipy>=1.6.3",
+        "matplotlib",
         "jarvis-tools>=2021.07.19",
         "torch==2.0.0",
     ],
