@@ -7,4 +7,4 @@ def test_si():
  model = MultiElementSkfParameterOptimizer.load_model(model_path, method='state_dict')
  get_gap(jid='JVASP-1002',model=model,plot=True)
 
-test_si()
+# test_si()
