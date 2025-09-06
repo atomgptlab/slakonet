@@ -13,6 +13,7 @@ setuptools.setup(
         "numpy>=1.22.0",
         "scipy>=1.6.3",
         "jarvis-tools>=2021.07.19",
+        "torch==2.0.0",
     ],
     long_description=long_description,
     long_description_content_type="text/markdown",
