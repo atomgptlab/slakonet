@@ -1,0 +1,25 @@
+{
+  "skf_directory": "slakoset_sic",
+  "elements_in_system": [],
+  "element_pairs": [
+    [
+      "Si",
+      "Si"
+    ],
+    [
+      "C",
+      "C"
+    ],
+    [
+      "C",
+      "Si"
+    ]
+  ],
+  "available_pairs": [
+    "C-C",
+    "C-Si",
+    "Si-C",
+    "Si-Si"
+  ],
+  "class_name": "MultiElementSkfParameterOptimizer"
+}
