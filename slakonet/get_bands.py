@@ -6,7 +6,11 @@ from jarvis.core.kpoints import Kpoints3D as Kpoints
 from slakonet.atoms import Geometry
 import torch
 import numpy as np
-from slakonet.optim import MultiElementSkfParameterOptimizer
+from slakonet.optim import (
+    MultiElementSkfParameterOptimizer,
+    get_atoms,
+    kpts_to_klines,
+)
 import torch
 import numpy as np
 from pathlib import Path
@@ -15,20 +19,6 @@ from slakonet.main import SimpleDftb, generate_shell_dict_upto_Z65
 from slakonet.atoms import Geometry
 from jarvis.core.specie import atomic_numbers_to_symbols
 import matplotlib.pyplot as plt
-
-# Import your model class (make sure this is available)
-# from your_module import MultiElementSkfParameterOptimizer
-dft_3d = data("dft_3d")
-
-
-def get_atoms(jid=""):
-    for i in dft_3d:
-        if i["jid"] == jid:
-            return (
-                Atoms.from_dict(i["atoms"]),
-                i["optb88vdw_bandgap"],
-                i["mbj_bandgap"],
-            )
 
 
 def load_trained_model(model_path, method="state_dict"):
@@ -62,27 +52,6 @@ def load_trained_model(model_path, method="state_dict"):
     # Set model to evaluation mode
     model.eval()
     return model
-
-
-def kpts_to_klines(kpts, default_points=10):
-    """
-    Convert a sequence of k-points into segments for band path plotting.
-
-    Args:
-        kpts (List[np.ndarray] or torch.Tensor): List of k-points (Nx3)
-        default_points (int): Number of interpolation points between each segment
-
-    Returns:
-        torch.Tensor: Tensor of shape (num_segments, 7)
-                      Each row is [kx1, ky1, kz1, kx2, ky2, kz2, n_points]
-    """
-    kpts = np.array(kpts)
-    segments = []
-    for i in range(0, len(kpts) - 1, 2):  # step by 2 to get paired segments
-        k1 = kpts[i]
-        k2 = kpts[i + 1]
-        segments.append([*k1, *k2, default_points])
-    return torch.tensor(segments, dtype=torch.float64)
 
 
 def get_gap(

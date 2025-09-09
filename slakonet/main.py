@@ -153,7 +153,7 @@ class SimpleDftb:
         self.repulsive = repulsive
         self.device = device
         # self.device="cuda"
-        self.device = torch.device("cpu")
+        # self.device = torch.device("cpu")
         print("self.device", self.device)
         self.nelectron = nelectron.to(self.device)
         # Initialize basis
@@ -1970,7 +1970,7 @@ class SimpleDftb:
             # System properties
             "nkpoints": self.max_nk.item(),
             "nbands": self.eigenvalue.shape[-1],
-            "nelectrons": self.nelectron.item(),
+            "nelectrons": int(self.nelectron.item()),
         }
 
         # Add bulk modulus data if requested
@@ -2094,7 +2094,7 @@ class SimpleDftb:
             "cbm_kpoint": band_gap_info["cbm_kpoint"],
             "nkpoints": self.max_nk.item(),
             "nbands": self.eigenvalue.shape[-1],
-            "nelectrons": self.nelectron.item(),
+            "nelectrons": int(self.nelectron.item()),
         }
 
         return properties
@@ -2208,13 +2208,13 @@ if __name__ == "__main__":
     )
     """
 
-    nelectron = torch.tensor([8])  # skparams.qzero.sum(-1)
+    # nelectron = torch.tensor([8])  # skparams.qzero.sum(-1)
     if "atomic_data" in dd:  # and skf_dict["atomic_data"]:
         occupations = dd["atomic_data"]["occupations"]
         nelectron = torch.tensor(
             [2 * sum(occupations)]
         )  # Factor of 2 for spin
-    nelectron = torch.tensor([8])  # skparams.qzero.sum(-1)
+    # nelectron = torch.tensor([8])  # skparams.qzero.sum(-1)
     print("nelectron", nelectron)
     # Create calculator for band structure
     calc_bands = SimpleDftb(

@@ -23,17 +23,18 @@ model = MultiElementSkfParameterOptimizer.load_model(
 
 def test_si():
     # Find the test file directory
-    get_gap(jid="JVASP-1002", model=model, plot=True)
+    bandgap, opt_gap, mbj_gap, calc, formula = get_gap(jid="JVASP-1002", model=model, plot=True)
+    print("bandgap, opt_gap, mbj_gap, calc, formula",bandgap, opt_gap, mbj_gap, calc, formula)
 
 
 def test_training():
     vasprun_files = [
-        os.path.join(test_dir, "vasprun-1002.xml"),
         os.path.join(test_dir, "vasprun-107.xml"),
+        os.path.join(test_dir, "vasprun-1002.xml"),
     ]
     print("vasprun_files", vasprun_files)
     example_multi_vasp_training(vasprun_files, model=model)
 
 
-# test_si()
-# test_training()
+#test_si()
+#test_training()

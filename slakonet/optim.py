@@ -19,7 +19,10 @@ import numpy as np
 import time
 import json
 import os
+from jarvis.core.atoms import Atoms
+from jarvis.db.figshare import data
 from collections import defaultdict
+from jarvis.core.kpoints import Kpoints3D as Kpoints
 from itertools import combinations_with_replacement
 from jarvis.core.specie import atomic_numbers_to_symbols
 from slakonet.skf import Skf
@@ -31,9 +34,39 @@ from jarvis.io.vasp.outputs import Vasprun
 import matplotlib.pyplot as plt
 import matplotlib
 from slakonet.fermi import fermi_search, fermi_smearing
+import random
 
 matplotlib.rcParams["figure.max_open_warning"] = 50
 torch.set_default_dtype(torch.float64)
+
+random_seed = 42
+random.seed(random_seed)
+torch.manual_seed(random_seed)
+np.random.seed(random_seed)
+torch.cuda.manual_seed_all(random_seed)
+try:
+    import torch_xla.core.xla_model as xm
+
+    xm.set_rng_state(random_seed)
+except ImportError:
+    pass
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+os.environ["PYTHONHASHSEED"] = str(random_seed)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(":4096:8")
+torch.use_deterministic_algorithms(True)
+
+dft_3d = data("dft_3d")
+
+
+def get_atoms(jid=""):
+    for i in dft_3d:
+        if i["jid"] == jid:
+            return (
+                Atoms.from_dict(i["atoms"]),
+                i["optb88vdw_bandgap"],
+                i["mbj_bandgap"],
+            )
 
 
 def fermi_dirac(
@@ -100,6 +133,71 @@ def fermi_search(
     return mu.squeeze(-1)
 
 
+def kpts_to_klines(kpts, default_points=10):
+    """
+    Convert a sequence of k-points into segments for band path plotting.
+
+    Args:
+        kpts (list[list[float]] or torch.Tensor): List of k-points (Nx3)
+        default_points (int): Number of interpolation points between each segment
+
+    Returns:
+        torch.Tensor: Tensor of shape (num_segments, 7)
+                      Each row is [kx1, ky1, kz1, kx2, ky2, kz2, n_points]
+    """
+    if not isinstance(kpts, torch.Tensor):
+        kpts = torch.tensor(kpts, dtype=torch.float64)
+
+    num_pairs = (kpts.shape[0] - 1) // 2 + ((kpts.shape[0] - 1) % 2 == 0)
+    segments = []
+
+    for i in range(0, kpts.shape[0] - 1, 2):
+        k1 = kpts[i]
+        k2 = kpts[i + 1]
+        seg = torch.cat(
+            [k1, k2, torch.tensor([default_points], dtype=torch.float64)]
+        )
+        segments.append(seg)
+
+    return torch.stack(segments, dim=0)
+
+
+def get_klines_example(
+    jid="JVASP-1002", model=None, plot=False, default_points=2, line_density=20
+):
+    # jid='JVASP-14636'
+    atoms, opt_gap, mbj_gap = get_atoms(
+        jid
+    )  # Atoms.from_dict(get_jid_data(jid=jid,dataset='dft_3d')['atoms'])
+    # atoms=Atoms.from_poscar("tests/POSCAR")
+    # atoms=Atoms.from_poscar("tests/POSCAR-SiC.vasp")
+    geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
+    # Generate shell dictionary
+    shell_dict = generate_shell_dict_upto_Z65()
+    kpoints = Kpoints().kpath(atoms, line_density=line_density)
+    labels = kpoints.labels
+    xticks = []
+    xtick_labels = []
+    kps = []
+    for ii, i in enumerate(labels):
+        kps.append(kpoints.kpts[ii])
+        lbl = "$" + i + "$"
+        # lbl=lbl.replace("\\G","\G")
+        if ii == 0 and lbl != "$$":
+            xticks.append(ii * int(default_points / 2))
+            xtick_labels.append(lbl)
+
+        if lbl != "$$" and labels[ii] != labels[ii - 1]:
+            xticks.append(ii * int(default_points / 2))
+            xtick_labels.append(lbl)
+            # kps.append(kpoints.kpts[ii])
+
+    # print(xtick_labels)
+    formula = atoms.composition.reduced_formula
+    klines = kpts_to_klines(kpoints.kpts, default_points=default_points)
+    return klines
+
+
 class MultiElementSkfParameterOptimizer(nn.Module):
     """Enhanced Universal SKF parameter optimizer for multi-element systems"""
 
@@ -110,13 +208,15 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         vasprun_path=None,
         available_skf_pairs=None,
         universal_params_file=None,
+        elements_in_system=["Si", "C"],
     ):
         super().__init__()
 
         self.skf_directory = skf_directory
         self.element_pairs = set()
         self.skf_optimizers = nn.ModuleDict()
-        self.elements_in_system = set()
+        self.elements_in_system = set(elements_in_system)
+        # self.elements_in_system = set()
 
         # Atomic number to symbol mapping
         zz = [i for i in range(1, 100)]
@@ -651,6 +751,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
         # Calculate total electron count for the system
         nelectron = self._calculate_system_electrons(geometry, updated_skfs)
+        # print("nelectron2",nelectron)
         # TODO: Specify kpoint option
         # Setup k-lines for band structure
         # klines = self._get_default_klines()
@@ -688,11 +789,11 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             kT = 0.025
             H2E = 27.211
             kT_hartree = kT / H2E
+            print("nelectron1", nelectron)
             fermi_energy = fermi_search(
                 # fermi_energy = fermi_search(
                 eigenvalues=eigenvalues,
-                # n_electrons=nelectron ,
-                n_electrons=nelectron / 2,
+                n_electrons=nelectron,
                 k_weights=calc.k_weights,
                 # k_weights=self.k_weights,
             )
@@ -821,7 +922,6 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         for atomic_num in atomic_nums:
             element_symbol = self.atomic_num_to_symbol.get(atomic_num.item())
             if element_symbol:
-                # Find SKF file that contains this element
                 electrons_for_atom = self._get_electrons_for_element(
                     element_symbol, updated_skfs
                 )
@@ -837,7 +937,8 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             skf_dict = updated_skfs[pair_key].to_dict()
             if "atomic_data" in skf_dict and skf_dict["atomic_data"]:
                 occupations = skf_dict["atomic_data"]["occupations"]
-                return 2 * sum(occupations)  # Factor of 2 for spin
+                return sum(occupations)  # Factor of 2 for spin
+                # return 2 * sum(occupations)  # Factor of 2 for spin
 
         # Fallback: look in any pair containing this element
         for pair_key, skf in updated_skfs.items():
@@ -1105,7 +1206,7 @@ class SkfParameterOptimizer(nn.Module):
 class MultiVaspDataLoader:
     """Data loader for multiple VASP calculations"""
 
-    def __init__(self, vasprun_paths, geometry_paths=None):
+    def __init__(self, vasprun_paths):
         """
         Initialize with multiple vasprun.xml files
 
@@ -1122,8 +1223,6 @@ class MultiVaspDataLoader:
         else:
             self.vasprun_paths = list(vasprun_paths)
 
-        self.geometry_paths = geometry_paths or self.vasprun_paths
-
         print(f"Found {len(self.vasprun_paths)} VASP calculations:")
         for i, path in enumerate(self.vasprun_paths):
             print(f"  {i+1:2d}. {path}")
@@ -1136,11 +1235,9 @@ class MultiVaspDataLoader:
         """Load all VASP datasets and validate them"""
         successful_loads = 0
 
-        for i, (vasp_path, geom_path) in enumerate(
-            zip(self.vasprun_paths, self.geometry_paths)
-        ):
+        for i, (vasp_path) in enumerate((self.vasprun_paths)):
             try:
-                dataset = self._load_single_dataset(vasp_path, geom_path, i)
+                dataset = self._load_single_dataset(vasp_path, i)
                 if dataset is not None:
                     self.datasets.append(dataset)
                     successful_loads += 1
@@ -1154,7 +1251,7 @@ class MultiVaspDataLoader:
             f"✅ Successfully loaded {successful_loads}/{len(self.vasprun_paths)} datasets"
         )
 
-    def _load_single_dataset(self, vasprun_path, geometry_path, index):
+    def _load_single_dataset(self, vasprun_path, index):
         """Load a single VASP dataset"""
         # Load VASP data
         vasprun = Vasprun(vasprun_path)
@@ -1165,6 +1262,7 @@ class MultiVaspDataLoader:
 
         # Extract target properties
         target_energy = vasprun.final_energy
+        target_bandgap = vasprun.get_indir_gap[0]
         target_dos = torch.tensor(vasprun.total_dos[1])  # spin up
         dos_energies = torch.tensor(vasprun.total_dos[0])
 
@@ -1177,6 +1275,7 @@ class MultiVaspDataLoader:
             "vasprun_path": vasprun_path,
             "geometry": geometry,
             "target_energy": target_energy,
+            "target_bandgap": target_bandgap,
             "target_dos": target_dos,
             "dos_energies": dos_energies,
             "elements": elements,
@@ -1187,7 +1286,7 @@ class MultiVaspDataLoader:
                 "volume": structure.volume,
             },
         }
-
+        print("_load_single_dataset", dataset)
         print(
             f"  ✓ Dataset {index}: {dataset['metadata']['formula']} "
             f"({dataset['metadata']['natoms']} atoms, {len(elements)} elements)"
@@ -1231,7 +1330,7 @@ class MultiVaspDataLoader:
 def train_multi_vasp_skf_parameters(
     multi_element_optimizer,
     vasprun_paths,  # List of vasprun.xml files or glob pattern
-    geometry_paths=None,
+    # geometry_paths=None,
     num_epochs=100,
     learning_rate=0.0001,
     batch_size=None,  # None = use all datasets each epoch
@@ -1263,7 +1362,7 @@ def train_multi_vasp_skf_parameters(
     print("LOADING MULTIPLE VASP DATASETS")
     print("=" * 70)
 
-    data_loader = MultiVaspDataLoader(vasprun_paths, geometry_paths)
+    data_loader = MultiVaspDataLoader(vasprun_paths)
 
     if len(data_loader) == 0:
         raise ValueError("No valid datasets found!")
@@ -1289,6 +1388,7 @@ def train_multi_vasp_skf_parameters(
     # Setup training
     shell_dict = generate_shell_dict_upto_Z65()
     kpoints = torch.tensor([5, 5, 5])
+    # kpoints = torch.tensor([11, 11, 11])
 
     # Setup optimizer and scheduler
     optimizer = optim.AdamW(
@@ -1322,7 +1422,7 @@ def train_multi_vasp_skf_parameters(
         batch_datasets = data_loader.get_batch(
             batch_size=batch_size, shuffle=True
         )
-
+        klines = get_klines_example()
         epoch_losses = []
         total_weight = 0.0
 
@@ -1330,9 +1430,13 @@ def train_multi_vasp_skf_parameters(
         for dataset in batch_datasets:
             try:
                 # Compute properties for this system
+                print("geometry=", dataset["geometry"])
                 properties, success = (
                     multi_element_optimizer.compute_multi_element_properties(
-                        dataset["geometry"], shell_dict, kpoints
+                        geometry=dataset["geometry"],
+                        shell_dict=shell_dict,
+                        klines=klines,
+                        # dataset["geometry"], shell_dict, kpoints
                     )
                 )
 
@@ -1343,6 +1447,11 @@ def train_multi_vasp_skf_parameters(
                     continue
 
                 # Extract computed values
+                # print("properties",properties)
+                # print("dataset",dataset)
+                target_bandgap = dataset["target_bandgap"]
+                print("pred band_gap_eV", properties["band_gap_eV"])
+                print("target band_gap_eV", target_bandgap)
                 computed_dos = properties["dos_values_tensor"]
                 target_dos = dataset["target_dos"].to(computed_dos.device)
 
@@ -1518,7 +1627,7 @@ def example_multi_vasp_training(
         multi_element_optimizer=model,
         vasprun_paths=vasprun_files,
         num_epochs=2,
-        learning_rate=0.001,
+        learning_rate=0.00001,
         batch_size=None,  # Use all datasets each epoch
         plot_frequency=5,
         save_directory="multi_vasp_results_all",
@@ -1544,6 +1653,7 @@ def analyze_multi_vasp_performance(
 
     shell_dict = generate_shell_dict_upto_Z65()
     kpoints = torch.tensor([5, 5, 5])
+    # kpoints = torch.tensor([11, 11, 11])
 
     results = []
 
@@ -1617,17 +1727,17 @@ def analyze_multi_vasp_performance(
     return results
 
 
-"""
+# """
 if __name__ == "__main__":
     # Run multi-VASP training example
-    trained_optimizer, loss_history, data_loader = (
-        example_multi_vasp_training()
-    )
+    # trained_optimizer, loss_history, data_loader = (
+    #    example_multi_vasp_training()
+    # )
 
     # Analyze performance
-    performance_results = analyze_multi_vasp_performance(
-        data_loader, trained_optimizer, "multi_vasp_results"
-    )
+    # performance_results = analyze_multi_vasp_performance(
+    #    data_loader, trained_optimizer, "multi_vasp_results"
+    # )
     example_multi_vasp_training()
 
-"""
+# """

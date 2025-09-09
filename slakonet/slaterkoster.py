@@ -313,19 +313,33 @@ def hs_matrix(
 
         # Gather from i_mat_s to get the atom index mask.
         index_mask_a = index_mask_s.clone()
-        index_mask_a[-2:] = i_mat_s[[*index_mask_s]].T
-
+        # index_mask_a[-2:] = i_mat_s[[*index_mask_s]].T
+        index_mask_a[-2:] = i_mat_s[tuple(index_mask_s)].T
         # Gather the atomic numbers, distances, and unit vectors.
-        atom_pairs_l = an_mat_a[[*index_mask_a]]
+        atom_pairs_l = an_mat_a[tuple(index_mask_a)]
+        # atom_pairs_l = an_mat_a[[tuple(index_mask_a)]]
+        # atom_pairs_l = an_mat_a[[*index_mask_a]]
 
         if not is_periodic:
-            g_dist = dist_mat_a[[*index_mask_a]]
-            g_vecs = vec_mat_a[[*index_mask_a]]
+            g_dist = dist_mat_a[tuple(index_mask_a)]
+            # g_dist = dist_mat_a[[tuple(index_mask_a)]]
+            # g_dist = dist_mat_a[[*index_mask_a]]
+            g_vecs = vec_mat_a[tuple(index_mask_a)]
+            # g_vecs = vec_mat_a[[tuple(index_mask_a)]]
+            # g_vecs = vec_mat_a[[*index_mask_a]]
         else:
-            g_dist = dist_mat_a[[*index_mask_a]].T
+            g_dist = dist_mat_a[tuple(index_mask_a)].T
+            # g_dist = dist_mat_a[[tuple(index_mask_a)]].T
+            # g_dist = dist_mat_a[[*index_mask_a]].T
             g_dist[g_dist.eq(0)] = 99999
-            g_vecs = vec_mat_a.permute(0, 2, 3, 4, 1)[[*index_mask_a]].permute(
-                2, 0, 1
+            g_vecs = vec_mat_a.permute(0, 2, 3, 4, 1)[
+                tuple(index_mask_a)
+            ].permute(
+                # g_vecs = vec_mat_a.permute(0, 2, 3, 4, 1)[[tuple(index_mask_a)]].permute(
+                # g_vecs = vec_mat_a.permute(0, 2, 3, 4, 1)[[*index_mask_a]].permute(
+                2,
+                0,
+                1,
             )
             atom_pairs_l = atom_pairs_l.repeat(g_dist.shape[0], 1, 1)
             if multi_varible is not None:
@@ -456,15 +470,25 @@ def hs_matrix(
             # mat.transpose(-2, -3)[[*a_mask1]] = ...
             a_mask = torch.nonzero((l_mat_f == l_pair).all(-1) * mask_dist_l).T
 
-        mat[[*a_mask]] = sk_data  # (ℓ_1, ℓ_2) blocks, i.e. the row blocks
+        mat[tuple(a_mask)] = sk_data  # (ℓ_1, ℓ_2) blocks, i.e. the row blocks
+        # mat[[*a_mask]] = sk_data  # (ℓ_1, ℓ_2) blocks, i.e. the row blocks
         if not is_periodic:
             # (ℓ_2, ℓ_1) column-wise
-            mat.transpose(-1, -2)[[*a_mask]] = sk_data
+            mat.transpose(-1, -2)[tuple(a_mask)] = sk_data
+            # mat.transpose(-1, -2)[[tuple(a_mask)]] = sk_data
+            # mat.transpose(-1, -2)[[*a_mask]] = sk_data
         else:
             if l_pair[0] == l_pair[1]:
-                mat.transpose(-2, -3)[[*a_mask1]] = torch.conj(mat[[*a_mask1]])
+                mat.transpose(-2, -3)[tuple(a_mask1)] = torch.conj(
+                    mat[tuple(a_mask1)]
+                )
+                # mat.transpose(-2, -3)[tuple(a_mask1)] = torch.conj(mat[[*a_mask1]])
+                # mat.transpose(-2, -3)[[tuple(a_mask1)]] = torch.conj(mat[[*a_mask1]])
+                # mat.transpose(-2, -3)[[*a_mask1]] = torch.conj(mat[[*a_mask1]])
             else:
-                mat.transpose(-2, -3)[[*a_mask]] = torch.conj(sk_data)
+                mat.transpose(-2, -3)[tuple(a_mask)] = torch.conj(sk_data)
+                # mat.transpose(-2, -3)[[tuple(a_mask)]] = torch.conj(sk_data)
+                # mat.transpose(-2, -3)[[*a_mask]] = torch.conj(sk_data)
 
     # Set the onsite terms (diagonal)
     if not train_onsite or train_onsite == "global" or ml_onsite is None:
