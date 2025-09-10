@@ -96,6 +96,57 @@ def fermi_search(
 ):
     """
     Computes Fermi energy using Fermi-Dirac distribution, including k-point weights.
+    Args:
+        eigenvalues: Tensor [..., kpoints, orbitals]
+        n_electrons: float
+        k_weights: Tensor [..., kpoints]
+    """
+    # Get device from eigenvalues tensor
+    device = eigenvalues.device
+    
+    # Ensure n_electrons is a tensor on the correct device
+    if not isinstance(n_electrons, torch.Tensor):
+        n_electrons = torch.tensor(n_electrons, device=device, dtype=eigenvalues.dtype)
+    else:
+        n_electrons = n_electrons.to(device)
+    
+    # Ensure k_weights is on the correct device
+    if k_weights is not None:
+        k_weights = k_weights.to(device)
+    
+    orig_shape = eigenvalues.shape[:-2]
+    eig = eigenvalues.reshape(
+        *orig_shape, -1, eigenvalues.shape[-1]
+    )  # [..., kpoints, orbitals]
+    
+    with torch.enable_grad():
+        mu = eig.mean(dim=(-1, -2), keepdim=True).clone().requires_grad_(True)
+        
+        for i in range(max_iter):
+            occ = fermi_dirac(eig, mu, kT)  # [..., kpoints, orbitals]
+            weighted_occ = occ * k_weights.unsqueeze(-1)  # [..., kpoints, orbitals]
+            total_occ = 2.0 * weighted_occ.sum(dim=(-1, -2), keepdim=True)  # spin degeneracy
+            
+            loss = (total_occ - n_electrons) ** 2
+            grad = torch.autograd.grad(loss.sum(), mu, create_graph=True)[0]
+            
+            if torch.max(torch.abs(grad)) < tol:
+                break
+                
+            mu = ((mu - loss / (grad + 1e-12)).detach().clone().requires_grad_(True))
+            
+    return mu.squeeze(-1)
+
+def fermi_search_old(
+    eigenvalues=[],
+    n_electrons=None,
+    k_weights=None,
+    kT=0.01,
+    tol=1e-6,
+    max_iter=100,
+):
+    """
+    Computes Fermi energy using Fermi-Dirac distribution, including k-point weights.
 
     Args:
         eigenvalues: Tensor [..., kpoints, orbitals]
@@ -118,7 +169,7 @@ def fermi_search(
             total_occ = 2.0 * weighted_occ.sum(
                 dim=(-1, -2), keepdim=True
             )  # spin degeneracy
-
+           
             loss = (total_occ - n_electrons) ** 2
             grad = torch.autograd.grad(loss.sum(), mu, create_graph=True)[0]
             if torch.max(torch.abs(grad)) < tol:
@@ -1168,6 +1219,7 @@ class SkfParameterOptimizer(nn.Module):
 
     def apply_constraints(self):
         """Apply physics-aware constraints"""
+        # These are quite arbitrary
         with torch.no_grad():
             for key, param in self.h_params.items():
                 original = self.original_h_params[key]
@@ -1295,7 +1347,7 @@ class MultiVaspDataLoader:
         return dataset
 
     def _structure_to_geometry(self, structure):
-        """Convert pymatgen structure to slakonet Geometry"""
+        """Convert structure to slakonet Geometry"""
         # Extract atomic numbers
         # print('structure)',structure)
         geometry = Geometry.from_ase_atoms([structure.ase_converter()])
@@ -1447,18 +1499,21 @@ def train_multi_vasp_skf_parameters(
                     continue
 
                 # Extract computed values
-                # print("properties",properties)
+                #print("properties",properties,"\n")
                 # print("dataset",dataset)
                 target_bandgap = dataset["target_bandgap"]
                 print("pred band_gap_eV", properties["band_gap_eV"])
                 print("target band_gap_eV", target_bandgap)
                 computed_dos = properties["dos_values_tensor"]
                 target_dos = dataset["target_dos"].to(computed_dos.device)
-
+                bandgap_weight=1.0
+                dos_weight=0.0
                 # Compute losses for this dataset
                 mse_loss = torch.mean((computed_dos - target_dos) ** 2)
                 mae_loss = torch.mean(torch.abs(computed_dos - target_dos))
+                bandgap_mae_loss = torch.mean(torch.abs(target_bandgap-properties["band_gap_eV"]))
 
+                
                 # Peak matching
                 peak_mask = target_dos > target_dos.max() * 0.1
                 if peak_mask.sum() > 0:
@@ -1467,10 +1522,10 @@ def train_multi_vasp_skf_parameters(
                     )
                 else:
                     peak_loss = torch.tensor(0.0, device=computed_dos.device)
-
+              
                 # Dataset-specific loss
                 dataset_loss = mse_loss + 0.5 * mae_loss + 2.0 * peak_loss
-
+                dataset_loss = bandgap_mae_loss
                 # Weight by system size if requested
                 if weight_by_system_size:
                     weight = dataset["metadata"]["natoms"]
@@ -1545,9 +1600,9 @@ def train_multi_vasp_skf_parameters(
             # Save best model
             save_path = os.path.join(save_directory, "best_model")
             multi_element_optimizer.save_model(save_path, method="state_dict")
-            multi_element_optimizer.save_model(
-                save_path, method="universal_params"
-            )
+            #multi_element_optimizer.save_model(
+            #    save_path, method="universal_params"
+            #)
         else:
             epochs_without_improvement += 1
 
@@ -1611,7 +1666,7 @@ def train_multi_vasp_skf_parameters(
 
 
 def example_multi_vasp_training(
-    vasprun_files=["tests/vasprun-1002.xml", "tests/vasprun-107.xml"], model=""
+    vasprun_files=["tests/vasprun-1002.xml", "tests/vasprun-107.xml"], model="",num_epochs=10
 ):
     """Example demonstrating training on multiple VASP calculations"""
 
@@ -1626,8 +1681,8 @@ def example_multi_vasp_training(
     trained_optimizer, history, data_loader = train_multi_vasp_skf_parameters(
         multi_element_optimizer=model,
         vasprun_paths=vasprun_files,
-        num_epochs=2,
-        learning_rate=0.00001,
+        num_epochs=num_epochs,
+        learning_rate=0.001,
         batch_size=None,  # Use all datasets each epoch
         plot_frequency=5,
         save_directory="multi_vasp_results_all",

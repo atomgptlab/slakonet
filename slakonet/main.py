@@ -154,7 +154,7 @@ class SimpleDftb:
         self.device = device
         # self.device="cuda"
         # self.device = torch.device("cpu")
-        print("self.device", self.device)
+        # print("self.device", self.device)
         self.nelectron = nelectron.to(self.device)
         # Initialize basis
         self.basis = Basis(self.geometry.atomic_numbers, self.shell_dict)
@@ -656,7 +656,7 @@ class SimpleDftb:
             k_weights=self.k_weights,
             # k_weights=self.k_weights,
         )
-        print("fermi_energy main", fermi_energy, fermi_energy.device)
+        #print("fermi_energy main", fermi_energy, fermi_energy.device)
         return fermi_energy
 
     def get_fermi_energy_old(self, kT=0.025):
@@ -777,9 +777,11 @@ class SimpleDftb:
             # Occupied: eigenvalue < fermi_energy
             # Unoccupied: eigenvalue > fermi_energy
             occupied_mask = eigenvals_eV < fermi_eV
-            unoccupied_mask = eigenvals_eV > fermi_eV
+            unoccupied_mask = eigenvals_eV >= fermi_eV
+            bands_at_fermi = torch.abs(eigenvals_eV - fermi_eV) < 0.01
+            if torch.any(bands_at_fermi):
 
-            if not torch.any(occupied_mask) or not torch.any(unoccupied_mask):
+                print("System is metallic - bands cross Fermi level")
                 # Metal or problematic case
                 self._band_gap = {
                     "gap": torch.tensor(0.0),
@@ -1815,7 +1817,7 @@ class SimpleDftb:
 
         # Find valence and conduction bands
         occupied_mask = eigenvals < 0  # Below Fermi level (shifted to zero)
-        unoccupied_mask = eigenvals > 0  # Above Fermi level
+        unoccupied_mask = eigenvals >= 0  # Above Fermi level
 
         # Valence band analysis
         valence_bands = eigenvals[occupied_mask]
@@ -1956,7 +1958,8 @@ class SimpleDftb:
             # Basic electronic properties
             "fermi_energy_eV": (fermi_energy * H2E).item(),
             "fermi_energy_Ha": fermi_energy.item(),
-            "band_gap_eV": band_gap_info["gap"].item(),
+            "band_gap_eV": band_gap_info["gap"],
+            #"band_gap_eV": band_gap_info["gap"].item(),
             "vbm_eV": band_gap_info["vbm"].item(),
             "cbm_eV": band_gap_info["cbm"].item(),
             "is_direct_gap": band_gap_info["direct"],
@@ -2086,7 +2089,8 @@ class SimpleDftb:
         properties = {
             "fermi_energy_eV": (fermi_energy * H2E).item(),
             "fermi_energy_Ha": fermi_energy.item(),
-            "band_gap_eV": band_gap_info["gap"].item(),
+            "band_gap_eV": band_gap_info["gap"],
+            #"band_gap_eV": band_gap_info["gap"].item(),
             "vbm_eV": band_gap_info["vbm"].item(),
             "cbm_eV": band_gap_info["cbm"].item(),
             "is_direct_gap": band_gap_info["direct"],

@@ -2,6 +2,9 @@ import setuptools
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
+with open("requirements.txt", "r", encoding="utf-8") as fh:
+    requirements = fh.read().splitlines()
+
 
 setuptools.setup(
     name="slakonet",
@@ -9,16 +12,7 @@ setuptools.setup(
     author="Kamal Choudhary",
     author_email="kchoudh2@jhu.edu",
     description="slakonet",
-    slakonet=[
-        "numpy>=1.22.0",
-        "scipy>=1.6.3",
-        "matplotlib>=3.0.0",
-        "jarvis-tools>=2021.07.19",
-        "torch",
-        "h5py",
-        "ase",
-        "spglib",
-    ],
+    install_requires=requirements,
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/atomgptlab/slakonet",
