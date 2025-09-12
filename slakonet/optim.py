@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 from slakonet.fermi import fermi_search, fermi_smearing
 import random
+import time
 
 matplotlib.rcParams["figure.max_open_warning"] = 50
 torch.set_default_dtype(torch.float64)
@@ -56,10 +57,9 @@ os.environ["PYTHONHASHSEED"] = str(random_seed)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(":4096:8")
 torch.use_deterministic_algorithms(True)
 
-dft_3d = data("dft_3d")
-
 
 def get_atoms(jid=""):
+    dft_3d = data("dft_3d")
     for i in dft_3d:
         if i["jid"] == jid:
             return (
@@ -103,39 +103,51 @@ def fermi_search(
     """
     # Get device from eigenvalues tensor
     device = eigenvalues.device
-    
+
     # Ensure n_electrons is a tensor on the correct device
     if not isinstance(n_electrons, torch.Tensor):
-        n_electrons = torch.tensor(n_electrons, device=device, dtype=eigenvalues.dtype)
+        n_electrons = torch.tensor(
+            n_electrons, device=device, dtype=eigenvalues.dtype
+        )
     else:
         n_electrons = n_electrons.to(device)
-    
+
     # Ensure k_weights is on the correct device
     if k_weights is not None:
         k_weights = k_weights.to(device)
-    
+
     orig_shape = eigenvalues.shape[:-2]
     eig = eigenvalues.reshape(
         *orig_shape, -1, eigenvalues.shape[-1]
     )  # [..., kpoints, orbitals]
-    
+
     with torch.enable_grad():
         mu = eig.mean(dim=(-1, -2), keepdim=True).clone().requires_grad_(True)
-        
+
         for i in range(max_iter):
             occ = fermi_dirac(eig, mu, kT)  # [..., kpoints, orbitals]
-            weighted_occ = occ * k_weights.unsqueeze(-1)  # [..., kpoints, orbitals]
-            total_occ = 2.0 * weighted_occ.sum(dim=(-1, -2), keepdim=True)  # spin degeneracy
-            
+            weighted_occ = occ * k_weights.unsqueeze(
+                -1
+            )  # [..., kpoints, orbitals]
+            total_occ = 2.0 * weighted_occ.sum(
+                dim=(-1, -2), keepdim=True
+            )  # spin degeneracy
+
             loss = (total_occ - n_electrons) ** 2
             grad = torch.autograd.grad(loss.sum(), mu, create_graph=True)[0]
-            
+
             if torch.max(torch.abs(grad)) < tol:
                 break
-                
-            mu = ((mu - loss / (grad + 1e-12)).detach().clone().requires_grad_(True))
-            
+
+            mu = (
+                (mu - loss / (grad + 1e-12))
+                .detach()
+                .clone()
+                .requires_grad_(True)
+            )
+
     return mu.squeeze(-1)
+
 
 def fermi_search_old(
     eigenvalues=[],
@@ -169,7 +181,7 @@ def fermi_search_old(
             total_occ = 2.0 * weighted_occ.sum(
                 dim=(-1, -2), keepdim=True
             )  # spin degeneracy
-           
+
             loss = (total_occ - n_electrons) ** 2
             grad = torch.autograd.grad(loss.sum(), mu, create_graph=True)[0]
             if torch.max(torch.abs(grad)) < tol:
@@ -376,9 +388,9 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         torch.save(skf_data, save_dir / "skf_data.pt")
 
         print(f"✅ Model saved using state_dict method to: {save_dir}")
-        print(f"   - model_state.pt: PyTorch state dict")
-        print(f"   - metadata.json: Model configuration")
-        print(f"   - skf_data.pt: Original SKF data")
+        # print(f"   - model_state.pt: PyTorch state dict")
+        # print(f"   - metadata.json: Model configuration")
+        # print(f"   - skf_data.pt: Original SKF data")
 
     def _save_full_model_method(self, save_path):
         """Save full model (less reliable due to pickle issues)"""
@@ -789,6 +801,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         get_energy=False,
         get_forces=False,
         device=None,
+        with_eigenvectors=False,
     ):
         """Compute DFTB properties for multi-element systems using ALL available optimizers"""
         if device is None:
@@ -817,6 +830,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 s_feed=s_feed,
                 nelectron=nelectron,
                 device=device,
+                with_eigenvectors=with_eigenvectors,
             )
         else:
             calc = SimpleDftb(
@@ -827,6 +841,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 s_feed=s_feed,
                 nelectron=nelectron,
                 device=device,
+                with_eigenvectors=with_eigenvectors,
             )
 
         # Compute properties
@@ -840,7 +855,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             kT = 0.025
             H2E = 27.211
             kT_hartree = kT / H2E
-            print("nelectron1", nelectron)
+            # print("nelectron1", nelectron)
             fermi_energy = fermi_search(
                 # fermi_energy = fermi_search(
                 eigenvalues=eigenvalues,
@@ -1384,7 +1399,7 @@ def train_multi_vasp_skf_parameters(
     vasprun_paths,  # List of vasprun.xml files or glob pattern
     # geometry_paths=None,
     num_epochs=100,
-    learning_rate=0.0001,
+    learning_rate=0.00001,
     batch_size=None,  # None = use all datasets each epoch
     plot_frequency=5,
     save_directory="multi_vasp_optimization_all",
@@ -1464,7 +1479,9 @@ def train_multi_vasp_skf_parameters(
     loss_history = []
     dataset_losses = defaultdict(list)  # Track per-dataset performance
 
+    klines = get_klines_example()
     for epoch in range(num_epochs):
+        t1 = time.time()
         optimizer.zero_grad()
 
         # Apply constraints
@@ -1474,7 +1491,6 @@ def train_multi_vasp_skf_parameters(
         batch_datasets = data_loader.get_batch(
             batch_size=batch_size, shuffle=True
         )
-        klines = get_klines_example()
         epoch_losses = []
         total_weight = 0.0
 
@@ -1499,21 +1515,22 @@ def train_multi_vasp_skf_parameters(
                     continue
 
                 # Extract computed values
-                #print("properties",properties,"\n")
+                # print("properties",properties,"\n")
                 # print("dataset",dataset)
                 target_bandgap = dataset["target_bandgap"]
                 print("pred band_gap_eV", properties["band_gap_eV"])
                 print("target band_gap_eV", target_bandgap)
                 computed_dos = properties["dos_values_tensor"]
                 target_dos = dataset["target_dos"].to(computed_dos.device)
-                bandgap_weight=1.0
-                dos_weight=0.0
+                bandgap_weight = 1.0
+                dos_weight = 0.0
                 # Compute losses for this dataset
                 mse_loss = torch.mean((computed_dos - target_dos) ** 2)
                 mae_loss = torch.mean(torch.abs(computed_dos - target_dos))
-                bandgap_mae_loss = torch.mean(torch.abs(target_bandgap-properties["band_gap_eV"]))
+                bandgap_mae_loss = torch.mean(
+                    torch.abs(target_bandgap - properties["band_gap_eV"])
+                )
 
-                
                 # Peak matching
                 peak_mask = target_dos > target_dos.max() * 0.1
                 if peak_mask.sum() > 0:
@@ -1522,7 +1539,7 @@ def train_multi_vasp_skf_parameters(
                     )
                 else:
                     peak_loss = torch.tensor(0.0, device=computed_dos.device)
-              
+
                 # Dataset-specific loss
                 dataset_loss = mse_loss + 0.5 * mae_loss + 2.0 * peak_loss
                 dataset_loss = bandgap_mae_loss
@@ -1546,6 +1563,7 @@ def train_multi_vasp_skf_parameters(
         if not epoch_losses:
             print(f"Epoch {epoch}: No valid computations, skipping...")
             continue
+        t2 = time.time()
 
         # Combine losses across all datasets in batch
         batch_loss = (
@@ -1600,9 +1618,9 @@ def train_multi_vasp_skf_parameters(
             # Save best model
             save_path = os.path.join(save_directory, "best_model")
             multi_element_optimizer.save_model(save_path, method="state_dict")
-            #multi_element_optimizer.save_model(
+            # multi_element_optimizer.save_model(
             #    save_path, method="universal_params"
-            #)
+            # )
         else:
             epochs_without_improvement += 1
 
@@ -1614,11 +1632,12 @@ def train_multi_vasp_skf_parameters(
                 if dataset_losses
                 else 0.0
             )
-
+            tot_time = round(t2 - t1, 3)
             print(
                 f"Epoch {epoch:3d}: Loss={total_loss.item():.6f}, "
                 f"Batch={batch_loss.item():.6f}, AvgDataset={avg_dataset_loss:.6f}, "
                 f"LR={optimizer.param_groups[0]['lr']:.6f}, Used={len(batch_datasets)} datasets"
+                f" Time={tot_time} sec."
             )
 
         # Early stopping
@@ -1665,8 +1684,12 @@ def train_multi_vasp_skf_parameters(
     return multi_element_optimizer, loss_history, data_loader
 
 
-def example_multi_vasp_training(
-    vasprun_files=["tests/vasprun-1002.xml", "tests/vasprun-107.xml"], model="",num_epochs=10
+def multi_vasp_training(
+    vasprun_files=["tests/vasprun-1002.xml", "tests/vasprun-107.xml"],
+    model="",
+    num_epochs=50,
+    batch_size=None,
+    save_directory="slakonet_universal",
 ):
     """Example demonstrating training on multiple VASP calculations"""
 
@@ -1683,9 +1706,9 @@ def example_multi_vasp_training(
         vasprun_paths=vasprun_files,
         num_epochs=num_epochs,
         learning_rate=0.001,
-        batch_size=None,  # Use all datasets each epoch
+        batch_size=batch_size,  # Use all datasets each epoch
         plot_frequency=5,
-        save_directory="multi_vasp_results_all",
+        save_directory=save_directory,
         weight_by_system_size=True,
         early_stopping_patience=20,
     )
@@ -1786,13 +1809,13 @@ def analyze_multi_vasp_performance(
 if __name__ == "__main__":
     # Run multi-VASP training example
     # trained_optimizer, loss_history, data_loader = (
-    #    example_multi_vasp_training()
+    #    multi_vasp_training()
     # )
 
     # Analyze performance
     # performance_results = analyze_multi_vasp_performance(
     #    data_loader, trained_optimizer, "multi_vasp_results"
     # )
-    example_multi_vasp_training()
+    multi_vasp_training()
 
 # """

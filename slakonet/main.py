@@ -141,6 +141,7 @@ class SimpleDftb:
         klines=None,
         repulsive=False,
         device=None,
+        with_eigenvectors=False,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -152,6 +153,7 @@ class SimpleDftb:
         # self.dtype = torch.complex128
         self.repulsive = repulsive
         self.device = device
+        self.with_eigenvectors = with_eigenvectors
         # self.device="cuda"
         # self.device = torch.device("cpu")
         # print("self.device", self.device)
@@ -229,19 +231,22 @@ class SimpleDftb:
         eigenvalues = []
         densities = []
         occupations = []
-
+        eigenvectors = []
         # Loop over k-points
         for ik in range(self.max_nk):
             eigenvals, eigenvecs, occ, density = self.solve_kpoint(ik)
             eigenvalues.append(eigenvals)
             densities.append(density)
             occupations.append(occ)
-
+            if self.with_eigenvectors:
+                eigenvectors.append(eigenvecs)
         # Store results (keep on GPU)
+
         self.eigenvalue = pack(eigenvalues).permute(1, 0, 2)
         self.density = pack(densities).permute(1, 2, 3, 0)
         self._occupations = pack(occupations).permute(1, 0, 2)
-
+        if self.with_eigenvectors:
+            self.eigenvectors = pack(eigenvectors).permute(1, 2, 3, 0)
         # Clear cache
         self._fermi_energy = None
         self._band_gap = None
@@ -656,7 +661,7 @@ class SimpleDftb:
             k_weights=self.k_weights,
             # k_weights=self.k_weights,
         )
-        #print("fermi_energy main", fermi_energy, fermi_energy.device)
+        # print("fermi_energy main", fermi_energy, fermi_energy.device)
         return fermi_energy
 
     def get_fermi_energy_old(self, kT=0.025):
@@ -778,7 +783,7 @@ class SimpleDftb:
             # Unoccupied: eigenvalue > fermi_energy
             occupied_mask = eigenvals_eV < fermi_eV
             unoccupied_mask = eigenvals_eV >= fermi_eV
-            bands_at_fermi = torch.abs(eigenvals_eV - fermi_eV) < 0.01
+            bands_at_fermi = torch.abs(eigenvals_eV - fermi_eV) < 1e-3
             if torch.any(bands_at_fermi):
 
                 print("System is metallic - bands cross Fermi level")
@@ -1959,7 +1964,7 @@ class SimpleDftb:
             "fermi_energy_eV": (fermi_energy * H2E).item(),
             "fermi_energy_Ha": fermi_energy.item(),
             "band_gap_eV": band_gap_info["gap"],
-            #"band_gap_eV": band_gap_info["gap"].item(),
+            # "band_gap_eV": band_gap_info["gap"].item(),
             "vbm_eV": band_gap_info["vbm"].item(),
             "cbm_eV": band_gap_info["cbm"].item(),
             "is_direct_gap": band_gap_info["direct"],
@@ -2090,7 +2095,7 @@ class SimpleDftb:
             "fermi_energy_eV": (fermi_energy * H2E).item(),
             "fermi_energy_Ha": fermi_energy.item(),
             "band_gap_eV": band_gap_info["gap"],
-            #"band_gap_eV": band_gap_info["gap"].item(),
+            # "band_gap_eV": band_gap_info["gap"].item(),
             "vbm_eV": band_gap_info["vbm"].item(),
             "cbm_eV": band_gap_info["cbm"].item(),
             "is_direct_gap": band_gap_info["direct"],

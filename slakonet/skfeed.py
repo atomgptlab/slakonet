@@ -31,6 +31,9 @@ from slakonet.interpolation import (
     BSpline,
 )
 from slakonet.skf import Skf, VcrSkf, TvcrSkf
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 class _SkFeed(ABC):
@@ -293,7 +296,7 @@ class SkfFeed(_SkFeed):
         on_site_dict: dict,
         shell_dict: dict,
         orbital_resolve=False,
-        # **kwargs,
+        # **kwargs, #TODO
     ):
         self.off_site_dict = off_site_dict
         self.on_site_dict = on_site_dict
@@ -601,7 +604,7 @@ class VcrFeed(_SkFeed):
         on_site_dict: dict,
         compression_radii_grid: Tensor,
         orbital_resolve=False,
-        # **kwargs,
+        # **kwargs, #TODO
     ):
         self.off_site_dict = off_site_dict
         self.on_site_dict = on_site_dict
@@ -917,7 +920,7 @@ class TvcrFeed(_SkFeed):
         off_site_dict: dict,
         on_site_dict: dict,
         compression_radii_grid: Tensor,
-        # **kwargs,
+        # **kwargs, #TODO
     ):
         self.off_site_dict = off_site_dict
         self.on_site_dict = on_site_dict
