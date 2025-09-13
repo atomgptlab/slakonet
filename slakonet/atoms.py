@@ -9,7 +9,6 @@ from typing import Union, List, Optional
 from operator import itemgetter
 import torch
 import numpy as np
-from h5py import Group
 from ase import Atoms
 import ase.io as io
 from slakonet.utils import pack, merge
@@ -826,77 +825,6 @@ class Geometry:
                 ],
                 units=units,
             )
-
-    @classmethod
-    def from_hdf5(
-        cls,
-        source: Union[Group, List[Group]],
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-        units: str = "bohr",
-    ) -> "Geometry":
-        """Instantiate a `Geometry` instances from an HDF5 group.
-
-        Construct a `Geometry` entity using data from an HDF5 group. Passing
-        multiple groups, or a single group representing multiple systems, will
-        return a batched `Geometry` instance.
-
-        Arguments:
-            source: An HDF5 group(s) containing geometry data.
-            device: Device on which to place tensors. [DEFAULT=None]
-            dtype: dtype to be used for floating point tensors. [DEFAULT=None]
-            units: Unit of length used by the data. [DEFAULT='bohr']
-
-        Returns:
-            geometry: The resulting ``Geometry`` object.
-
-        """
-        # If not specified by the user; ensure that the default dtype is used,
-        # rather than inheriting from numpy. Failing to do this will case some
-        # *very* hard to diagnose errors.
-        dtype = torch.get_default_dtype() if dtype is None else dtype
-
-        # If a single system or a batch system
-        if not isinstance(source, list):
-            # Read & parse a datasets from the database into a System instance
-            # & return the result.
-            return cls(
-                torch.tensor(source["atomic_numbers"], device=device),
-                torch.tensor(source["positions"], dtype=dtype, device=device),
-                units=units,
-            )
-        else:
-            return cls(  # Create a batched Geometry instance and return it
-                [
-                    torch.tensor(s["atomic_numbers"], device=device)
-                    for s in source
-                ],
-                [
-                    torch.tensor(s["positions"], device=device, dtype=dtype)
-                    for s in source
-                ],
-                units=units,
-            )
-
-    def to_hdf5(self, target: Group):
-        """Saves Geometry instance into a target HDF5 Group.
-
-        Arguments:
-            target: The hdf5 group to which the system's data should be saved.
-
-        Notes:
-            This function does not create its own group as it expects that
-            ``target`` is the group into which data should be writen.
-        """
-        # Short had for dataset creation
-        add_data = target.create_dataset
-
-        # Add datasets for atomic_numbers, positions, lattice, and pbc
-        add_data("atomic_numbers", data=self.atomic_numbers.cpu().numpy())
-        pos = add_data("positions", data=self.positions.cpu().numpy())
-
-        # Add units meta-data to the atomic positions
-        pos.attrs["unit"] = "bohr"
 
     def to_vasp(
         self,

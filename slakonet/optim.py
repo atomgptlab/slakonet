@@ -28,12 +28,12 @@ from jarvis.core.specie import atomic_numbers_to_symbols
 from slakonet.skf import Skf
 from slakonet.main import SimpleDftb, generate_shell_dict_upto_Z65
 from slakonet.skfeed import SkfFeed, _get_hs_dict, _get_onsite_dict
-from slakonet.interpolation import PolyInterpU, BicubInterp, BSpline
+from slakonet.interpolation import PolyInterpU
 from slakonet.atoms import Geometry
 from jarvis.io.vasp.outputs import Vasprun
 import matplotlib.pyplot as plt
 import matplotlib
-from slakonet.fermi import fermi_search, fermi_smearing
+from slakonet.fermi import fermi_search, fermi_smearing, fermi_dirac
 import random
 import time
 
@@ -67,133 +67,6 @@ def get_atoms(jid=""):
                 i["optb88vdw_bandgap"],
                 i["mbj_bandgap"],
             )
-
-
-def fermi_dirac(
-    epsilon: torch.Tensor, ef: torch.Tensor, kT: float
-) -> torch.Tensor:
-    """
-    Compute Fermi-Dirac occupation numbers.
-
-    Args:
-        epsilon (torch.Tensor): Energy levels [nkpts, nbands]
-        ef (torch.Tensor): Fermi level (scalar or broadcastable)
-        kT (float): Electronic temperature in Hartree
-
-    Returns:
-        torch.Tensor: Occupation numbers
-    """
-    return 1.0 / (torch.exp((epsilon - ef) / kT) + 1.0)
-
-
-def fermi_search(
-    eigenvalues=[],
-    n_electrons=None,
-    k_weights=None,
-    kT=0.01,
-    tol=1e-6,
-    max_iter=100,
-):
-    """
-    Computes Fermi energy using Fermi-Dirac distribution, including k-point weights.
-    Args:
-        eigenvalues: Tensor [..., kpoints, orbitals]
-        n_electrons: float
-        k_weights: Tensor [..., kpoints]
-    """
-    # Get device from eigenvalues tensor
-    device = eigenvalues.device
-
-    # Ensure n_electrons is a tensor on the correct device
-    if not isinstance(n_electrons, torch.Tensor):
-        n_electrons = torch.tensor(
-            n_electrons, device=device, dtype=eigenvalues.dtype
-        )
-    else:
-        n_electrons = n_electrons.to(device)
-
-    # Ensure k_weights is on the correct device
-    if k_weights is not None:
-        k_weights = k_weights.to(device)
-
-    orig_shape = eigenvalues.shape[:-2]
-    eig = eigenvalues.reshape(
-        *orig_shape, -1, eigenvalues.shape[-1]
-    )  # [..., kpoints, orbitals]
-
-    with torch.enable_grad():
-        mu = eig.mean(dim=(-1, -2), keepdim=True).clone().requires_grad_(True)
-
-        for i in range(max_iter):
-            occ = fermi_dirac(eig, mu, kT)  # [..., kpoints, orbitals]
-            weighted_occ = occ * k_weights.unsqueeze(
-                -1
-            )  # [..., kpoints, orbitals]
-            total_occ = 2.0 * weighted_occ.sum(
-                dim=(-1, -2), keepdim=True
-            )  # spin degeneracy
-
-            loss = (total_occ - n_electrons) ** 2
-            grad = torch.autograd.grad(loss.sum(), mu, create_graph=True)[0]
-
-            if torch.max(torch.abs(grad)) < tol:
-                break
-
-            mu = (
-                (mu - loss / (grad + 1e-12))
-                .detach()
-                .clone()
-                .requires_grad_(True)
-            )
-
-    return mu.squeeze(-1)
-
-
-def fermi_search_old(
-    eigenvalues=[],
-    n_electrons=None,
-    k_weights=None,
-    kT=0.01,
-    tol=1e-6,
-    max_iter=100,
-):
-    """
-    Computes Fermi energy using Fermi-Dirac distribution, including k-point weights.
-
-    Args:
-        eigenvalues: Tensor [..., kpoints, orbitals]
-        n_electrons: float
-        k_weights: Tensor [..., kpoints]
-    """
-    orig_shape = eigenvalues.shape[:-2]
-    eig = eigenvalues.reshape(
-        *orig_shape, -1, eigenvalues.shape[-1]
-    )  # [..., kpoints, orbitals]
-
-    with torch.enable_grad():
-        mu = eig.mean(dim=(-1, -2), keepdim=True).clone().requires_grad_(True)
-
-        for _ in range(max_iter):
-            occ = fermi_dirac(eig, mu, kT)  # [..., kpoints, orbitals]
-            weighted_occ = occ * k_weights.unsqueeze(
-                -1
-            )  # [..., kpoints, orbitals]
-            total_occ = 2.0 * weighted_occ.sum(
-                dim=(-1, -2), keepdim=True
-            )  # spin degeneracy
-
-            loss = (total_occ - n_electrons) ** 2
-            grad = torch.autograd.grad(loss.sum(), mu, create_graph=True)[0]
-            if torch.max(torch.abs(grad)) < tol:
-                break
-            mu = (
-                (mu - loss / (grad + 1e-12))
-                .detach()
-                .clone()
-                .requires_grad_(True)
-            )
-
-    return mu.squeeze(-1)
 
 
 def kpts_to_klines(kpts, default_points=10):
@@ -1687,7 +1560,7 @@ def train_multi_vasp_skf_parameters(
 def multi_vasp_training(
     vasprun_files=["tests/vasprun-1002.xml", "tests/vasprun-107.xml"],
     model="",
-    num_epochs=50,
+    num_epochs=2,
     batch_size=None,
     save_directory="slakonet_universal",
 ):

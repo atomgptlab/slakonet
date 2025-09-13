@@ -7,7 +7,6 @@ identities of a chemical systems bases.
 
 from typing import Dict, List, Union, Literal, Optional, Any
 import numpy as np
-from h5py import Group
 import torch
 from torch import Tensor, Size, arange
 from slakonet.atoms import Geometry
@@ -292,49 +291,6 @@ class Basis:
             self.shell_dict,
             self.shell_resolved,
         )
-
-    @classmethod
-    def from_hdf5(
-        cls, source: Group, device: Optional[torch.device] = None
-    ) -> "Basis":
-        """Instantiate a `Basis` instances from an HDF5 group.
-
-        Arguments:
-            source: An HDF5 group(s) containing `Basis` instance.
-            device: Device on which to place tensors. [DEFAULT=None]
-
-        Returns:
-            basis: The resulting `Basis` object.
-        """
-        shell_dict = {
-            int(k): v[()].tolist() for k, v in source["shell_dict"].items()
-        }
-        shell_resolved = bool(source["shell_resolved"][()])
-        atomic_numbers = torch.tensor(
-            source["atomic_numbers"][()], device=device
-        )
-        return cls(atomic_numbers, shell_dict, shell_resolved)
-
-    def to_hdf5(self, target: Group):
-        """Saves `Basis` instance into a target HDF5 Group.
-
-        Arguments:
-            target: The hdf5 group to which the `Basis` should be saved.
-
-        Notes:
-            This function does not create its own group as it expects that
-            ``target`` is the group into which data should be writen.
-        """
-        # Store the shell dictionary, atomic numbers & resolution
-        shell_dict = target.create_group("shell_dict")
-        for k, v in self.shell_dict.items():
-            shell_dict.create_dataset(str(k), data=np.array(v))
-
-        target.create_dataset(
-            "atomic_numbers", data=self.atomic_numbers.detach().cpu().numpy()
-        )
-
-        target.create_dataset("shell_resolved", data=self.shell_resolved)
 
     def matrix_shape(self, form: Form) -> Size:
         """Returns the expected shape of a matrix based on ``form``.

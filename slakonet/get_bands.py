@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+
 def load_trained_model(model_path, method="state_dict"):
     """
     Load a trained model
@@ -108,7 +109,7 @@ def get_gap(
         
         )
     """
-    #print("device1",model.device)
+    # print("device1",model.device)
     # Calculate properties using the trained model
     with torch.no_grad():  # No gradients needed for inference
         properties, success = model.compute_multi_element_properties(
@@ -116,7 +117,7 @@ def get_gap(
             shell_dict=shell_dict,
             klines=klines,
             get_fermi=True,
-            device=device
+            device=device,
         )
 
     if not success:
@@ -127,9 +128,9 @@ def get_gap(
     total_energy = properties.get("total_energy_eV", None)
     eigenvalues = properties.get("eigenvalues", None)
     calc = properties["calc"]
-    #bandgap = properties["bandgap"].squeeze().detach().numpy().tolist()
+    # bandgap = properties["bandgap"].squeeze().detach().numpy().tolist()
     # NEW:
-    #print("properties",properties)
+    # print("properties",properties)
     bandgap = properties["bandgap"].squeeze().detach().cpu().numpy().tolist()
     H2E = 27.21
     # print("eigenvalues",eigenvalues)
@@ -140,7 +141,8 @@ def get_gap(
         efermi = properties["efermi"].squeeze().detach().cpu().numpy().tolist()
         for i in range(eigenvalues.shape[-1]):  # Plot each band
             plt.plot(
-                eigenvalues[0, :, i].real.detach().cpu().numpy() * H2E - efermi,
+                eigenvalues[0, :, i].real.detach().cpu().numpy() * H2E
+                - efermi,
                 c="blue",
             )
 
@@ -169,10 +171,19 @@ def get_gap(
 
 if __name__ == "__main__":
     model_path = "slakonet_v1_sic"
-    model_path="slakonet_v1"
+    model_path = "slakonet_v1"
     model = MultiElementSkfParameterOptimizer.load_model(
         model_path, method="state_dict"
     )
-    bandgap, opt_gap, mbj_gap, calc, formula = get_gap(jid="JVASP-75464", model=model, plot=True)
-    print("bandgap, opt_gap, mbj_gap, calc, formula",bandgap, opt_gap, mbj_gap, calc, formula)
-    #get_gap(jid="JVASP-1002", model=model, plot=True)
+    bandgap, opt_gap, mbj_gap, calc, formula = get_gap(
+        jid="JVASP-75464", model=model, plot=True
+    )
+    print(
+        "bandgap, opt_gap, mbj_gap, calc, formula",
+        bandgap,
+        opt_gap,
+        mbj_gap,
+        calc,
+        formula,
+    )
+    # get_gap(jid="JVASP-1002", model=model, plot=True)

@@ -110,82 +110,6 @@ def fermi(eigenvalue: Tensor, nelectron: Tensor, kT=0.0, spin=None):
         return occ, nocc
 
 
-def fffffermi(eigenvalue: Tensor, nelectron: Tensor, kT=0.0, spin=None):
-    """Fermi-Dirac distributions without smearing.
-    Arguments:
-        eigenvalue: Eigen-energies.
-        nelectron: number of electrons.
-        kT: temperature.
-    Returns
-        occ: occupancies of electrons
-    """
-    # make sure each system has at least one electron
-    assert False not in torch.ge(nelectron, 1)
-    if spin is None:
-        # the number of full occupied state
-        electron_pair = torch.true_divide(nelectron.clone().detach(), 2).int()
-        # the left single electron
-        electron_single = (nelectron.clone().detach() % 2).unsqueeze(1)
-
-        # zero temperature
-        if kT != 0:
-            raise NotImplementedError("not implement smearing method.")
-
-        # occupied state for batch, if full occupied, occupied will be 2
-        # with unpaired electron, return 1
-        occ_ = pack(
-            [
-                torch.cat(
-                    (torch.ones(electron_pair[i]) * 2, electron_single[i]), 0
-                )
-                for i in range(nelectron.shape[0])
-            ]
-        )
-
-        # pad the rest unoccupied states with 0
-        occ = F.pad(
-            input=occ_, pad=(0, eigenvalue.shape[-1] - occ_.shape[-1]), value=0
-        )
-
-        # all occupied states (include full and not full occupied)
-        nocc = (nelectron.clone().detach() / 2.0).ceil()
-
-        return occ, nocc
-    else:
-        electron_pair = torch.true_divide(
-            nelectron[..., spin].clone().detach(), 1
-        ).int()
-        # the left single electron
-        electron_single = (
-            nelectron[..., spin].clone().detach() % 1
-        ).unsqueeze(1)
-
-        # zero temperature
-        if kT != 0:
-            raise NotImplementedError("not implement smearing method.")
-
-        # occupied state for batch, if full occupied, occupied will be 2
-        # with unpaired electron, return 1
-        occ_ = pack(
-            [
-                torch.cat(
-                    (torch.ones(electron_pair[i]), electron_single[i]), 0
-                )
-                for i in range(nelectron.shape[0])
-            ]
-        )
-
-        # pad the rest unoccupied states with 0
-        occ = F.pad(
-            input=occ_, pad=(0, eigenvalue.shape[-1] - occ_.shape[-1]), value=0
-        )
-
-        # all occupied states (include full and not full occupied)
-        nocc = (nelectron.clone().detach() / 2.0).ceil()
-
-        return occ, nocc
-
-
 def hs_matrix(
     geometry: Geometry,
     basis: Basis,
@@ -1052,32 +976,6 @@ def _gether_var(multi_varible, index_mask_a):
                 multi_varible[..., 1][index_mask_a[0], index_mask_a[2]],
             ]
         ).T
-
-
-def _pe_sk_data(geometry, sk_data, dist_mat_a, mask, **kwargs):
-    """Reshape periodic Hamiltonian and overlap data."""
-    neigh_size = dist_mat_a.shape[-1]
-
-    # mask[0] is how many distances in each geometry
-    phase = geometry.phase[:, mask[0]].transpose(-1, -2).flatten(1, 2)
-
-    # repeat if there are p, d orbitals, since the total integrals size is not
-    # equal to atom pairs size, the last 2 dims of sk_data are n_integrals
-    phase = phase.unsqueeze(-1).repeat_interleave(sk_data.shape[-2], -1)
-    phase = phase.unsqueeze(-1).repeat_interleave(sk_data.shape[-1], -1)
-
-    sk_data = sk_data.unsqueeze(0).repeat_interleave(phase.shape[0], 0)
-
-    # Reshape data: [n_kpoints, n_atoms, n_cellvec, n_integrals, n_integrals]
-    # and then sum over cell vectors dimension
-    sk_data = (
-        (phase * sk_data)
-        .reshape(sk_data.shape[0], neigh_size, -1, *sk_data.shape[2:])
-        .sum(1)
-    )
-
-    # make the kpoints as last dimension for batch
-    return sk_data.permute(1, 2, 3, 0)
 
 
 def _pe_sk_data2(

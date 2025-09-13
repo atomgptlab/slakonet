@@ -1,7 +1,7 @@
 from slakonet.get_bands import get_gap
 from slakonet.optim import (
     MultiElementSkfParameterOptimizer,
-    example_multi_vasp_training,
+    multi_vasp_training,
 )
 import os
 import glob
@@ -9,6 +9,7 @@ import glob
 
 test_dir = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(test_dir, "slakonet_v1_sic")
+#model_path = os.path.join(test_dir, "../slakonet_v1")
 
 # Debug: print the path being used
 print(f"Test directory: {test_dir}")
@@ -31,9 +32,14 @@ def test_training():
     vasprun_files = [
         os.path.join(test_dir, "vasprun-107.xml"),
         os.path.join(test_dir, "vasprun-1002.xml"),
+        os.path.join(test_dir, "vasprun-1002.xml"),
+        os.path.join(test_dir, "vasprun-1002.xml"),
     ]
+    #vasprun_files = []
+    #for i in glob.glob("vasprun/*.xml"):
+    #    vasprun_files.append(i)
     print("vasprun_files", vasprun_files)
-    example_multi_vasp_training(vasprun_files, model=model)
+    multi_vasp_training(vasprun_files, model=model,batch_size=2)
 
 
 #test_si()
