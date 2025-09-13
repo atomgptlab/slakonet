@@ -238,61 +238,6 @@ class PolyInterpU:
         return result
 
 
-def vcr_poly_to_zero(
-    xx: Tensor, yy: Tensor, n_grid: Tensor, ninterp=8, delta_r=1e-5, tail=1.0
-):
-    """Smooth the tail with input xx and yy with various compression radii.
-
-    Arguments:
-        xx:
-        yy:
-
-    """
-    assert xx.dim() == 2
-    assert yy.dim() == 3
-    assert n_grid.shape[0] == xx.shape[0]
-    ny1, ny2, ny3 = yy.shape
-
-    _yy = yy.permute(0, -1, -2)  # -> permute distance dim from last to second
-    ilast = n_grid.clone()
-    incr = xx[0, 1] - xx[0, 0]
-
-    # get grid points and grid point values
-    xa = (ilast.unsqueeze(1) - ninterp + torch.arange(ninterp)) * incr
-    yb = torch.stack(
-        [_yy[ii, il - ninterp - 1 : il - 1] for ii, il in enumerate(ilast)]
-    )
-
-    # return smooth grid points in the tail for each SKF
-    dr = -torch.linspace(4, 0, 5) * incr
-
-    # get derivative
-    y0 = poly_interp(xa, yb, xa[:, ninterp - 1] - delta_r)
-    y2 = poly_interp(xa, yb, xa[:, ninterp - 1] + delta_r)
-    y1 = _yy[torch.arange(_yy.shape[0]), ilast - 2]
-    y1p = (y2 - y0) / (2.0 * delta_r)
-    y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
-    integral_tail = poly_to_zero(
-        dr,
-        -1.0 * tail,
-        -1.0 / tail,
-        y1.unsqueeze(-1),
-        y1p.unsqueeze(-1),
-        y1pp.unsqueeze(-1),
-    ).permute(0, 2, 1)
-
-    if _yy.shape[1] == max(n_grid):
-        ynew = torch.zeros(ny1, ny3 + integral_tail.shape[1], ny2)
-        ynew[:ny1, :ny3, :ny2] = _yy[:ny1, :ny3, :ny2]
-    else:
-        ynew = _yy.clone()
-
-    for ii, iy in enumerate(_yy):  # -> add tail
-        ynew[ii, n_grid[ii] : n_grid[ii] + 5] = integral_tail[ii]
-
-    return ynew.permute(0, -1, -2)
-
-
 def poly5_zero(
     y0: Tensor, y0p: Tensor, y0pp: Tensor, xx: Tensor, dx: Tensor
 ) -> Tensor:

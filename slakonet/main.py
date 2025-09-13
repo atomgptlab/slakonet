@@ -19,7 +19,7 @@ from jarvis.core.atoms import Atoms
 from slakonet.utils import eighb, pack
 import matplotlib.pyplot as plt
 
-# from slakonet.fermi import fermi_search, fermi_smearing
+from slakonet.fermi import fermi_search, fermi_dirac, fermi_smearing
 import numpy as np
 from slakonet.utils import eighb
 from slakonet.fermi import fermi_smearing
@@ -32,74 +32,6 @@ except Exception:
 # torch.set_default_dtype(torch.float32)
 torch.set_default_dtype(torch.float64)
 H2E = 27.211
-
-
-def fermi_dirac(
-    epsilon: torch.Tensor, ef: torch.Tensor, kT: float
-) -> torch.Tensor:
-    """
-    Compute Fermi-Dirac occupation numbers.
-
-    Args:
-        epsilon (torch.Tensor): Energy levels [nkpts, nbands]
-        ef (torch.Tensor): Fermi level (scalar or broadcastable)
-        kT (float): Electronic temperature in Hartree
-
-    Returns:
-        torch.Tensor: Occupation numbers
-    """
-    return 1.0 / (torch.exp((epsilon - ef) / kT) + 1.0)
-
-
-def fermi_search(
-    eigenvalues=[],
-    n_electrons=None,
-    k_weights=None,
-    kT=0.01,
-    tol=1e-6,
-    max_iter=10,
-):
-    """
-    Computes Fermi energy using Fermi-Dirac distribution, including k-point weights.
-
-    Args:
-        eigenvalues: Tensor [..., kpoints, orbitals]
-        n_electrons: float
-        k_weights: Tensor [..., kpoints]
-    """
-    orig_shape = eigenvalues.shape[:-2]
-    # print("fermi_search device",eigenvalues.device)
-    eig = eigenvalues.reshape(
-        *orig_shape, -1, eigenvalues.shape[-1]
-    )  # [..., kpoints, orbitals]
-    # print("occ",occ.to(device))
-    # print("k_weights",k_weights.to(device))
-    with torch.enable_grad():
-        mu = eig.mean(dim=(-1, -2), keepdim=True).clone().requires_grad_(True)
-
-        for _ in range(max_iter):
-            occ = fermi_dirac(eig, mu, kT)  # [..., kpoints, orbitals]
-            # print("occ",occ.device)
-            # print("k_weights",k_weights.device)
-            weighted_occ = occ * k_weights.unsqueeze(
-                -1
-            )  # [..., kpoints, orbitals]
-            total_occ = 2.0 * weighted_occ.sum(
-                dim=(-1, -2), keepdim=True
-            )  # spin degeneracy
-
-            loss = (total_occ - n_electrons) ** 2
-            grad = torch.autograd.grad(loss.sum(), mu, create_graph=True)[0]
-            if torch.max(torch.abs(grad)) < tol:
-                break
-            mu = (
-                (mu - loss / (grad + 1e-12))
-                .detach()
-                .clone()
-                .requires_grad_(True)
-            )
-
-    return mu.squeeze(-1)
 
 
 def generate_shell_dict_upto_Z65():
@@ -253,10 +185,13 @@ class SimpleDftb:
 
         return self.eigenvalue
 
-    def _compute_forces_finite_diff(self, delta=1e-2):
+    def _compute_forces_finite_diff(
+        self, delta=1e-2, kpoints=torch.tensor([5, 5, 5])
+    ):
         """
         Fallback force calculation using finite differences.
         """
+        # This is not completely tested
         print("Computing forces using finite differences...")
 
         original_positions = self.geometry.positions.clone()
@@ -265,7 +200,7 @@ class SimpleDftb:
         # Temporarily disable gradients for finite difference calculation
         self.geometry.positions = self.geometry.positions.detach()
 
-        kpoints2 = torch.tensor([5, 5, 5])  # For DOS
+        kpoints2 = kpoints  # torch.tensor([5, 5, 5])  # For DOS
 
         def get_energy_at_positions(positions):
             """Get energy for given positions."""
@@ -333,7 +268,6 @@ class SimpleDftb:
         # Restore original positions with gradients
         self.geometry.positions = original_positions.requires_grad_(True)
 
-        # print(f"Finite difference forces computed. Max: {torch.max(torch.abs(forces)).item():.6f}")
         return forces
 
     def calculate_phonon_modes(self, line_density=5, write_fc=True):
@@ -663,70 +597,6 @@ class SimpleDftb:
         )
         # print("fermi_energy main", fermi_energy, fermi_energy.device)
         return fermi_energy
-
-    def get_fermi_energy_old(self, kT=0.025):
-        """
-        Calculate Fermi energy in a differentiable way for force calculations.
-
-        Parameters:
-        -----------
-        kT : float
-            Electronic temperature in eV (converted to Hartree internally)
-
-        Returns:
-        --------
-        torch.Tensor : Fermi energy in Hartree (differentiable)
-        """
-        kT_hartree = kT / H2E  # Convert eV to Hartree
-
-        # Flatten eigenvalues and apply k-point weights
-        eigenvals_flat = self.eigenvalue.flatten()  # All eigenvalues
-
-        # Simple differentiable Fermi energy estimation
-        # Sort eigenvalues to find approximate Fermi level
-        sorted_eigenvals, _ = torch.sort(eigenvals_flat)
-
-        # Estimate number of occupied states
-        n_total_states = len(sorted_eigenvals)
-        n_occupied_approx = int(self.nelectron.item())
-
-        # Clamp to valid range
-        n_occupied_approx = max(1, min(n_occupied_approx, n_total_states - 1))
-
-        # Use eigenvalue near the occupation boundary as initial guess
-        if n_occupied_approx < n_total_states:
-            fermi_guess = (
-                sorted_eigenvals[n_occupied_approx - 1]
-                + sorted_eigenvals[n_occupied_approx]
-            ) / 2
-        else:
-            fermi_guess = sorted_eigenvals[n_occupied_approx - 1]
-
-        return fermi_guess
-
-    def get_fermi_energy_nodiff(self, kT=0.025):
-        """
-        Calculate Fermi energy.
-
-        Parameters:
-        -----------
-        kT : float
-            Electronic temperature in eV (converted to Hartree internally)
-
-        Returns:
-        --------
-        torch.Tensor : Fermi energy in Hartree
-        """
-        if self._fermi_energy is None:
-            kT_hartree = kT / H2E  # Convert eV to Hartree
-            self._fermi_energy = fermi_search(
-                eigenvalues=self.eigenvalue,
-                n_electrons=self.nelectron,
-                e_mask=self.basis,
-                kT=kT_hartree,
-                k_weights=self.k_weights,
-            )
-        return self._fermi_energy
 
     def get_eigenvalues(self, fermi_shift=True, unit="eV"):
         """
@@ -1385,6 +1255,7 @@ class SimpleDftb:
         plot=True,
         save_path="EV_curve.png",
         figsize=(8, 6),
+        cutoff=16.0,
     ):
         """
         Calculate and plot Energy-Volume (EV) curve for equation of state.
@@ -1409,7 +1280,7 @@ class SimpleDftb:
         dict : Dictionary containing EV curve data and fitted parameters
         """
         print(f"Calculating EV curve with {num_points} points...")
-
+        # Note: this is not tested yet
         # Store original geometry and periodic structure info
         original_cell = self.geometry.cell.clone()
         original_positions = self.geometry.positions.clone()
@@ -1418,7 +1289,7 @@ class SimpleDftb:
         # Store original k-point configuration
         has_kpoints = hasattr(self, "kpoints") and self.kpoints is not None
         has_klines = hasattr(self, "klines") and self.klines is not None
-
+        kpoints = torch.tensor([5, 5, 5])
         if has_kpoints:
             original_kpoints = self.kpoints.clone()
         if has_klines:
@@ -1430,6 +1301,44 @@ class SimpleDftb:
         energies = []
         total_energies = []  # Store total energies including repulsive
 
+        def get_energy_at_positions(cell, positions):
+            """Get energy for given positions."""
+
+            # cell = torch.tensor(
+            #    [
+            #        [6.3573, -0.0000, 3.6704],
+            #        [2.1191, 5.9937, 3.6704],
+            #        [-0.0000, -0.0000, 7.3408],
+            #    ]
+            # )
+            # geometry = Geometry(torch.tensor([[14, 14]]), positions, cell)
+            geometry = Geometry(self.geometry.atomic_numbers, positions, cell)
+            # print("positions",positions)
+            calc = SimpleDftb(
+                geometry,
+                shell_dict=self.shell_dict,
+                kpoints=kpoints,
+                # klines=klines,
+                h_feed=self.h_feed,
+                s_feed=self.s_feed,
+                nelectron=self.nelectron,
+            )
+
+            # Compute properties
+            eigenvalues = calc()
+            # Clear cache
+            # self._fermi_energy = None
+            # self._band_gap = None
+            # self._occupations = None
+
+            # Recalculate
+            # self()
+            # return torch.sum(
+            #    eigenvalues
+            # )
+            return self._calculate_electronic_energy()
+
+        # Need repulsion term
         for i, strain in enumerate(strains):
             print(f"EV point {i+1}/{num_points}: strain = {strain:.4f}")
 
@@ -1439,111 +1348,41 @@ class SimpleDftb:
 
             # Scale positions proportionally with cell (important!)
             strained_positions = original_positions * strain_factor
-
+            electronic_energy = get_energy_at_positions(
+                strained_cell, strained_positions
+            )
+            volume = torch.det(strained_cell).abs()
+            # print("orig cell",self.geometry.cell)
+            # print("strained_cell",strained_cell)
+            print(
+                "RUNNING EV,i,strain,energy,volume",
+                i,
+                strain,
+                electronic_energy,
+                volume,
+            )
             # Update geometry with strained cell and positions
             self.geometry.cell = strained_cell
             self.geometry.positions = strained_positions
 
-            # Recreate periodic structure with original k-point configuration
-            try:
-                if has_kpoints and has_klines:
-                    self.periodic = Periodic(
-                        self.geometry,
-                        self.geometry.cell,
-                        cutoff=20.0,
-                        kpoints=original_kpoints,
-                        klines=original_klines,
-                    )
-                elif has_kpoints:
-                    self.periodic = Periodic(
-                        self.geometry,
-                        self.geometry.cell,
-                        cutoff=20.0,
-                        kpoints=original_kpoints,
-                    )
-                elif has_klines:
-                    self.periodic = Periodic(
-                        self.geometry,
-                        self.geometry.cell,
-                        cutoff=20.0,
-                        klines=original_klines,
-                    )
-                else:
-                    self.periodic = Periodic(
-                        self.geometry, self.geometry.cell, cutoff=20.0
-                    )
-            except Exception as e:
-                print(f"Warning: Could not recreate periodic structure: {e}")
-                # Use simpler approach - just update cell without recreating periodic
-                self.periodic.geometry = self.geometry
-                self.periodic.cell = self.geometry.cell
-
-            # Update k_weights for new structure
-            self.k_weights = self.periodic.k_weights
-            self.max_nk = torch.max(self.periodic.n_kpoints)
-
-            # Recalculate with strained geometry
-            eigenvalues = self()
-
-            # Calculate electronic energy
-            electronic_energy = self._calculate_electronic_energy()
-
-            # Calculate repulsive energy if available
-            repulsive_energy = 0.0
-            if self.repulsive and hasattr(self, "skparams"):
-                try:
-                    # This would need proper repulsive energy calculation
-                    # For now, add a simple volume-dependent term as placeholder
-                    volume = torch.det(strained_cell).abs()
-                    repulsive_energy = 0.001 * (
-                        strain**2
-                    )  # Simple strain penalty
-                except:
-                    repulsive_energy = 0.0
-
-            total_energy = electronic_energy + repulsive_energy
-
-            # Store results
-            volume = torch.det(strained_cell).abs()
             volumes.append(volume)
             energies.append(
                 electronic_energy
             )  # Electronic only for comparison
-            total_energies.append(total_energy)  # Total energy for EOS fitting
+            # total_energies.append(total_energy)  # Total energy for EOS fitting
 
-            print(
-                f"  Volume: {volume.item():.3f} Bohr³, Electronic Energy: {electronic_energy.item():.6f} Ha"
-            )
-
-        # Restore original geometry and periodic structure
-        self.geometry.cell = original_cell
-        self.geometry.positions = original_positions
-        self.periodic = (
-            original_periodic  # Restore original periodic structure
-        )
-        self.k_weights = original_periodic.k_weights
-        self.max_nk = torch.max(original_periodic.n_kpoints)
-
-        # Convert to tensors
-        volumes = torch.stack(volumes)
-        energies = torch.stack(energies)
-        total_energies = torch.stack(total_energies)
-
-        # Use total energies for fitting (more physical)
-        energies_for_fitting = total_energies
-
-        print(
-            f"Energy variation: {energies_for_fitting.max().item() - energies_for_fitting.min().item():.8f} Ha"
-        )
+        print("energies", torch.tensor(energies).unsqueeze(0))
+        print("volumes", torch.tensor(volumes).unsqueeze(0))
+        return energies, volumes
 
         # Fit equation of state
         if method == "birch_murnaghan":
             bulk_modulus, eq_volume, eq_energy = self._fit_birch_murnaghan(
-                volumes, energies_for_fitting
+                volumes, energies
             )
         else:  # polynomial
             bulk_modulus, eq_volume, eq_energy = self._fit_polynomial_eos(
-                volumes, energies_for_fitting
+                volumes, energies
             )
 
         # Create fitted curve for plotting
@@ -1571,116 +1410,9 @@ class SimpleDftb:
         else:
             # Simple interpolation for Birch-Murnaghan (placeholder)
             energy_fit = torch.interp(vol_fit, volumes, energies_for_fitting)
-
-        # Plot if requested
-        if plot:
-            fig, ax = plt.subplots(figsize=figsize)
-
-            # Convert to numpy for plotting
-            vol_np = volumes.detach().cpu().numpy()
-            energy_np = (
-                energies_for_fitting.detach().cpu().numpy()
-            )  # Use fitted energies for plot
-            vol_fit_np = vol_fit.detach().cpu().numpy()
-            energy_fit_np = energy_fit.detach().cpu().numpy()
-            eq_vol_np = eq_volume.detach().cpu().item()
-            eq_energy_np = eq_energy.detach().cpu().item()
-
-            # Plot data points and fitted curve
-            ax.plot(
-                vol_np,
-                energy_np,
-                "ro",
-                markersize=8,
-                label="Calculated points",
-                zorder=3,
-            )
-            ax.plot(
-                vol_fit_np,
-                energy_fit_np,
-                "b-",
-                linewidth=2,
-                label=f"{method.title()} fit",
-                zorder=2,
-            )
-
-            # Mark equilibrium point
-            ax.plot(
-                eq_vol_np,
-                eq_energy_np,
-                "g*",
-                markersize=15,
-                label=f"Equilibrium\nV₀ = {eq_vol_np:.3f} Bohr³",
-                zorder=4,
-            )
-
-            # Formatting
-            ax.set_xlabel("Volume (Bohr³)")
-            ax.set_ylabel("Energy (Hartree)")
-            ax.set_title(
-                f"Energy-Volume Curve\nBulk Modulus = {bulk_modulus.item():.1f} GPa"
-            )
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-
-            # Add text box with properties and energy variation info
-            energy_variation = (
-                energies_for_fitting.max().item()
-                - energies_for_fitting.min().item()
-            )
-            textstr = f"B₀ = {bulk_modulus.item():.1f} GPa\nV₀ = {eq_vol_np:.3f} Bohr³\nE₀ = {eq_energy_np:.6f} Ha\nΔE = {energy_variation:.6f} Ha"
-            props = dict(boxstyle="round", facecolor="wheat", alpha=0.8)
-            ax.text(
-                0.05,
-                0.95,
-                textstr,
-                transform=ax.transAxes,
-                fontsize=10,
-                verticalalignment="top",
-                bbox=props,
-            )
-
-            plt.tight_layout()
-
-            if save_path:
-                try:
-                    fig.savefig(save_path, dpi=300, bbox_inches="tight")
-                    print(f"EV curve saved to {save_path}")
-                except Exception as e:
-                    print(f"Failed to save EV curve: {e}")
-
-            # Always show the plot
-            plt.show()
-
-            result_dict = {
-                "bulk_modulus": bulk_modulus,
-                "equilibrium_volume": eq_volume,
-                "equilibrium_energy": eq_energy,
-                "strains": strains,
-                "volumes": volumes,
-                "energies": energies,  # Electronic energies
-                "total_energies": total_energies,  # Total energies used for fitting
-                "fitted_volumes": vol_fit,
-                "fitted_energies": energy_fit,
-                "energy_variation": energies_for_fitting.max()
-                - energies_for_fitting.min(),
-            }
-
-            return fig, ax, result_dict
-
-        return {
-            "bulk_modulus": bulk_modulus,
-            "equilibrium_volume": eq_volume,
-            "equilibrium_energy": eq_energy,
-            "strains": strains,
-            "volumes": volumes,
-            "energies": energies,
-            "total_energies": total_energies,
-            "fitted_volumes": vol_fit,
-            "fitted_energies": energy_fit,
-            "energy_variation": energies_for_fitting.max()
-            - energies_for_fitting.min(),
-        }
+        print("volumes", volumes)
+        print("energies", energies)
+        return (volumes, energies)
 
     def _calculate_electronic_energy(self):
         """Calculate electronic energy from current eigenvalues."""
@@ -1689,21 +1421,6 @@ class SimpleDftb:
             # Recalculate if needed
             self()
         # print("self.get_fermi_energy()",self.get_fermi_energy())
-        fermi_energy = self.get_fermi_energy()
-
-        # Calculate occupations using Fermi-Dirac distribution
-        kT_hartree = 0.025 / H2E  # Convert eV to Hartree
-        occupations = fermi_smearing(self.eigenvalue, fermi_energy, kT_hartree)
-
-        # Calculate electronic energy
-        electronic_energy = torch.sum(
-            occupations * self.eigenvalue * self.k_weights.unsqueeze(-1)
-        )
-
-        return electronic_energy.real
-
-    def _calculate_electronic_energyold(self):
-        """Calculate electronic energy from current eigenvalues."""
         fermi_energy = self.get_fermi_energy()
 
         # Calculate occupations using Fermi-Dirac distribution

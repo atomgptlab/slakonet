@@ -673,6 +673,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         get_fermi=False,
         get_energy=False,
         get_forces=False,
+        get_bulk_mod=False,
         device=None,
         with_eigenvectors=False,
     ):
@@ -720,7 +721,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         # Compute properties
         eigenvalues = calc()
         properties = calc.get_properties_dict(
-            include_bulk_modulus=False,
+            include_bulk_modulus=get_bulk_mod,
             include_dos_data=True,
         )
         # """
