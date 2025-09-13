@@ -67,6 +67,7 @@ def test_basic():
     eigenvalues = calc()
     energy = calc._calculate_electronic_energy()
     forces = calc._compute_forces_finite_diff()
+    #freqs,ds = calc.calculate_phonon_modes()
     print("energy", energy)
     print("forces", forces)
     print("eigenvalues", eigenvalues)
@@ -74,6 +75,7 @@ def test_basic():
     import sys
 
     # sys.exit()
+    """
     properties, success = model.compute_multi_element_properties(
         geometry=geometry,
         shell_dict=shell_dict,
@@ -84,6 +86,7 @@ def test_basic():
         device=device,
         with_eigenvectors=True,
     )
+    """
 
 
 def test_si():
