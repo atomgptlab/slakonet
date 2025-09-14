@@ -1,8 +1,9 @@
 from slakonet.get_bands import get_gap
 from slakonet.optim import (
     MultiElementSkfParameterOptimizer,
-    multi_vasp_training,
     get_atoms,
+    kpts_to_klines,
+    default_model,
 )
 import os
 import glob
@@ -10,19 +11,8 @@ from slakonet.atoms import Geometry
 from slakonet.main import SimpleDftb, generate_shell_dict_upto_Z65
 import torch
 
-test_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(test_dir, "slakonet_v1_sic")
-# model_path = os.path.join(test_dir, "../slakonet_v1")
 
-# Debug: print the path being used
-print(f"Test directory: {test_dir}")
-print(f"Model path: {model_path}")
-print(f"Model path exists: {os.path.exists(model_path)}")
-
-
-model = MultiElementSkfParameterOptimizer.load_model(
-    model_path, method="state_dict"
-)
+model = default_model()
 
 
 def test_basic():
@@ -67,7 +57,7 @@ def test_basic():
     eigenvalues = calc()
     energy = calc._calculate_electronic_energy()
     forces = calc._compute_forces_finite_diff()
-    #freqs,ds = calc.calculate_phonon_modes()
+    # freqs,ds = calc.calculate_phonon_modes()
     print("energy", energy)
     print("forces", forces)
     print("eigenvalues", eigenvalues)
@@ -118,6 +108,6 @@ def test_training():
     multi_vasp_training(vasprun_files, model=model, batch_size=2)
 
 
-test_basic()
+# test_basic()
 # test_si()
 # test_training()

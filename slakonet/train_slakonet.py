@@ -3,6 +3,7 @@ from slakonet.optim import (
     MultiElementSkfParameterOptimizer,
     multi_vasp_training,
     train_multi_vasp_skf_parameters,
+    default_model,
 )
 import os
 import glob
@@ -46,10 +47,12 @@ if __name__ == "__main__":
             xml_files.append(pth)
 
     model_path = config.initial_model_path
-
-    model = MultiElementSkfParameterOptimizer.load_model(
-        model_path, method="state_dict"
-    )
+    if model_path == "":
+        model = default_model()
+    else:
+        model = MultiElementSkfParameterOptimizer.load_model(
+            model_path, method="state_dict"
+        )
 
     trained_optimizer, history, data_loader = train_multi_vasp_skf_parameters(
         multi_element_optimizer=model,

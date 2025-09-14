@@ -10,9 +10,6 @@ import random
 import torch
 import pickle
 import json
-import os
-from pathlib import Path
-import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
@@ -34,8 +31,12 @@ from jarvis.io.vasp.outputs import Vasprun
 import matplotlib.pyplot as plt
 import matplotlib
 from slakonet.fermi import fermi_search, fermi_smearing, fermi_dirac
+from jarvis.core.specie import atomic_numbers_to_symbols
 import random
-import time
+from tqdm import tqdm
+import zipfile
+import requests
+import io
 
 matplotlib.rcParams["figure.max_open_warning"] = 50
 torch.set_default_dtype(torch.float64)
@@ -211,13 +212,12 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
         if method == "state_dict":
-            # Method 1: Save state dict + metadata (RECOMMENDED)
             self._save_state_dict_method(save_path)
+        elif method == "compact":
+            self.save_ultra_compact(save_path)
         elif method == "full_model":
-            # Method 2: Save full model (requires careful loading)
             self._save_full_model_method(save_path)
         elif method == "universal_params":
-            # Method 3: Save as universal parameters file
             self._save_universal_params_method(save_path)
         else:
             raise ValueError(f"Unknown save method: {method}")
@@ -310,6 +310,8 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             return cls._load_state_dict_method(load_path)
         elif method == "full_model":
             return cls._load_full_model_method(load_path)
+        elif method == "compact":
+            return cls.load_ultra_compact(load_path)
         elif method == "universal_params":
             return cls._load_universal_params_method(load_path, skf_directory)
         else:
@@ -318,6 +320,8 @@ class MultiElementSkfParameterOptimizer(nn.Module):
     @classmethod
     def _load_state_dict_method(cls, load_path):
         """Load using state_dict + metadata (most reliable)"""
+        print("Loading model ...")
+        t1 = time.time()
         if load_path.is_file():
             # If it's a file, assume it's the directory name
             load_dir = load_path.with_suffix("")
@@ -343,7 +347,6 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         skf_data = torch.load(load_dir / "skf_data.pt")
 
         # Recreate atomic number mapping
-        from jarvis.core.specie import atomic_numbers_to_symbols
 
         zz = [i for i in range(1, 100)]
         z = atomic_numbers_to_symbols(zz)
@@ -392,7 +395,9 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         state_dict = torch.load(load_dir / "model_state.pt")
         instance.load_state_dict(state_dict)
 
+        t2 = time.time()
         print(f"✅ Model loaded using state_dict method from: {load_dir}")
+        print("Time taken:", round(t2 - t1, 3))
         return instance
 
     @classmethod
@@ -475,6 +480,283 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         print(
             f"Loaded {len(self.skf_optimizers)} optimizers from universal parameters"
         )
+
+    def save_ultra_compact(self, save_path):
+        """
+        Save everything in a single .pt file with minimal redundancy
+        Only stores trained parameters once, reconstructs skf_dict on load
+        """
+        save_file = Path(save_path).with_suffix(".pt")
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Get current trained parameters
+        state_dict = self.state_dict()
+
+        compact_data = {
+            "metadata": {
+                "skf_directory": self.skf_directory,
+                "elements_in_system": list(self.elements_in_system),
+                "element_pairs": [list(pair) for pair in self.element_pairs],
+                "available_pairs": list(self.skf_optimizers.keys()),
+                "class_name": "MultiElementSkfParameterOptimizer",
+                "ultra_compact": True,
+            },
+            "trained_parameters": state_dict,  # Only store trained params once
+            "skf_metadata": {},  # Only store non-parameter data from skf_dict
+        }
+
+        # Store only non-parameter metadata from each SKF
+        for pair_key, optimizer in self.skf_optimizers.items():
+            skf_dict = optimizer.skf_dict.copy()
+
+            # Remove parameter data (we have it in state_dict)
+            skf_dict.pop("hamiltonian", None)
+            skf_dict.pop("overlap", None)
+
+            compact_data["skf_metadata"][pair_key] = skf_dict
+
+        torch.save(compact_data, save_file)
+
+        # Calculate size savings
+        original_h_size = sum(
+            len(opt.skf_dict.get("hamiltonian", {}))
+            for opt in self.skf_optimizers.values()
+        )
+        original_s_size = sum(
+            len(opt.skf_dict.get("overlap", {}))
+            for opt in self.skf_optimizers.values()
+        )
+        total_eliminated = original_h_size + original_s_size
+
+        print(f"✅ Compact model saved to: {save_file}")
+        print(f"   Eliminated {total_eliminated} duplicate parameter copies")
+        print(f"   Estimated ~75% size reduction from eliminating redundancy")
+
+    @classmethod
+    def load_ultra_compact(cls, load_path):
+        """
+        Load ultra-compact model and reconstruct skf_dict from trained parameters
+        """
+        t1 = time.time()
+        load_file = Path(load_path).with_suffix(".pt")
+        compact_data = torch.load(load_file)
+
+        if not compact_data["metadata"].get("ultra_compact", False):
+            raise ValueError("This is not an ultra-compact model file")
+
+        metadata = compact_data["metadata"]
+        state_dict = compact_data["trained_parameters"]
+        skf_metadata = compact_data["skf_metadata"]
+
+        # Create new instance
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+
+        # Restore basic attributes
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        # Recreate atomic number mapping
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+
+        # Recreate SKF optimizers
+        instance.skf_optimizers = nn.ModuleDict()
+
+        for pair_key in metadata["available_pairs"]:
+            # Create optimizer
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            # Get the metadata (everything except hamiltonian/overlap)
+            skf_dict = skf_metadata[pair_key].copy()
+
+            # Extract trained parameters for this pair from state_dict
+            h_params = {}
+            s_params = {}
+
+            for key, value in state_dict.items():
+                if key.startswith(f"skf_optimizers.{pair_key}.h_params."):
+                    param_name = key.replace(
+                        f"skf_optimizers.{pair_key}.h_params.", ""
+                    )
+                    h_params[param_name] = value
+                elif key.startswith(f"skf_optimizers.{pair_key}.s_params."):
+                    param_name = key.replace(
+                        f"skf_optimizers.{pair_key}.s_params.", ""
+                    )
+                    s_params[param_name] = value
+
+            # Reconstruct full skf_dict with trained parameters
+            skf_dict["hamiltonian"] = h_params
+            skf_dict["overlap"] = s_params
+
+            optimizer.skf_dict = skf_dict
+
+            # Create parameter dicts
+            optimizer.h_params = nn.ParameterDict(
+                {k: nn.Parameter(v.clone()) for k, v in h_params.items()}
+            )
+            optimizer.s_params = nn.ParameterDict(
+                {k: nn.Parameter(v.clone()) for k, v in s_params.items()}
+            )
+
+            # Set other attributes
+            optimizer.grid = skf_dict.get("grid", None)
+            optimizer.atomic_data = skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+            instance.skf_optimizers[pair_key] = optimizer
+
+        # Load the state dict (this should work since we reconstructed the structure)
+        instance.load_state_dict(state_dict)
+        t2 = time.time()
+
+        print(f"✅ Compact model loaded from: {load_file}")
+        print("Time taken:", round(t2 - t1, 3))
+        return instance
+
+    def save_without_orig(self, save_path):
+        """
+        Save model without original parameters to reduce file size
+
+        Args:
+            save_path: Path to save the model
+        """
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Create save directory
+        save_dir = save_path.with_suffix("")
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save the state dict
+        torch.save(self.state_dict(), save_dir / "model_state.pt")
+
+        # Save metadata needed for reconstruction
+        metadata = {
+            "skf_directory": self.skf_directory,
+            "elements_in_system": list(self.elements_in_system),
+            "element_pairs": [list(pair) for pair in self.element_pairs],
+            "available_pairs": list(self.skf_optimizers.keys()),
+            "class_name": "MultiElementSkfParameterOptimizer",
+            "compact_version": True,  # Flag to indicate this is the compact version
+        }
+
+        with open(save_dir / "metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        # Save SKF data WITHOUT original parameters
+        skf_data = {}
+        for pair_key, optimizer in self.skf_optimizers.items():
+            skf_data[pair_key] = {
+                "skf_dict": optimizer.skf_dict
+                # No original_h_params or original_s_params stored
+            }
+
+        torch.save(skf_data, save_dir / "skf_data.pt")
+
+        print(
+            f"✅ Compact model saved (without original params) to: {save_dir}"
+        )
+
+        # Calculate size reduction estimate
+        total_params = sum(p.numel() for p in self.parameters())
+        print(
+            f"   Reduced storage by ~{total_params} parameter values (~50% size reduction)"
+        )
+
+    @classmethod
+    def load_without_orig(cls, load_path):
+        """
+        Load model saved without original parameters
+
+        Args:
+            load_path: Path to load the model from
+        """
+        t1 = time.time()
+        load_path = Path(load_path)
+
+        if load_path.is_file():
+            load_dir = load_path.with_suffix("")
+        else:
+            load_dir = load_path
+
+        # Load metadata
+        with open(load_dir / "metadata.json", "r") as f:
+            metadata = json.load(f)
+
+        # Check if this is a compact version
+        if not metadata.get("compact_version", False):
+            print("⚠️  This doesn't appear to be a compact model")
+
+        # Create new instance with minimal initialization
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+
+        # Restore basic attributes
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        # Load SKF data
+        skf_data = torch.load(load_dir / "skf_data.pt")
+
+        # Recreate atomic number mapping
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+
+        # Recreate SKF optimizers WITHOUT original parameters
+        instance.skf_optimizers = nn.ModuleDict()
+        for pair_key, data in skf_data.items():
+            # Create SkfParameterOptimizer manually
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            # Restore attributes
+            optimizer.skf_dict = data["skf_dict"]
+
+            # Create parameter dicts directly from skf_dict (no original params)
+            h_param_dict = {
+                k: nn.Parameter(torch.tensor(v, dtype=torch.float64))
+                for k, v in optimizer.skf_dict["hamiltonian"].items()
+            }
+            s_param_dict = {
+                k: nn.Parameter(torch.tensor(v, dtype=torch.float64))
+                for k, v in optimizer.skf_dict["overlap"].items()
+            }
+
+            optimizer.h_params = nn.ParameterDict(h_param_dict)
+            optimizer.s_params = nn.ParameterDict(s_param_dict)
+
+            # Set other attributes
+            optimizer.grid = optimizer.skf_dict.get("grid", None)
+            optimizer.atomic_data = optimizer.skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = optimizer.skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = optimizer.skf_dict.get("hs_cutoff", None)
+
+            instance.skf_optimizers[pair_key] = optimizer
+
+        # Load the trained state dict
+        state_dict = torch.load(load_dir / "model_state.pt")
+        instance.load_state_dict(state_dict)
+        t2 = time.time()
+
+        print(f"✅ Compact model loaded from: {load_dir}")
+        print("Time taken", round(t2 - t1, 3))
+        return instance
 
     def get_available_pairs(self):
         """Get available element pairs"""
@@ -1106,19 +1388,33 @@ class SkfParameterOptimizer(nn.Module):
         self.atom_pair = self.skf_dict.get("atom_pair", None)
         self.hs_cutoff = self.skf_dict.get("hs_cutoff", None)
 
-    def apply_constraints(self):
+    def apply_constraints(self, c=[0.9, 0.7, 0.95, 0.9]):
         """Apply physics-aware constraints"""
+        # Create original params lazily if they don't exist (for ultra-compact loaded models)
+        if not hasattr(self, "original_h_params"):
+            self.original_h_params = {
+                k: v.clone().detach() for k, v in self.h_params.items()
+            }
+        if not hasattr(self, "original_s_params"):
+            self.original_s_params = {
+                k: v.clone().detach() for k, v in self.s_params.items()
+            }
+
         # These are quite arbitrary
         with torch.no_grad():
             for key, param in self.h_params.items():
                 original = self.original_h_params[key]
                 if key.split("-")[0] == key.split("-")[1]:  # Diagonal terms
                     param.data = torch.clamp(
-                        param.data, original * 0.9, original * 1.1
+                        param.data,
+                        original * c[0],
+                        original * (1 + (1 - c[0])),
                     )
                 else:  # Off-diagonal terms
                     param.data = torch.clamp(
-                        param.data, original * 0.7, original * 1.3
+                        param.data,
+                        original * c[1],
+                        original * (1 + (1 - c[1])),
                     )
 
             for key, param in self.s_params.items():
@@ -1126,12 +1422,14 @@ class SkfParameterOptimizer(nn.Module):
                 if key.split("-")[0] == key.split("-")[1]:  # Diagonal terms
                     param.data = torch.clamp(
                         param.data,
-                        torch.maximum(original * 0.95, torch.tensor(0.1)),
-                        original * 1.05,
+                        torch.maximum(original * c[2], torch.tensor(0.1)),
+                        original * (1 + (1 - c[2])),
                     )
                 else:  # Off-diagonal terms
                     param.data = torch.clamp(
-                        param.data, original * 0.9, original * 1.1
+                        param.data,
+                        original * c[3],
+                        original * (1 + (1 - c[3])),
                     )
 
     def get_updated_skf(self):
@@ -1524,9 +1822,7 @@ def train_multi_vasp_skf_parameters(
     # Final save
     final_save_path = os.path.join(save_directory, "final_model")
     multi_element_optimizer.save_model(final_save_path, method="state_dict")
-    multi_element_optimizer.save_model(
-        final_save_path, method="universal_params"
-    )
+    multi_element_optimizer.save_model(final_save_path, method="compact")
 
     # Save training history
     history_file = os.path.join(save_directory, "training_history.json")
@@ -1677,6 +1973,88 @@ def analyze_multi_vasp_performance(
         print(f"  Average MAE: {avg_mae:.6f}")
 
     return results
+
+
+def default_model(dir_path=None, model_name="slakonet_v0"):
+    """
+    More direct version - modify load function to accept BytesIO
+    """
+    if dir_path is None:
+        dir_path = str(os.path.join(os.path.dirname(__file__), model_name))
+    dir_path = os.path.abspath(dir_path)
+
+    # Check for cached .pt file first (extracted from previous run)
+    cached_model_file = os.path.join(dir_path, f"{model_name}.pt")
+    if os.path.exists(cached_model_file):
+        print(f"Loading cached model from {cached_model_file}")
+        return MultiElementSkfParameterOptimizer.load_ultra_compact(
+            cached_model_file
+        )
+
+    # Check if zip file already exists
+    zip_file = os.path.join(dir_path, f"{model_name}.zip")
+    if os.path.exists(zip_file):
+        print(f"Found existing zip file: {zip_file}")
+        # Load from existing zip file
+        with zipfile.ZipFile(zip_file, "r") as zf:
+            pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+            if not pt_files:
+                raise FileNotFoundError(f"No .pt file found in {zip_file}")
+
+            # Load model data from zip
+            with zf.open(pt_files[0]) as model_file:
+                model_data = model_file.read()
+
+            # Cache for future use
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+            with open(cached_model_file, "wb") as cache_file:
+                cache_file.write(model_data)
+
+            # Load the model
+            return MultiElementSkfParameterOptimizer.load_ultra_compact(
+                cached_model_file
+            )
+
+    # If we get here, need to download
+    url = "https://figshare.com/ndownloader/files/57945370"
+
+    print(f"Downloading and loading {model_name} model from zip...")
+    response = requests.get(url, stream=True)
+
+    # Read zip data into memory
+    zip_data = io.BytesIO()
+    total_size = int(response.headers.get("content-length", 0))
+
+    progress_bar = tqdm(total=total_size, unit="iB", unit_scale=True)
+    for chunk in response.iter_content(chunk_size=1024):
+        zip_data.write(chunk)
+        progress_bar.update(len(chunk))
+    progress_bar.close()
+
+    zip_data.seek(0)  # Reset to beginning
+
+    # Process zip from memory
+    with zipfile.ZipFile(zip_data, "r") as zf:
+        pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+        if not pt_files:
+            raise FileNotFoundError("No .pt file found in downloaded zip")
+
+        # Load model data
+        with zf.open(pt_files[0]) as model_file:
+            model_data = model_file.read()
+
+        # Cache for future use
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+        cached_path = os.path.join(dir_path, f"{model_name}.pt")
+        with open(cached_path, "wb") as cache_file:
+            cache_file.write(model_data)
+
+        # Load the model
+        return MultiElementSkfParameterOptimizer.load_ultra_compact(
+            cached_path
+        )
 
 
 # """

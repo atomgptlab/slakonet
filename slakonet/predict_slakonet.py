@@ -5,6 +5,7 @@ from slakonet.optim import (
     MultiElementSkfParameterOptimizer,
     get_atoms,
     kpts_to_klines,
+    default_model,
 )
 from jarvis.core.kpoints import Kpoints3D as Kpoints
 from slakonet.atoms import Geometry
@@ -20,7 +21,8 @@ H2E = 27.211
 parser = argparse.ArgumentParser(description="SlakoNet Pretrained Models")
 parser.add_argument(
     "--model_path",
-    default="slakonet/tests/slakonet_v1_sic",
+    default=None,
+    # default="slakonet/tests/slakonet_v1_sic",
     help="Provide model path ",
 )
 
@@ -30,7 +32,7 @@ parser.add_argument(
 
 parser.add_argument(
     "--file_path",
-    default="slakonet/examples/POSCAR-JVASP-107.vasp",
+    default=None,
     help="Path to atomic structure file.",
 )
 
@@ -47,6 +49,11 @@ parser.add_argument(
 )
 
 
+parser.add_argument(
+    "--jid",
+    default="JVASP-107",
+    help="JARVIS-DFT Identifier",
+)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -115,7 +122,9 @@ def compute_atom_projected_dos(
 
     # Eigen info from calculator (assumed in eV)
     fermi_eV = properties["fermi_energy_eV"]
-    eigenvalues = properties["calc"].eigenvalue * H2E - fermi_eV  # [1, nk, nb]
+    eigenvalues = (
+        properties["calc"].eigenvalue * H2E
+    )  # - fermi_eV  # [1, nk, nb]
     eigenvectors = properties["calc"].eigenvectors  # [1, norb, nb, nk]
 
     # Atom symbols (list for the single geometry in batch)
@@ -199,11 +208,13 @@ def compute_atom_projected_dos(
 def plot_band_dos_atoms(
     jid="JVASP-107",
     atoms=None,
+    model=None,
     model_path="slakonet_v1_sic",
     energy_range=(-10, 10),
     filename="slakonet_out.png",
 ):
-    model = load_trained_model(model_path)
+    if not model:
+        model = load_trained_model(model_path)
 
     properties, atoms, kpoints = get_properties(
         jid=jid, model=model, atoms=atoms
@@ -252,7 +263,10 @@ def plot_band_dos_atoms(
 
     # Total DOS: (x vs y so the curve appears horizontal)
     dos_energies = (
-        properties["dos_energy_grid_tensor"].detach().cpu().numpy() - fermi_eV
+        properties["dos_energy_grid_tensor"]
+        .detach()
+        .cpu()
+        .numpy()  # - fermi_eV
     )
     dos_values = properties["dos_values_tensor"].detach().cpu().numpy()
     ax2.plot(dos_values, dos_energies, linewidth=1.5)
@@ -289,25 +303,35 @@ def plot_band_dos_atoms(
 if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     model_path = args.model_path
+    model = None
+    atoms = None
+    if model_path is None:
+        model = default_model()
     file_path = args.file_path
     file_format = args.file_format
     output_filename = args.output_filename
     energy_range = np.array(args.energy_range.split(" "), dtype="float")
-    if file_format == "poscar":
-        atoms = Atoms.from_poscar(file_path)
-    elif file_format == "cif":
-        atoms = Atoms.from_cif(file_path)
-    elif file_format == "xyz":
-        atoms = Atoms.from_xyz(file_path, box_size=500)
-    elif file_format == "pdb":
-        atoms = Atoms.from_pdb(file_path, max_lat=500)
-    else:
-        raise NotImplementedError("File format not implemented", file_format)
+    jid = args.jid
+    if file_path is not None:
+        if file_format == "poscar":
+            atoms = Atoms.from_poscar(file_path)
+        elif file_format == "cif":
+            atoms = Atoms.from_cif(file_path)
+        elif file_format == "xyz":
+            atoms = Atoms.from_xyz(file_path, box_size=500)
+        elif file_format == "pdb":
+            atoms = Atoms.from_pdb(file_path, max_lat=500)
+        else:
+            raise NotImplementedError(
+                "File format not implemented", file_format
+            )
 
     # fig, properties, atom_pdos, energy_grid = plot_band_dos_atoms(jid='JVASP-107')
     fig, properties, atom_pdos, energy_grid = plot_band_dos_atoms(
         atoms=atoms,
         model_path=model_path,
+        model=model,
+        jid=jid,
         energy_range=energy_range,
         filename=output_filename,
     )

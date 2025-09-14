@@ -1,5 +1,5 @@
 {
-  "initial_model_path": "slakonet/tests/slakonet_v1_sic",
+  "initial_model_path": "",
   "xml_folder_path": "slakonet/tests",
   "num_epochs": 3,
   "batch_size": 2,
