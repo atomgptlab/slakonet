@@ -18,7 +18,7 @@ setuptools.setup(
     url="https://github.com/atomgptlab/slakonet",
     packages=setuptools.find_packages(),
     scripts=[
-        "slakonet/pretrained.py",
+        "slakonet/predict_slakonet.py",
         "slakonet/train_slakonet.py",
     ],
     classifiers=[

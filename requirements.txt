@@ -5,3 +5,4 @@ jarvis-tools>=2021.07.19
 torch
 ase
 spglib
+pydantic_settings
