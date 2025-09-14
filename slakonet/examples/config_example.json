@@ -1,0 +1,12 @@
+{
+  "initial_model_path": "slakonet/tests/slakonet_v1_sic",
+  "xml_folder_path": "slakonet/tests",
+  "num_epochs": 3,
+  "batch_size": 2,
+  "save_directory": "out",
+  "learning_rate": 0.001,
+  "plot_frequency": 3,
+  "weight_by_system_size": true,
+  "early_stopping_patience": 20
+}
+
