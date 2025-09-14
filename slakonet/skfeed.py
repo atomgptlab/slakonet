@@ -624,6 +624,52 @@ def _get_hs_dict(
     return hs_dict
 
 
+def _expand_onsite(
+    onsite_hs_dict, geometry: Geometry, basis: Basis, _orbital_resolved=False
+):
+    """Gather onsite for machine learning if training is not global."""
+    if _orbital_resolved:
+        an = geometry.atomic_numbers
+        # o_shape = basis.orbital_matrix_shape[:-1]
+        #
+        # # Get the onsite values for all non-padding elements & pass on the
+        # # indices of the atoms just in case they are needed by the SkFeed
+        # mask = an.nonzero(as_tuple=True)
+        # os_flat = torch.cat([onsite_hs_dict[(ian.tolist())]
+        #                     for ian in an[mask]])
+        #
+        # # Pack results if necessary (code has no effect on single systems)
+        # c = torch.unique_consecutive((basis.on_atoms != -1).nonzero().T[0],
+        #                              return_counts=True)[1]
+        # return pack(torch.split(os_flat, tuple(c))).view(o_shape)
+        mask = an.nonzero(as_tuple=True)
+        _onsite = torch.cat(
+            [onsite_hs_dict[(ian.tolist())] for ian in an[mask]]
+        )
+        # Repeat p, d orbitals from 1 to 3, 5...
+        _onsite = torch.repeat_interleave(
+            _onsite, basis.orbs_per_shell[basis.orbs_per_shell.ne(0)]
+        )
+
+        # Pack results if necessary (code has no effect on single systems)
+        c = torch.unique_consecutive(
+            (basis.on_atoms != -1).nonzero().T[0], return_counts=True
+        )[1]
+        _onsite = pack(torch.split(_onsite, tuple(c))).view(
+            basis.orbital_matrix_shape[:-1]
+        )
+        return _onsite
+
+    else:
+        an = geometry.atomic_numbers
+
+        # Get the onsite values for all non-padding elements & pass on the
+        # indices of the atoms just in case they are needed by the SkFeed
+        mask = an.nonzero(as_tuple=True)
+
+        return torch.cat([onsite_hs_dict[(ian.tolist())] for ian in an[mask]])
+
+
 def _get_onsite_dict(
     onsite_hs_dict: dict,
     skf: object,

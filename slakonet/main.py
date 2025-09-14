@@ -1386,6 +1386,7 @@ class SimpleDftb:
             )
 
         return (volumes, energies)
+        """
         # Create fitted curve for plotting
         vol_fit = torch.linspace(volumes.min(), volumes.max(), 100)
 
@@ -1414,6 +1415,7 @@ class SimpleDftb:
         print("volumes", volumes)
         print("energies", energies)
         return (volumes, energies)
+        """
 
     def _calculate_electronic_energy(self):
         """Calculate electronic energy from current eigenvalues."""
