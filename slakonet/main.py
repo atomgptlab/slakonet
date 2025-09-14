@@ -1385,6 +1385,7 @@ class SimpleDftb:
                 volumes, energies
             )
 
+        return (volumes, energies)
         # Create fitted curve for plotting
         vol_fit = torch.linspace(volumes.min(), volumes.max(), 100)
 

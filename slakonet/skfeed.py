@@ -555,6 +555,75 @@ def _get_hs_dict(
     return hs_dict
 
 
+def _get_hs_dict(
+    hs_dict: dict,
+    interpolator: object,
+    skf: object,
+    skf_type: str,
+    vcr=None,
+    tvcr=None,
+    pair=None,
+    build_abcd=False,
+    # **kwargs,
+) -> Tuple[dict, dict]:
+    """Get Hamiltonian or overlap tables for each orbital interaction.
+
+    Arguments:
+        h_dict: Hamiltonian tables dictionary.
+        s_dict: Overlap tables dictionary.
+        interpolator: Slater-Koster interpolation method.
+        interactions: Orbital interactions, e.g. (0, 0, 0) for ss0 orbital.
+        skf: Object with original SKF integrals data.
+
+    Returns:
+        h_dict: Dictionary with updated Hamiltonian tables.
+        s_dict: Dictionary with updated overlap tables.
+
+    """
+    # build_abcd = kwargs.get("build_abcd", False)
+    hs_data = (
+        getattr(skf, "hamiltonian")
+        if skf_type == "H"
+        else getattr(skf, "overlap")
+    )
+
+    for ii, interaction in enumerate(hs_data.keys()):
+
+        # Standard interpolation
+        if vcr is None and tvcr is None:
+            hs_dict[(*skf.atom_pair.tolist(), *interaction)] = interpolator(
+                skf.grid, hs_data[interaction].T
+            )
+
+            # write spline parameters into list
+            if build_abcd:
+                hs_dict["variable"].append(
+                    hs_dict[
+                        (*skf.atom_pair.tolist(), *interaction)
+                    ].abcd.requires_grad_(build_abcd)
+                )
+
+        # with one extra varible for each element atom
+        elif vcr is not None:
+            val = torch.stack([vcr[pair[0].tolist()], vcr[pair[1].tolist()]]).T
+            hs_dict[(*skf.atom_pair.tolist(), *interaction)] = interpolator(
+                val, hs_data[interaction], skf.grid
+            )
+
+        # with two extra varibles for each element atom
+        elif tvcr is not None:
+            hs_dict[(*skf.atom_pair.tolist(), *interaction)] = interpolator(
+                hs_data[interaction].permute(-2, 0, 1, 2, 3, -1),
+                tvcr,
+                tvcr,
+                tvcr,
+                tvcr,
+                skf.grid,
+            )
+
+    return hs_dict
+
+
 def _get_onsite_dict(
     onsite_hs_dict: dict,
     skf: object,

@@ -344,3 +344,54 @@ def poly_to_zero2(
     yy = ((ff * xr + ee) * xr + dd) * xr * xr * xr
 
     return yy
+
+
+def poly_interp_2d(xp: Tensor, yp: Tensor, rr: Tensor) -> Tensor:
+    """Interpolate from DFTB+ (lib_math) with uniform grid.
+
+    Arguments:
+        xp: 2D tensor, 1st dimension if batch size, 2nd is grid points.
+        yp: 2D tensor of integrals.
+        rr: interpolation points.
+    """
+    nn0, nn1 = xp.shape[0], xp.shape[1]
+    index_nn0 = torch.arange(nn0)
+    icl = torch.zeros(nn0).long()
+    cc, dd = yp.clone(), yp.clone()
+    dxp = abs(rr - xp[index_nn0, icl])
+
+    # find the most close point to rr (single atom pair or multi pairs)
+    _mask, ii = torch.zeros(len(rr)) == 0, 0
+    dxNew = abs(rr - xp[index_nn0, 0])
+    while (dxNew < dxp).any():
+        ii += 1
+        assert ii < nn1 - 1  # index ii range from 0 to nn1 - 1
+        _mask = dxNew < dxp
+        icl[_mask] = ii
+        dxp[_mask] = abs(rr - xp[index_nn0, ii])[_mask]
+
+    yy = yp[index_nn0, icl]
+
+    for mm in range(nn1 - 1):
+        for ii in range(nn1 - mm - 1):
+            rtmp0 = xp[index_nn0, ii] - xp[index_nn0, ii + mm + 1]
+
+            # use transpose to realize div: (N, M, K) / (N)
+            rtmp1 = (
+                (cc[index_nn0, ii + 1] - dd[index_nn0, ii]).transpose(0, -1)
+                / rtmp0
+            ).transpose(0, -1)
+            cc[index_nn0, ii] = (
+                (xp[index_nn0, ii] - rr) * rtmp1.transpose(0, -1)
+            ).transpose(0, -1)
+            dd[index_nn0, ii] = (
+                (xp[index_nn0, ii + mm + 1] - rr) * rtmp1.transpose(0, -1)
+            ).transpose(0, -1)
+        if (2 * icl < nn1 - mm - 1).any():
+            _mask = 2 * icl < nn1 - mm - 1
+            yy[_mask] = (yy + cc[index_nn0, icl])[_mask]
+        else:
+            _mask = 2 * icl >= nn1 - mm - 1
+            yy[_mask] = (yy + dd[index_nn0, icl - 1])[_mask]
+            icl[_mask] = icl[_mask] - 1
+    return yy
