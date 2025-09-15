@@ -141,7 +141,13 @@ class SimpleDftb:
         s_k = self.overlap[..., ik]
 
         # Solve generalized eigenvalue problem
-        eigenvals, eigenvecs = eighb(h_k, s_k)
+        # eigenvals, eigenvecs = eighb(h_k, s_k,broadening_method=None,scheme="lowd")
+        eigenvals, eigenvecs = eighb(h_k, s_k, scheme="chol")
+        # try:
+        #  eigenvals, eigenvecs = eighb(h_k, s_k,scheme="chol")
+        # except:
+        #  eigenvals, eigenvecs = eighb(h_k, s_k,broadening_method=None)
+
         # print("h_k device",h_k.device)
         # print("s_k device",s_k.device)
         # print("eigenvals",eigenvals.device)
@@ -166,12 +172,16 @@ class SimpleDftb:
         eigenvectors = []
         # Loop over k-points
         for ik in range(self.max_nk):
-            eigenvals, eigenvecs, occ, density = self.solve_kpoint(ik)
-            eigenvalues.append(eigenvals)
-            densities.append(density)
-            occupations.append(occ)
-            if self.with_eigenvectors:
-                eigenvectors.append(eigenvecs)
+            try:
+                eigenvals, eigenvecs, occ, density = self.solve_kpoint(ik)
+                eigenvalues.append(eigenvals)
+                densities.append(density)
+                occupations.append(occ)
+                if self.with_eigenvectors:
+                    eigenvectors.append(eigenvecs)
+            except Exception as exp:
+                print("ik failed for", ik, exp)
+                pass
         # Store results (keep on GPU)
 
         self.eigenvalue = pack(eigenvalues).permute(1, 0, 2)
@@ -1663,9 +1673,19 @@ class SimpleDftb:
         --------
         dict : Dictionary containing various properties
         """
-        fermi_energy = self.get_fermi_energy(kT)
-        band_gap_info = self.calculate_band_gap(kT)
-
+        try:
+            fermi_energy = self.get_fermi_energy(kT)
+            band_gap_info = self.calculate_band_gap(kT)
+        except:
+            fermi_energy = torch.tensor(0)
+            band_gap_info = {}
+            band_gap_info["vbm"] = torch.tensor(0)  # 0
+            band_gap_info["cbm"] = torch.tensor(0)  # 0
+            band_gap_info["gap"] = torch.tensor(0)  # 0
+            band_gap_info["direct"] = True
+            band_gap_info["vbm_kpoint"] = 0
+            band_gap_info["cbm_kpoint"] = 0
+            print("Check for errors 1")
         # Try to get band structure properties, but handle if it fails
         try:
             band_structure_props = self.calculate_band_structure_properties()
@@ -1674,6 +1694,7 @@ class SimpleDftb:
             min_direct_gap = band_structure_props["minimum_direct_gap"]
             is_direct_semi = band_structure_props["is_direct_semiconductor"]
         except:
+            print("Check for errors 2")
             valence_width = 0.0
             conduction_width = 0.0
             min_direct_gap = None

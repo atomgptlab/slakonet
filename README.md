@@ -33,7 +33,7 @@ python slakonet/train_slakonet.py --config_name slakonet/examples/config_example
 ### Example of Inference
 
 ```bash
-python slakonet/predict_slakonet.py --model_path slakonet/tests/slakonet_v1_sic --file_path slakonet/examples/POSCAR-JVASP-107.vasp
+python slakonet/predict_slakonet.py  --file_path slakonet/examples/POSCAR-JVASP-107.vasp
 ```
 
 ### Using Pretrained Models in Python
