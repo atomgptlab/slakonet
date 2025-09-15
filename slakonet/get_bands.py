@@ -10,6 +10,7 @@ from slakonet.optim import (
     MultiElementSkfParameterOptimizer,
     get_atoms,
     kpts_to_klines,
+    default_model,
 )
 import torch
 import numpy as np
@@ -59,6 +60,8 @@ def load_trained_model(model_path, method="state_dict"):
 def get_gap(
     jid="JVASP-1002", model=None, plot=False, default_points=2, line_density=20
 ):
+    if model is None:
+        model = default_model()
     # jid='JVASP-14636'
     atoms, opt_gap, mbj_gap = get_atoms(
         jid

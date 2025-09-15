@@ -59,10 +59,11 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(":4096:8")
 torch.use_deterministic_algorithms(True)
 
 
-def get_atoms(jid=""):
-    dft_3d = data("dft_3d")
-    for i in dft_3d:
-        if i["jid"] == jid:
+def get_atoms(jid="", dataset=None, id_tag="jid"):
+    if dataset is None:
+        dataset = data("dft_3d")
+    for i in dataset:
+        if i[id_tag] == jid:
             return (
                 Atoms.from_dict(i["atoms"]),
                 i["optb88vdw_bandgap"],

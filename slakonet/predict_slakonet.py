@@ -17,6 +17,8 @@ from jarvis.io.vasp.inputs import Poscar
 import argparse
 import sys
 
+plt.rcParams.update({"font.size": 18})
+
 H2E = 27.211
 parser = argparse.ArgumentParser(description="SlakoNet Pretrained Models")
 parser.add_argument(
@@ -65,9 +67,12 @@ def load_trained_model(model_path):
     return model
 
 
-def get_properties(jid="", model="", atoms=None):
+def get_properties(jid="", model=None, atoms=None, dataset=None):
     if atoms is None:
-        atoms, opt_gap, mbj_gap = get_atoms(jid)
+        atoms, opt_gap, mbj_gap = get_atoms(jid=jid, dataset=dataset)
+    if model is None:
+        model = default_model()
+
     geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
     shell_dict = generate_shell_dict_upto_Z65()
 
@@ -206,12 +211,12 @@ def compute_atom_projected_dos(
 
 
 def plot_band_dos_atoms(
-    jid="JVASP-107",
+    jid=None,
     atoms=None,
     model=None,
-    model_path="slakonet_v1_sic",
+    model_path="slakonet_v0",
     energy_range=(-10, 10),
-    filename="slakonet_out.png",
+    filename=None,
 ):
     if not model:
         model = load_trained_model(model_path)
@@ -219,6 +224,10 @@ def plot_band_dos_atoms(
     properties, atoms, kpoints = get_properties(
         jid=jid, model=model, atoms=atoms
     )
+    if filename is None:
+        filename = "slakonet_out.png"
+    if jid is not None and filename is None:
+        filename = str(jid) + "_slakonet_out.png"
 
     # Band structure data (assumed eV)
     eigenvalues = properties["calc"].eigenvalue * H2E  # [1, nk, nb], eV
