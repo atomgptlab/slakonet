@@ -11,7 +11,7 @@ from slakonet.atoms import Geometry
 from slakonet.main import SimpleDftb, generate_shell_dict_upto_Z65
 import torch
 
-
+test_dir = os.path.dirname(os.path.abspath(__file__))
 model = default_model()
 
 
