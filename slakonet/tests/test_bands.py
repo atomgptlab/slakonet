@@ -4,6 +4,7 @@ from slakonet.optim import (
     get_atoms,
     kpts_to_klines,
     default_model,
+    multi_vasp_training
 )
 import os
 import glob
