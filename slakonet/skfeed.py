@@ -30,6 +30,8 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# Adapted from TBMalT
+
 
 class _SkFeed(ABC):
     """ABC for objects responsible for supplying Slater-Koster integrals.
