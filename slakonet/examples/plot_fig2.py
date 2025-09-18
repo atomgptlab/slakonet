@@ -14,13 +14,15 @@ import numpy as np
 # the_grid = GridSpec(2, 2)
 plt.rcParams.update({"font.size": 18})
 plt.figure(figsize=(10, 8))
+E_low = -2
+E_high = 2
 
 jid = "JVASP-1002"
-jid = "JVASP-107"
+# jid = "JVASP-107"
 model_best = default_model()
 
 
-def get_max_diff(tb3_bands, tb3_fermi, vasprun, energy_tol=4.0):
+def get_max_diff(tb3_bands, tb3_fermi, vasprun, energy_tol=4):
     # Get VASP bands relative to Fermi level
     vasp_eigs = (
         np.array([eig[:, 0] for eig in vasprun.eigenvalues[0]]).T
@@ -32,6 +34,8 @@ def get_max_diff(tb3_bands, tb3_fermi, vasprun, energy_tol=4.0):
     tb3_adj = tb3_bands - tb3_fermi
 
     differences = []
+    x = []
+    y = []
     for k in range(min(len(tb3_adj), len(vasp_eigs))):
         tb3_valid = tb3_adj[k][
             (tb3_adj[k] > -energy_tol) & (tb3_adj[k] < energy_tol)
@@ -43,8 +47,10 @@ def get_max_diff(tb3_bands, tb3_fermi, vasprun, energy_tol=4.0):
         for tb3_e in tb3_valid:
             if len(vasp_valid) > 0:
                 differences.append(np.min(np.abs(tb3_e - vasp_valid)))
-
-    return max(differences) if differences else 0.0
+                x.append(np.min(np.abs(tb3_e - vasp_valid)))
+                y.append(k)
+    max_diff = max(differences) if differences else 0.0
+    return max_diff, x, y  # max(differences) if differences else 0.0
 
 
 def filter_close_labels(points, labels, min_distance=5):
@@ -171,8 +177,6 @@ with tempfile.TemporaryDirectory() as temp_dir:
                                 kp_labels_points.append(ii - 3)
 
 
-E_low = -20
-E_high = 20
 spin = 0
 zero_efermi = True
 plot = True
@@ -306,5 +310,10 @@ plt.close()
 # plt.show()
 
 sk_fermi = properties.get("fermi_energy_eV", None)
-max_diff = get_max_diff(eigenvalues[0].cpu().numpy(), sk_fermi, vrun_bands)
+max_diff, x, y = get_max_diff(
+    eigenvalues[0].cpu().numpy(), sk_fermi, vrun_bands
+)
 print("max_diff", max_diff)
+plt.plot(x, y, ".")
+plt.savefig("diff.png")
+plt.close()
