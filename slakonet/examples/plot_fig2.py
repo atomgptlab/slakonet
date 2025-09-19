@@ -13,21 +13,38 @@ import numpy as np
 import requests
 
 # Set up the figure with 4x2 subplots
-fig = plt.figure(figsize=(20, 26))
+fig = plt.figure(figsize=(20, 28))
 gs = GridSpec(4, 2, figure=fig, hspace=0.3, wspace=0.1)
 
-plt.rcParams.update({"font.size": 22})
+plt.rcParams.update({"font.size": 24})
 E_low = -4
 E_high = 4
 
 # List of materials to analyze
 jids = ["JVASP-816", "JVASP-1002", "JVASP-107", "JVASP-1174"]
-model_best = default_model()
+# model_best = default_model()
+
+
+def add_descriptive_panel_label(
+    ax, label, x=-0.12, y=1.05, fontsize=24, fontweight="bold"
+):
+    """
+    Add descriptive panel label like (a) JVASP-816 - Al
+    """
+    ax.text(
+        x,
+        y,
+        label,
+        transform=ax.transAxes,
+        fontsize=fontsize,
+        va="bottom",
+        ha="left",
+    )
 
 
 def get_max_diff_with_scatter(sk_bands, sk_fermi, vasprun, energy_tol=4):
     """
-    Modified version that returns scatter plot data
+    Fixed version that properly aligns energies and returns correct scatter plot data
     """
     # Get VASP bands relative to Fermi level
     vasp_eigs = (
@@ -35,9 +52,10 @@ def get_max_diff_with_scatter(sk_bands, sk_fermi, vasprun, energy_tol=4):
         - vasprun.efermi
     )
     vasp_eigs = vasp_eigs.T  # (n_kpoints, n_bands)
-    # print("vasprun.eigenvalues",vasprun.eigenvalue)
-    # Adjust SK bands
-    sk_adj = sk_bands - sk_fermi
+
+    # Convert SK bands to eV and adjust relative to SK Fermi level
+    sk_bands_eV = sk_bands * 27.21  # Convert from Hartree to eV
+    sk_adj = sk_bands_eV - sk_fermi
 
     differences = []
     energy_points = []
@@ -53,21 +71,24 @@ def get_max_diff_with_scatter(sk_bands, sk_fermi, vasprun, energy_tol=4):
 
         for sk_e in sk_valid:
             if len(vasp_valid) > 0:
-                min_diff = np.min(np.abs(sk_e - vasp_valid))
-                closest_vasp_idx = np.argmin(np.abs(sk_e - vasp_valid))
-                closest_vasp_e = vasp_valid[closest_vasp_idx]
+                distances = np.abs(sk_e - vasp_valid)
+                min_diff_idx = np.argmin(distances)
+                min_diff = distances[min_diff_idx]
+                closest_vasp_e = vasp_valid[min_diff_idx]
 
-                differences.append(min_diff)
-                energy_points.append(k)  # Use VASP energy as reference
-                # energy_points.append(closest_vasp_e)
-                # energy_points.append(sk_adj[k])
-                vasp_energies.append(closest_vasp_e)
+                # Only include reasonable matches (within 1 eV)
+                if min_diff < 5.0:
+                    differences.append(min_diff)
+                    energy_points.append(
+                        closest_vasp_e
+                    )  # Use VASP energy as reference
+                    vasp_energies.append(closest_vasp_e)
 
     max_diff = max(differences) if differences else 0.0
     return (
         max_diff,
         np.array(differences),
-        np.array(energy_points) - float(vasprun.efermi),
+        np.array(energy_points),
         vasp_energies,
     )
 
@@ -89,7 +110,7 @@ def filter_close_labels(points, labels, min_distance=5):
 
 
 def process_material(jid, row_idx):
-    """Process a single material and create plots"""
+    """Process a single material and create plots with descriptive panel labels"""
     print(f"Processing {jid}...")
 
     try:
@@ -204,8 +225,26 @@ def process_material(jid, row_idx):
             indir_gap = float(vrun_bands.get_indir_gap[0])
             vasp_efermi = float(vrun_bands.efermi)
 
+            # Create descriptive panel labels
+            panel_letters = ["a", "b", "c", "d", "e", "f", "g", "h"]
+            left_letter = panel_letters[
+                row_idx * 2
+            ]  # For left column: a, c, e, g
+            right_letter = panel_letters[
+                row_idx * 2 + 1
+            ]  # For right column: b, d, f, h
+
+            left_label = f"({left_letter}) {jid} - {formula}"
+            right_label = f"({right_letter}) Energy vs |Difference|"
+
             # PLOT 1: Band Structure Comparison
             ax1 = fig.add_subplot(gs[row_idx, 0])
+
+            # Add descriptive panel label to band structure plot
+            add_descriptive_panel_label(
+                ax1, left_label, x=0.2, y=1.02, fontsize=18
+            )
+            # add_descriptive_panel_label(ax1, left_label, x=-0.12, y=1.02, fontsize=18)
 
             # Plot VASP bands
             count = 0
@@ -217,7 +256,7 @@ def process_material(jid, row_idx):
                         np.arange(len(band_data)),
                         band_data,
                         color="r",
-                        label="VASP",
+                        label="OPT",
                         linewidth=1,
                         alpha=0.8,
                     )
@@ -263,15 +302,38 @@ def process_material(jid, row_idx):
 
             ax1.set_xlim([0, len(vrun_bands.kpoints._kpoints)])
             ax1.set_ylabel("E - E$_f$ (eV)")
-            ax1.set_title(
-                f"{jid} - {formula}\nVASP Gap: {indir_gap:.3f} eV, SK Gap: {bandgap:.3f} eV"
+            if indir_gap < 0.05:
+                indir_gap = 0.0
+
+            # Remove individual subplot titles since we have descriptive panel labels
+            # ax1.set_title(f"{jid} - {formula}\nVASP Gap: {indir_gap:.2f} eV, SK Gap: {bandgap:.2f} eV")
+
+            # Add gap information as text annotation instead
+            if bandgap < 0.06:
+                bandgap = 0.0
+            ax1.text(
+                0.02,
+                0.98,
+                f"VASP Gap: {indir_gap:.2f} eV\nSK Gap: {bandgap:.2f} eV",
+                transform=ax1.transAxes,
+                verticalalignment="top",
+                bbox=dict(boxstyle="round", facecolor="lightblue", alpha=0.8),
+                fontsize=20,
             )
+
             if row_idx == 0:  # Only show legend for the first row
-                ax1.legend(fontsize=10)
+                ax1.legend(fontsize=16, loc="upper right")
 
             # PLOT 2: Max Difference Analysis
             ax2 = fig.add_subplot(gs[row_idx, 1])
-            ax2.set_xlim([0, 5])
+            ax2.set_xlim([0, 2])  # Adjusted x-limit for better visualization
+
+            # Add descriptive panel label to difference plot
+            add_descriptive_panel_label(
+                ax2, right_label, x=0.2, y=1.02, fontsize=18
+            )
+            # add_descriptive_panel_label(ax2, right_label, x=-0.12, y=1.02, fontsize=18)
+
             # Get max difference data
             max_diff, differences, energy_points, vvv = (
                 get_max_diff_with_scatter(
@@ -280,23 +342,18 @@ def process_material(jid, row_idx):
             )
 
             if len(differences) > 0:
-                # Create scatter plot similar to your reference figure
-                # print("energy_points",energy_points)
-                # scatter = ax2.scatter(differences, energy_points, c='blue', alpha=0.6, s=3, rasterized=True)
-                # plt.plot(differences,np.linspace(-4, 4, 551) ,'.')
+                # Create scatter plot using actual energy points
                 scatter = ax2.scatter(
                     differences,
-                    np.linspace(E_low, E_high, len(differences)),
-                    c="blue",
-                    alpha=0.6,
-                    s=3,
+                    energy_points,  # Now using actual VASP energies
+                    c="black",
+                    alpha=0.3,
+                    s=8,
                     rasterized=True,
                 )
                 ax2.set_xlabel("δ = |E$_{VASP}$ - E$_{SK}$| (eV)")
                 # ax2.set_ylabel("E - E$_f$ (eV)")
-                # ax2.set_xlim(0, min(0.5, max(differences) * 1.1))
-                # ax2.set_ylim(-4, 4)
-
+                ax2.set_ylim(E_low, E_high)
                 ax2.grid(True, alpha=0.3)
                 ax2.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
                 ax2.axhline(
@@ -311,13 +368,13 @@ def process_material(jid, row_idx):
                 rms = np.sqrt(np.mean(differences**2))
                 ax2.text(
                     0.02,
-                    0.98,
-                    f"MAE: {mae:.3f} eV\nMax: {max_diff:.3f} eV",
-                    # ax2.text(0.02, 0.98, f'MAE: {mae:.3f} eV\nRMS: {rms:.3f} eV\nMax: {max_diff:.3f} eV',
+                    0.02,  # Position at bottom left instead of top
+                    f"MAE: {mae:.2f} eV\nRMS: {rms:.2f} eV\nMax: {max_diff:.2f} eV",
                     transform=ax2.transAxes,
-                    verticalalignment="top",
+                    # verticalalignment="bottom",
+                    verticalalignment="baseline",
                     bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
-                    fontsize=18,
+                    fontsize=20,
                 )
             else:
                 ax2.text(
@@ -327,9 +384,8 @@ def process_material(jid, row_idx):
                     transform=ax2.transAxes,
                     ha="center",
                     va="center",
+                    fontsize=20,
                 )
-
-            ax2.set_title(f"Energy vs |Difference|")
 
             print(
                 f"Completed {jid}: Max diff = {max_diff:.4f} eV, Points = {len(differences)}"
@@ -337,8 +393,19 @@ def process_material(jid, row_idx):
 
     except Exception as e:
         print(f"Error processing {jid}: {str(e)}")
-        # Create empty plots with error message
+
+        # Create error plots with panel labels
+        panel_letters = ["a", "b", "c", "d", "e", "f", "g", "h"]
+        left_letter = panel_letters[row_idx * 2]
+        right_letter = panel_letters[row_idx * 2 + 1]
+
+        left_label = f"({left_letter}) {jid} - Error"
+        right_label = f"({right_letter}) Error"
+
         ax1 = fig.add_subplot(gs[row_idx, 0])
+        add_descriptive_panel_label(
+            ax1, left_label, x=-0.12, y=1.02, fontsize=20
+        )
         ax1.text(
             0.5,
             0.5,
@@ -347,9 +414,11 @@ def process_material(jid, row_idx):
             ha="center",
             va="center",
         )
-        ax1.set_title(f"{jid} - Error")
 
         ax2 = fig.add_subplot(gs[row_idx, 1])
+        add_descriptive_panel_label(
+            ax2, right_label, x=-0.12, y=1.02, fontsize=20
+        )
         ax2.text(
             0.5,
             0.5,
@@ -358,25 +427,32 @@ def process_material(jid, row_idx):
             ha="center",
             va="center",
         )
-    return max_diff, differences, energy_points, vrun_bands, vvv
+
+    try:
+        return max_diff, differences, energy_points, vrun_bands, vvv
+    except:
+        return None, None, None, None, None
 
 
 # Process all materials
+results = []
 for i, jid in enumerate(jids):
-    max_diff, differences, energy_points, vrun_bands, vvv = process_material(
-        jid, i
-    )
+    result = process_material(jid, i)
+    results.append(result)
 
-# Add overall title
-# fig.suptitle('Band Structure Comparison and Energy Difference Analysis', fontsize=16, y=0.95)
+# Adjust layout to accommodate panel labels
+plt.subplots_adjust(left=0.1, right=0.95, top=0.95, bottom=0.05)
 
 # Save the figure
-plt.savefig("multi_material_analysis.png", dpi=300, bbox_inches="tight")
 plt.savefig(
-    "multi_material_analysis.pdf", bbox_inches="tight"
-)  # Also save as PDF
+    "multi_material_analysis_with_labels.png", dpi=300, bbox_inches="tight"
+)
+plt.savefig("multi_material_analysis_with_labels.pdf", bbox_inches="tight")
 plt.show()
 
-print(
-    "Analysis complete! Saved as 'multi_material_analysis.png' and 'multi_material_analysis.pdf'"
-)
+print("Analysis complete!")
+print("Panel labels:")
+print("(a) JVASP-816 - Al, (b) Energy vs |Difference|")
+print("(c) JVASP-1002 - Si, (d) Energy vs |Difference|")
+print("(e) JVASP-107 - SiC, (f) Energy vs |Difference|")
+print("(g) JVASP-1174 - GaAs, (h) Energy vs |Difference|")
