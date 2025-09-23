@@ -89,7 +89,7 @@ dos_energies = properties['dos_energy_grid_tensor']
 
 ## Supported Materials
 
-- **Elements**: Z = 1-65 (H to Tb)
+- **Elements**: Z = 1-65
 - **Material classes**: Oxides, carbides, nitrides, chalcogenides, halides, intermetallics
 - **Crystal structures**: All major structure types 
 
