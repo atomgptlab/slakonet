@@ -21,8 +21,8 @@ E_low = -4
 E_high = 4
 
 # List of materials to analyze
-jids = ["JVASP-816", "JVASP-1002", "JVASP-107", "JVASP-1174"]
-# model_best = default_model()
+jids = ["JVASP-816", "JVASP-1002", "JVASP-299", "JVASP-30"]
+model_best = default_model()
 
 
 def add_descriptive_panel_label(
@@ -255,19 +255,19 @@ def process_material(jid, row_idx):
                     ax1.plot(
                         np.arange(len(band_data)),
                         band_data,
-                        color="r",
+                        color="blue",
                         label="OPT",
-                        linewidth=1,
-                        alpha=0.8,
+                        linewidth=2,
+                        # alpha=0.8,
                     )
                     count += 1
                 else:
                     ax1.plot(
                         np.arange(len(band_data)),
                         band_data,
-                        color="r",
-                        linewidth=1,
-                        alpha=0.8,
+                        color="blue",
+                        linewidth=2,
+                        # alpha=0.8,
                     )
 
             # Plot SlaKoNet bands
@@ -279,13 +279,13 @@ def process_material(jid, row_idx):
                 if i == 0:
                     ax1.plot(
                         sk_band,
-                        c="b",
+                        c="green",
                         label="SlaKoNet",
-                        linewidth=1,
-                        alpha=0.8,
+                        linewidth=2,
+                        # alpha=0.8,
                     )
                 else:
-                    ax1.plot(sk_band, c="b", linewidth=1, alpha=0.8)
+                    ax1.plot(sk_band, c="green", linewidth=2)
 
             ax1.set_ylim([E_low, E_high])
             ax1.axhline(y=0, linestyle="--", color="gray", alpha=0.7)
@@ -314,7 +314,7 @@ def process_material(jid, row_idx):
             ax1.text(
                 0.02,
                 0.98,
-                f"VASP Gap: {indir_gap:.2f} eV\nSK Gap: {bandgap:.2f} eV",
+                f"OPT Gap: {indir_gap:.2f} eV\nSK Gap: {bandgap:.2f} eV",
                 transform=ax1.transAxes,
                 verticalalignment="top",
                 bbox=dict(boxstyle="round", facecolor="lightblue", alpha=0.8),

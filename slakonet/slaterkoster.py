@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Code associated with performing Slater-Koster transformations.
-
-This houses the code responsible for constructing & applying the Slater-Koster
-transformations that rotate matrix elements from the reference frame of the
-parametrisation set, [0,0,1], into that required by the calculation.
-
-Hamiltonian & overlap matrices can be constructed via calls to `sk_hs_matrix`.
-"""
+"""Code associated with performing Slater-Koster transformations."""
 from typing import Dict, Tuple
 import numpy as np
 import torch
@@ -18,12 +11,9 @@ from slakonet.skfeed import _SkFeed as SkFeed
 from slakonet.atoms import Geometry, Periodic
 from slakonet.basis import Basis
 from slakonet.utils import pack, split_by_size
-
-# from tbmalt import Basis, Periodic
-# from tbmalt.common import split_by_size
-# from tbmalt.common.batch import pack
-# from tbmalt.ml.skfeeds import SkFeed
 import torch.nn.functional as F
+
+# Adapted from TBMalT
 
 # Static module-level constants (used for SK transformation operations)
 _SQR3, _SQR6, _SQR10, _SQR15 = np.sqrt(
