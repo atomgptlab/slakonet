@@ -30,6 +30,10 @@ pip install -e .
 
 ## Quick Start
 
+### Google Colab example
+
+[Open in Colab](https://colab.research.google.com/github/knc6/jarvis-tools-notebooks/blob/master/jarvis-tools-notebooks/slakonet_example.ipynb)
+
 ### Example of Training Models
 
 ```bash
@@ -95,6 +99,9 @@ dos_energies = properties['dos_energy_grid_tensor']
 - **Speed**: <10 seconds for 1000-atom systems on GPU
 - **Scalability**: Efficient with GPU acceleration
 - **Coverage**: Validated on 50 semiconductor/insulator compounds for experiments
+
+![SlakoNet timing](https://github.com/atomgptlab/slakonet/blob/main/slakonet/examples/timing.png)
+
 
 ## Output Properties
 
