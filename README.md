@@ -9,7 +9,7 @@ Accurate and efficient prediction of electronic band structures is essential for
 
 - **Universal parameterization**: Works across 65 elements and their combinations
 - **Physics-informed**: Based on Slater-Koster tight-binding formalism
-- **High accuracy**: Mean absolute error of 0.81 eV for band gaps vs experimental values
+- **High accuracy**: Mean absolute error of 0.74 eV for band gaps vs experimental values
 - **Scalable**: GPU-accelerated calculations for systems up to 2000 atoms
 - **Comprehensive properties**: Predicts band structures, DOS, band gaps, and orbital projections
 
