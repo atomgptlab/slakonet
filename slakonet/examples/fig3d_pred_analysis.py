@@ -18,7 +18,7 @@ import plotly.graph_objs as go
 # Set notebook mode to work in offline
 pyo.init_notebook_mode()
 import plotly.express as px
-get_ipython().run_line_magic('matplotlib', 'inline')
+#get_ipython().run_line_magic('matplotlib', 'inline')
 # Load dataframe
 df = pd.DataFrame(loadjson('pred.json'))
 

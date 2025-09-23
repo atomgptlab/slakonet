@@ -15,6 +15,13 @@ Accurate and efficient prediction of electronic band structures is essential for
 
 ## Installation
 
+
+```bash
+pip install slakonet
+```
+
+or
+
 ```bash
 git clone https://github.com/atomgptlab/slakonet.git
 cd slakonet
