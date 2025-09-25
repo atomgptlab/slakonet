@@ -138,7 +138,7 @@ SlakoNet employs a neural network to learn distance-dependent Slater-Koster para
 ## Limitations
 
 - Limited to elements Z ≤ 65
-- Trained on specific DFT functional (TB-mBJ)
+- Trained on specific meta-GGA DFT (TBmBJ)
 - Discrepancies in conduction band descriptions
 - No self-consistent cycle
 - No spin-orbit coupling or magnetic properties
