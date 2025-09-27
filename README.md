@@ -152,7 +152,7 @@ If you use SlakoNet in your research, please cite:
   title={SlaKoNet: A Unified Slater-Koster Tight-Binding Framework Using Neural Network Infrastructure for the Periodic Table},
   author={Choudhary, Kamal},
   journal={ChemRxiv},
-  doi={https://doi.org/10.26434/chemrxiv-2025-4vjr9},
+  doi={https://doi.org/10.26434/chemrxiv-2025-4vjr9-v2},
   year={2025}
 }
 ```
