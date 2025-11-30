@@ -383,6 +383,7 @@ def plot_band_dos_atoms(
     if not model:
         model = load_trained_model(model_path)
     model = model.float()
+    # print("MODEL PATHHHHH", model_path)
     properties, atoms, kpoints = get_properties(
         jid=jid, model=model, atoms=atoms
     )

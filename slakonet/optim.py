@@ -208,6 +208,18 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
             self._initialize_skf_optimizers()
 
+    def __getitem__(self, key):
+        """Allow model['Ag-Ag'] syntax"""
+        return self.skf_optimizers[key]
+
+    def __setitem__(self, key, value):
+        """Allow model['Ag-Ag'] = value syntax"""
+        self.skf_optimizers[key] = value
+
+    def __contains__(self, key):
+        """Allow 'Ag-Ag' in model syntax"""
+        return key in self.skf_optimizers
+
     def save_model(self, save_path, method="state_dict"):
         """
         Save the model using different methods
@@ -509,6 +521,74 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 "class_name": "MultiElementSkfParameterOptimizer",
                 "ultra_compact": True,
             },
+            "trained_parameters": state_dict,
+            "skf_metadata": {},
+            "r_spline_data": {},  # ADD THIS
+        }
+
+        # Store only non-parameter metadata from each SKF
+        for pair_key, optimizer in self.skf_optimizers.items():
+            skf_dict = optimizer.skf_dict.copy()
+
+            # Remove parameter data (we have it in state_dict)
+            skf_dict.pop("hamiltonian", None)
+            skf_dict.pop("overlap", None)
+
+            compact_data["skf_metadata"][pair_key] = skf_dict
+
+            # ADD: Save r_spline if it exists
+            if (
+                hasattr(optimizer, "r_spline")
+                and optimizer.r_spline is not None
+            ):
+                compact_data["r_spline_data"][pair_key] = {
+                    "grid": optimizer.r_spline.grid,
+                    "cutoff": optimizer.r_spline.cutoff,
+                    "spline_coef": optimizer.r_spline.spline_coef,
+                    "exp_coef": optimizer.r_spline.exp_coef,
+                    "tail_coef": optimizer.r_spline.tail_coef,
+                }
+
+        torch.save(compact_data, save_file)
+
+        # Calculate size savings
+        original_h_size = sum(
+            len(opt.skf_dict.get("hamiltonian", {}))
+            for opt in self.skf_optimizers.values()
+        )
+        original_s_size = sum(
+            len(opt.skf_dict.get("overlap", {}))
+            for opt in self.skf_optimizers.values()
+        )
+        total_eliminated = original_h_size + original_s_size
+
+        print(f"✅ Compact model saved to: {save_file}")
+        print(f"   Eliminated {total_eliminated} duplicate parameter copies")
+        if compact_data["r_spline_data"]:
+            print(
+                f"   Saved r_spline for {len(compact_data['r_spline_data'])} pairs"
+            )
+
+    def save_ultra_compact_old(self, save_path):
+        """
+        Save everything in a single .pt file with minimal redundancy
+        Only stores trained parameters once, reconstructs skf_dict on load
+        """
+        save_file = Path(save_path).with_suffix(".pt")
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Get current trained parameters
+        state_dict = self.state_dict()
+
+        compact_data = {
+            "metadata": {
+                "skf_directory": self.skf_directory,
+                "elements_in_system": list(self.elements_in_system),
+                "element_pairs": [list(pair) for pair in self.element_pairs],
+                "available_pairs": list(self.skf_optimizers.keys()),
+                "class_name": "MultiElementSkfParameterOptimizer",
+                "ultra_compact": True,
+            },
             "trained_parameters": state_dict,  # Only store trained params once
             "skf_metadata": {},  # Only store non-parameter data from skf_dict
         }
@@ -542,6 +622,117 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
     @classmethod
     def load_ultra_compact(cls, load_path):
+        """
+        Load ultra-compact model and reconstruct skf_dict from trained parameters
+        """
+        t1 = time.time()
+        load_file = Path(load_path).with_suffix(".pt")
+        compact_data = torch.load(
+            load_file, map_location="cpu"
+        )  # ADD map_location
+
+        if not compact_data["metadata"].get("ultra_compact", False):
+            raise ValueError("This is not an ultra-compact model file")
+
+        metadata = compact_data["metadata"]
+        state_dict = compact_data["trained_parameters"]
+        skf_metadata = compact_data["skf_metadata"]
+        r_spline_data = compact_data.get("r_spline_data", {})  # ADD THIS
+
+        # Create new instance
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+
+        # Restore basic attributes
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        # Recreate atomic number mapping
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+
+        # Recreate SKF optimizers
+        instance.skf_optimizers = nn.ModuleDict()
+
+        for pair_key in metadata["available_pairs"]:
+            # Create optimizer
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            # Get the metadata (everything except hamiltonian/overlap)
+            skf_dict = skf_metadata[pair_key].copy()
+
+            # Extract trained parameters for this pair from state_dict
+            h_params = {}
+            s_params = {}
+
+            for key, value in state_dict.items():
+                if key.startswith(f"skf_optimizers.{pair_key}.h_params."):
+                    param_name = key.replace(
+                        f"skf_optimizers.{pair_key}.h_params.", ""
+                    )
+                    h_params[param_name] = value
+                elif key.startswith(f"skf_optimizers.{pair_key}.s_params."):
+                    param_name = key.replace(
+                        f"skf_optimizers.{pair_key}.s_params.", ""
+                    )
+                    s_params[param_name] = value
+
+            # Reconstruct full skf_dict with trained parameters
+            skf_dict["hamiltonian"] = h_params
+            skf_dict["overlap"] = s_params
+
+            optimizer.skf_dict = skf_dict
+
+            # Create parameter dicts
+            optimizer.h_params = nn.ParameterDict(
+                {k: nn.Parameter(v.clone()) for k, v in h_params.items()}
+            )
+            optimizer.s_params = nn.ParameterDict(
+                {k: nn.Parameter(v.clone()) for k, v in s_params.items()}
+            )
+
+            # Set other attributes
+            optimizer.grid = skf_dict.get("grid", None)
+            optimizer.atomic_data = skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+            # ADD: Restore r_spline if it exists
+            if pair_key in r_spline_data:
+                from slakonet.skf import Skf
+
+                rspl_data = r_spline_data[pair_key]
+                optimizer.r_spline = Skf.RSpline(
+                    grid=rspl_data["grid"],
+                    cutoff=rspl_data["cutoff"],
+                    spline_coef=rspl_data["spline_coef"],
+                    exp_coef=rspl_data["exp_coef"],
+                    tail_coef=rspl_data["tail_coef"],
+                )
+            else:
+                optimizer.r_spline = None
+
+            instance.skf_optimizers[pair_key] = optimizer
+
+        # Load the state dict (this should work since we reconstructed the structure)
+        instance.load_state_dict(state_dict)
+        t2 = time.time()
+
+        print(f"✅ Compact model loaded from: {load_file}")
+        if r_spline_data:
+            print(f"   Restored r_spline for {len(r_spline_data)} pairs")
+        print("Time taken:", round(t2 - t1, 3))
+        return instance
+
+    @classmethod
+    def load_ultra_compact_old(cls, load_path):
         """
         Load ultra-compact model and reconstruct skf_dict from trained parameters
         """
@@ -1365,8 +1556,115 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         print("=" * 70)
 
 
-# Keep original SkfParameterOptimizer class
 class SkfParameterOptimizer(nn.Module):
+    """Trainable SKF parameters for fitting to DFT data with constraints"""
+
+    def __init__(self, skf_path):
+        super().__init__()
+
+        # Load initial SKF parameters
+        self.skf = Skf.from_skf(skf_path)
+        self.skf_dict = self.skf.to_dict()
+
+        # Store original parameters for reference
+        self.original_h_params = {}
+        self.original_s_params = {}
+
+        # Make Hamiltonian and overlap parameters trainable
+        h_param_dict = {}
+        for key, value in self.skf_dict["hamiltonian"].items():
+            original_tensor = torch.tensor(value).type(
+                torch.get_default_dtype()
+            )
+            self.original_h_params[key] = original_tensor.clone()
+            h_param_dict[key] = nn.Parameter(original_tensor)
+
+        s_param_dict = {}
+        for key, value in self.skf_dict["overlap"].items():
+            original_tensor = torch.tensor(value).type(
+                torch.get_default_dtype()
+            )
+            self.original_s_params[key] = original_tensor.clone()
+            s_param_dict[key] = nn.Parameter(original_tensor)
+
+        self.h_params = nn.ParameterDict(h_param_dict)
+        self.s_params = nn.ParameterDict(s_param_dict)
+
+        # Store other fixed parameters
+        self.grid = self.skf_dict.get("grid", None)
+        self.atomic_data = self.skf_dict.get("atomic_data", None)
+        self.atom_pair = self.skf_dict.get("atom_pair", None)
+        self.hs_cutoff = self.skf_dict.get("hs_cutoff", None)
+
+        # Initialize r_spline
+        self.r_spline = None
+
+    def get_updated_skf(self):
+        """Create updated SKF with current parameters (including r_spline)"""
+        updated_dict = self.skf_dict.copy()
+        updated_h = {key: param for key, param in self.h_params.items()}
+        updated_s = {key: param for key, param in self.s_params.items()}
+        updated_dict["hamiltonian"] = updated_h
+        updated_dict["overlap"] = updated_s
+
+        # Include r_spline if it exists - convert to dict format
+        if hasattr(self, "r_spline") and self.r_spline is not None:
+            updated_dict["r_spline"] = {
+                "grid": self.r_spline.grid,
+                "cutoff": self.r_spline.cutoff,
+                "spline_coef": self.r_spline.spline_coef,
+                "exp_coef": self.r_spline.exp_coef,
+                "tail_coef": self.r_spline.tail_coef,
+            }
+
+        return Skf.from_dict(updated_dict)
+
+    def apply_constraints(self, c=[0.9, 0.7, 0.95, 0.9]):
+        """Apply physics-aware constraints"""
+        # Create original params lazily if they don't exist (for ultra-compact loaded models)
+        if not hasattr(self, "original_h_params"):
+            self.original_h_params = {
+                k: v.clone().detach() for k, v in self.h_params.items()
+            }
+        if not hasattr(self, "original_s_params"):
+            self.original_s_params = {
+                k: v.clone().detach() for k, v in self.s_params.items()
+            }
+
+        # Apply constraints
+        with torch.no_grad():
+            for key, param in self.h_params.items():
+                original = self.original_h_params[key]
+                if key.split("-")[0] == key.split("-")[1]:  # Diagonal terms
+                    param.data = torch.clamp(
+                        param.data,
+                        original * c[0],
+                        original * (1 + (1 - c[0])),
+                    )
+                else:  # Off-diagonal terms
+                    param.data = torch.clamp(
+                        param.data,
+                        original * c[1],
+                        original * (1 + (1 - c[1])),
+                    )
+
+            for key, param in self.s_params.items():
+                original = self.original_s_params[key]
+                if key.split("-")[0] == key.split("-")[1]:  # Diagonal terms
+                    param.data = torch.clamp(
+                        param.data,
+                        torch.maximum(original * c[2], torch.tensor(0.1)),
+                        original * (1 + (1 - c[2])),
+                    )
+                else:  # Off-diagonal terms
+                    param.data = torch.clamp(
+                        param.data,
+                        original * c[3],
+                        original * (1 + (1 - c[3])),
+                    )
+
+
+class SkfParameterOptimizer_old(nn.Module):
     """Trainable SKF parameters for fitting to DFT data with constraints"""
 
     def __init__(self, skf_path):
@@ -1407,6 +1705,7 @@ class SkfParameterOptimizer(nn.Module):
         self.atomic_data = self.skf_dict.get("atomic_data", None)
         self.atom_pair = self.skf_dict.get("atom_pair", None)
         self.hs_cutoff = self.skf_dict.get("hs_cutoff", None)
+        self.r_spline = None
 
     def apply_constraints(self, c=[0.9, 0.7, 0.95, 0.9]):
         """Apply physics-aware constraints"""
@@ -1452,13 +1751,27 @@ class SkfParameterOptimizer(nn.Module):
                         original * (1 + (1 - c[3])),
                     )
 
-    def get_updated_skf(self):
+    def get_updated_skf_old(self):
         """Create updated SKF with current parameters"""
         updated_dict = self.skf_dict.copy()
         updated_h = {key: param for key, param in self.h_params.items()}
         updated_s = {key: param for key, param in self.s_params.items()}
         updated_dict["hamiltonian"] = updated_h
         updated_dict["overlap"] = updated_s
+        return Skf.from_dict(updated_dict)
+
+    def get_updated_skf(self):  # SINGULAR - this is CORRECT
+        """Create updated SKF with current parameters"""
+        updated_dict = self.skf_dict.copy()
+        updated_h = {key: param for key, param in self.h_params.items()}
+        updated_s = {key: param for key, param in self.s_params.items()}
+        updated_dict["hamiltonian"] = updated_h
+        updated_dict["overlap"] = updated_s
+
+        # ADD: Include r_spline if it exists
+        if hasattr(self, "r_spline") and self.r_spline is not None:
+            updated_dict["r_spline"] = self.r_spline
+
         return Skf.from_dict(updated_dict)
 
 
@@ -2007,9 +2320,12 @@ def default_model(dir_path=None, model_name="slakonet_v0"):
     cached_model_file = os.path.join(dir_path, f"{model_name}.pt")
     if os.path.exists(cached_model_file):
         print(f"Loading cached model from {cached_model_file}")
-        return MultiElementSkfParameterOptimizer.load_ultra_compact(
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
             cached_model_file
         )
+        model.eval()
+        model = model.float()
+        return model
 
     # Check if zip file already exists
     zip_file = os.path.join(dir_path, f"{model_name}.zip")
@@ -2032,9 +2348,11 @@ def default_model(dir_path=None, model_name="slakonet_v0"):
                 cache_file.write(model_data)
 
             # Load the model
-            return MultiElementSkfParameterOptimizer.load_ultra_compact(
+            model = MultiElementSkfParameterOptimizer.load_ultra_compact(
                 cached_model_file
             )
+            model = model.float()
+            return model
 
     # If we get here, need to download
     url = "https://figshare.com/ndownloader/files/57945370"
@@ -2072,9 +2390,11 @@ def default_model(dir_path=None, model_name="slakonet_v0"):
             cache_file.write(model_data)
 
         # Load the model
-        return MultiElementSkfParameterOptimizer.load_ultra_compact(
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
             cached_path
         )
+        model = model.float()
+        return model
 
 
 # """

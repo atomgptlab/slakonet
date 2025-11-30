@@ -253,6 +253,35 @@ class Periodic:
             )
         )
 
+    def to(self, device: torch.device) -> "Geometry":
+        """Returns a copy of the `Geometry` instance on the specified device
+
+        This method creates and returns a new copy of the `Geometry` instance
+        on the specified device "``device``".
+
+        Arguments:
+            device: Device to which all associated tensors should be moved.
+
+        Returns:
+            geometry: A copy of the `Geometry` instance placed on the
+                specified device.
+
+        Notes:
+            If the `Geometry` instance is already on the desired device then
+            `self` will be returned.
+        """
+        # Developers Notes: It is imperative that this function gets updated
+        # whenever new attributes are added to the `Geometry` class. Otherwise
+        # this will return an incomplete `Geometry` object.
+        if self.atomic_numbers.device == device:
+            return self
+        else:
+            return self.__class__(
+                self.atomic_numbers.to(device=device),
+                self.positions.to(device=device),
+                self.latvec.to(device=device),
+            )
+
     def supercell(self, idx: Tensor):
 
         # convert single to batch

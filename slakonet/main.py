@@ -75,6 +75,8 @@ class SimpleDftb:
         repulsive=False,
         device=None,
         with_eigenvectors=False,
+        model=None,
+        ham=None,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -94,12 +96,14 @@ class SimpleDftb:
         # Initialize basis
         self.basis = Basis(self.geometry.atomic_numbers, self.shell_dict)
         self.atom_orbitals = self.basis.orbs_per_atom
-
-        # Initialize periodic structure with k-points
+        self.model = model
+        self.ham = ham
+        if self.h_feed is None:
+            updated_skfs = self.get_updated_skfs()
         if kpoints is not None and klines is not None:
             self.periodic = Periodic(
-                self.geometry,
-                self.geometry.cell,
+                self.geometry.to(device),
+                self.geometry.cell.to(device),
                 cutoff=20.0,
                 kpoints=kpoints,
                 klines=klines,
@@ -107,7 +111,7 @@ class SimpleDftb:
         elif kpoints is not None:
             self.periodic = Periodic(
                 self.geometry, self.geometry.cell, cutoff=20.0, kpoints=kpoints
-            )
+            )  # ??????????????????????? 20 Angtrom
         elif klines is not None:
             self.periodic = Periodic(
                 self.geometry, self.geometry.cell, cutoff=20.0, klines=klines
@@ -127,6 +131,103 @@ class SimpleDftb:
         self._band_gap = None
         self._occupations = None
 
+    @classmethod
+    def load_model(cls, load_path):
+        """
+        Load the model using different methods
+
+        Args:
+            load_path: Path to load the model from
+            method: 'state_dict', 'full_model', or 'universal_params'
+            skf_directory: SKF directory (needed for some methods)
+        """
+        load_path = Path(load_path)
+        t1 = time.time()
+        load_file = Path(load_path).with_suffix(".pt")
+        compact_data = torch.load(load_file)
+
+        if not compact_data["metadata"].get("ultra_compact", False):
+            raise ValueError("This is not an ultra-compact model file")
+
+        metadata = compact_data["metadata"]
+        state_dict = compact_data["trained_parameters"]
+        skf_metadata = compact_data["skf_metadata"]
+
+        # Create new instance
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+
+        # Restore basic attributes
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        # Recreate atomic number mapping
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+
+        # Recreate SKF optimizers
+        instance.skf_optimizers = nn.ModuleDict()
+
+        for pair_key in metadata["available_pairs"]:
+            # Create optimizer
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            # Get the metadata (everything except hamiltonian/overlap)
+            skf_dict = skf_metadata[pair_key].copy()
+
+            # Extract trained parameters for this pair from state_dict
+            h_params = {}
+            s_params = {}
+
+            for key, value in state_dict.items():
+                if key.startswith(f"skf_optimizers.{pair_key}.h_params."):
+                    param_name = key.replace(
+                        f"skf_optimizers.{pair_key}.h_params.", ""
+                    )
+                    h_params[param_name] = value
+                elif key.startswith(f"skf_optimizers.{pair_key}.s_params."):
+                    param_name = key.replace(
+                        f"skf_optimizers.{pair_key}.s_params.", ""
+                    )
+                    s_params[param_name] = value
+
+            # Reconstruct full skf_dict with trained parameters
+            skf_dict["hamiltonian"] = h_params
+            skf_dict["overlap"] = s_params
+
+            optimizer.skf_dict = skf_dict
+
+            # Create parameter dicts
+            optimizer.h_params = nn.ParameterDict(
+                {k: nn.Parameter(v.clone()) for k, v in h_params.items()}
+            )
+            optimizer.s_params = nn.ParameterDict(
+                {k: nn.Parameter(v.clone()) for k, v in s_params.items()}
+            )
+
+            # Set other attributes
+            optimizer.grid = skf_dict.get("grid", None)
+            optimizer.atomic_data = skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+            instance.skf_optimizers[pair_key] = optimizer
+
+        # Load the state dict (this should work since we reconstructed the structure)
+        instance.load_state_dict(state_dict)
+        t2 = time.time()
+
+        print(f"✅ Compact model loaded from: {load_file}")
+        print("Time taken:", round(t2 - t1, 3))
+        return instance
+
     def compute_hs_matrices(self):
         """Compute Hamiltonian and overlap matrices."""
         # print("Computing H and S matrices...")
@@ -135,12 +236,160 @@ class SimpleDftb:
         self.ham = self.ham.to(self.device)
         self.overlap = self.overlap.to(self.device)
 
+    def get_electronic_energy(self):
+        if not self.ham:
+            self.compute_hs_matrices()
+        eigenvalues_list = []
+        occupations_list = []
+        for ik in range(self.max_nk):
+            # self.ham: (batch_size,n_orb,n_orb,n_kpoints)
+            h_k = self.ham[..., ik]
+            s_k = self.overlap[..., ik]
+            eigenvals, eigenvecs = eighb(h_k, s_k)
+            # Get occupations (CHECK: does fermi preserve gradients?)
+            occ, fermi_level = fermi(eigenvals, self.nelectron)
+            eigenvalues_list.append(eigenvals)
+            occupations_list.append(occ)
+        eigenvalues = torch.stack(eigenvalues_list)
+        occupations = torch.stack(occupations_list)
+        electronic_energy = torch.sum(
+            eigenvalues * occupations * self.k_weights.unsqueeze(-1)
+        )
+        if electronic_energy.is_complex():
+            electronic_energy = torch.real(electronic_energy)
+        return electronic_energy
+
+    def evaluate_repulsive_spline(self, s, r):
+        """Evaluate repulsive energy at distance r."""
+        if r > s.r_spline.cutoff:
+            return torch.tensor(0.0)
+        elif r < s.r_spline.grid[0]:
+            # Exponential: c + exp(-a*r + b)
+            return s.r_spline.exp_coef[2] + torch.exp(
+                -s.r_spline.exp_coef[0] * r + s.r_spline.exp_coef[1]
+            )
+        else:
+            # Cubic spline: c0 + c1*dr + c2*dr^2 + c3*dr^3
+            idx = torch.searchsorted(s.r_spline.grid, r) - 1
+            idx = torch.clamp(idx, 0, len(s.r_spline.grid) - 2)
+            c = s.r_spline.spline_coef[idx]
+            dr = r - s.r_spline.grid[idx]
+            return c[0] + c[1] * dr + c[2] * dr**2 + c[3] * dr**3
+
+    def get_total_energy(self):
+        rep = self.get_repulsive_energy()
+        elec = self._calculate_electronic_energy()
+        print("rep", rep)
+        print("elec", elec)
+        return rep  # +elec
+
+    def get_repulsive_energy(self):
+        self.rep_energy = torch.zeros(self.periodic.n_atoms.shape)
+        uan = self.periodic.unique_atomic_numbers()
+        n_global = len(uan)
+        uap = (
+            torch.stack(
+                [uan.repeat(n_global), uan.repeat_interleave(n_global)]
+            ).T
+        ).to(self.device)
+        atom_pairs = self.basis.atomic_number_matrix("atomic").to(self.device)
+
+        # Get the device from periodic.distances to ensure consistency
+        device = self.device  # self.periodic.distances.device
+        energy = torch.zeros(self.periodic.distances.shape, device=device)
+
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        atomic_num_to_symbol = dict(zip(zz, z))
+        dist_mat = self.periodic.distances.to(device)
+        for iap in uap:
+            # get rid of the same atom interaction
+            mask_dist = dist_mat.ne(0)
+            element_symbol_i = atomic_num_to_symbol.get(iap[0].item())
+            element_symbol_j = atomic_num_to_symbol.get(iap[1].item())
+            element_pair = "-".join(
+                tuple(sorted([element_symbol_i, element_symbol_j]))
+            )
+            skf = self.model.get_updated_skfs()[element_pair]
+            r_cutoff = skf.r_spline.cutoff
+
+            # get mask for different atom pairs
+            mask_cut = dist_mat.lt(r_cutoff)
+
+            # Expand atom_pairs to match the periodic images dimension
+            atom_pairs_expanded = atom_pairs.unsqueeze(-2).expand(
+                -1, -1, -1, mask_dist.shape[-1], -1
+            )
+            print(
+                "device = self.periodic.distances",
+                self.periodic.distances.device,
+            )
+            # Now compare with iap
+            mask = (
+                ((iap == atom_pairs_expanded).sum(-1) == 2)
+                * mask_dist
+                * mask_cut
+            )
+            d_mask = dist_mat[mask]
+
+            # 1. exponential repulsive
+            r_a123 = skf.r_spline.exp_coef.to(
+                device
+            )  # Ensure coefficients are on the right device
+            energy[mask] = (
+                energy[mask]
+                + torch.exp(-r_a123[0] * d_mask + r_a123[1])
+                + r_a123[2]
+            )
+
+            # 2. spline repulsive
+            r_table = skf.r_spline.spline_coef.to(device)
+            grid = skf.r_spline.grid.to(device)
+
+            mask2 = (
+                dist_mat.le(grid[-1]) * dist_mat.ge(grid[0]) * mask
+            ) * mask_dist
+            ind1 = (torch.searchsorted(grid, dist_mat) - 1)[mask2]
+            r_pol = r_table[ind1]
+            deltar = dist_mat[mask2] - grid[ind1]
+            energy[mask2] = (
+                r_pol[..., 0]
+                + r_pol[..., 1] * deltar
+                + r_pol[..., 2] * deltar**2
+                + r_pol[..., 3] * deltar**3
+            )
+
+            # 3. bounds distances spline repulsive
+            r_table_l = skf.r_spline.tail_coef.to(device)
+            grid_l = skf.r_spline.grid.to(device)
+            mask_l = (
+                dist_mat.le(grid_l[1]) * dist_mat.ge(grid_l[0]) * mask
+            ) * mask_dist
+            ind_l = (torch.searchsorted(grid_l, dist_mat) - 1)[mask_l]
+            deltar_l = dist_mat[mask_l] - grid_l[ind_l]
+            if mask_l.any():
+                energy[mask_l] = (
+                    r_table_l[0]
+                    + r_table_l[1] * deltar_l
+                    + r_table_l[2] * deltar_l**2
+                    + r_table_l[3] * deltar_l**3
+                    + r_table_l[4] * deltar_l**4
+                    + r_table_l[5] * deltar_l**5
+                )
+
+        if not dist_mat.dim() == 4:
+            return 0.5 * energy.sum(-1).sum(-1)
+        else:
+            return 0.5 * energy.sum(-1).sum(-1).sum(-1)
+
     def solve_kpoint(self, ik):
         """Solve eigenvalue problem for k-point ik."""
         # Get matrices for this k-point
         h_k = self.ham[..., ik]
         s_k = self.overlap[..., ik]
-
+        # print('h_kkkk',h_k.shape)
         # Solve generalized eigenvalue problem
         # eigenvals, eigenvecs = eighb(h_k, s_k, scheme="chol")
         eigenvals, eigenvecs = eighb(h_k, s_k, scheme="chol")
@@ -301,7 +550,14 @@ class SimpleDftb:
 
         return forces
 
-    def calculate_phonon_modes(self, line_density=5, write_fc=True):
+    def calculate_phonon_modes(
+        self,
+        line_density=5,
+        write_fc=True,
+        dim=[1, 1, 1],
+        distance=0.05,
+        electron_kpoints=[5, 5, 5],
+    ):
         """Calculate phonon modes and frequencies using Phonopy."""
         print("Setting up phonon calculation...")
 
@@ -319,8 +575,8 @@ class SimpleDftb:
             cartesian=True,
         )
         kpoints = Kpoints().kpath(atoms, line_density=line_density)
-        dim = [1, 1, 1]
-        distance = 0.05
+        # dim = [1, 1, 1]
+        # distance = 0.05
         # Convert to phonopy format
         bulk = atoms.phonopy_converter()
         self.phonon = Phonopy(
@@ -357,7 +613,7 @@ class SimpleDftb:
             calc_bands = SimpleDftb(
                 geometry,
                 shell_dict=self.shell_dict,
-                kpoints=torch.tensor([5, 5, 5]),
+                kpoints=torch.tensor(electron_kpoints),
                 # klines=klines,
                 h_feed=self.h_feed,
                 s_feed=self.s_feed,
@@ -399,13 +655,69 @@ class SimpleDftb:
             filename="phonopy_disp.yaml",
         )
 
+        # Calculate BS
+        lbls = kpoints.labels
+        lbls_ticks = []
+        freqs = []
+        tmp_kp = []
+        lbls_x = []
+        count = 0
+        for ii, k in enumerate(kpoints.kpts):
+            k_str = ",".join(map(str, k))
+            if ii == 0:
+                tmp = []
+                for i, freq in enumerate(self.phonon.get_frequencies(k)):
+                    tmp.append(freq)
+                freqs.append(tmp)
+                tmp_kp.append(k_str)
+                lbl = "$" + str(lbls[ii]) + "$"
+                lbls_ticks.append(lbl)
+                lbls_x.append(count)
+                count += 1
+                # lbls_x.append(ii)
+            elif k_str != tmp_kp[-1]:
+                tmp_kp.append(k_str)
+                tmp = []
+                for i, freq in enumerate(self.phonon.get_frequencies(k)):
+                    tmp.append(freq)
+                freqs.append(tmp)
+                lbl = lbls[ii]
+                if lbl != "":
+                    lbl = "$" + str(lbl) + "$"
+                    lbls_ticks.append(lbl)
+                    # lbls_x.append(ii)
+                    lbls_x.append(count)
+                count += 1
+        # lbls_x = np.arange(len(lbls_ticks))
+        freq_conversion_factor = 33.3566830
+        freqs = np.array(freqs)
+        freqs = freqs * freq_conversion_factor
+        # print('freqs',freqs,freqs.shape)
+        # the_grid = GridSpec(1, 2, width_ratios=[3, 1], wspace=0.0)
+        # plt.rcParams.update({"font.size": 18})
+        plt.figure(figsize=(10, 5))
+        # plt.subplot(the_grid[0])
+        for i in range(freqs.shape[1]):
+            plt.plot(freqs[:, i], lw=2, c="b")
+        for i in lbls_x:
+            plt.axvline(x=i, c="black")
+        plt.xticks(lbls_x, lbls_ticks)
+        # print('lbls_x',lbls_x,len(lbls_x))
+        # print('lbls_ticks',lbls_ticks,len(lbls_ticks))
+        plt.ylabel("Frequency (cm$^{-1}$)")
+        plt.xlim([0, max(lbls_x)])
+        plt.savefig("phonon_bands.png")
+        plt.close()
+
         # Calculate phonon DOS
         self.phonon.run_mesh(
             [40, 40, 40], is_gamma_center=True, is_mesh_symmetry=False
         )
         self.phonon.run_total_dos()
         tdos = self.phonon._total_dos
-        freqs, ds = tdos.get_dos()
+        freqs = tdos.frequency_points
+        ds = tdos.dos
+        # freqs, ds = tdos.get_dos()
         freqs = np.array(freqs)
         freq_conversion_factor = 33.3566830
         freqs = freqs * freq_conversion_factor
@@ -1974,29 +2286,11 @@ class SimpleDftb:
 
 # Example usage
 if __name__ == "__main__":
-    # Read geometry
-    atoms = Atoms.from_poscar("tests/POSCAR-SiC.vasp")
-    atoms = Atoms.from_poscar("tests/POSCAR")
+    atoms = Atoms.from_poscar("tests/POSCAR").make_supercell_matrix([2, 2, 2])
     geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
-    cell = torch.tensor(
-        [
-            [6.3573, -0.0000, 3.6704],
-            [2.1191, 5.9937, 3.6704],
-            [-0.0000, -0.0000, 7.3408],
-        ]
-    )
-
-    # pos=pos.requires_grad_(True)
-    geometry = Geometry(
-        torch.tensor([[14, 14]]),
-        torch.tensor([[[7.4169, 5.2445, 12.8464], [1.0596, 0.7492, 1.8352]]]),
-        cell,
-    )
     geometry.positions.requires_grad_(True)
     # Setup k-points and k-lines
     kpoints2 = torch.tensor([5, 5, 5])  # For DOS
-    atoms = Atoms.from_poscar("tests/POSCAR-Al")
-    geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
     klines = torch.tensor(
         [
             [0.0, 0.0, 0.0, -0.5, 0.5, 0.0, 10],
@@ -2019,7 +2313,7 @@ if __name__ == "__main__":
     path_to_skf = "tests/Si-Si.skf"
     path_to_skf = "tests/Al-Al.skf"
     from slakonet.skf import Skf
-    from slakonet.interpolation import PolyInterpU, BSpline
+    from slakonet.interpolation import PolyInterpU
 
     interpolator = PolyInterpU
     sk = Skf.from_skf(path_to_skf)
@@ -2055,31 +2349,6 @@ if __name__ == "__main__":
         )
 
     s_feed = SkfFeed(hs_dict, onsite_hs_dict, shell_dict)
-    """
-    print("hs_dict",hs_dict)
-    import sys
-    sys.exit()
-
-    # Initialize feeds
-    h_feed = SkfFeed.from_dir(
-        path_to_skf,
-        shell_dict,
-        skf_type="skf",
-        geometry=geometry,
-        integral_type="H",
-    )
-    s_feed = SkfFeed.from_dir(
-        path_to_skf,
-        shell_dict,
-        skf_type="skf",
-        geometry=geometry,
-        integral_type="S",
-    )
-    skparams = SkfParamFeed.from_dir(
-        path_to_skf, geometry, skf_type="skf", repulsive=True
-    )
-    """
-
     # nelectron = torch.tensor([8])  # skparams.qzero.sum(-1)
     if "atomic_data" in dd:  # and skf_dict["atomic_data"]:
         occupations = dd["atomic_data"]["occupations"]
@@ -2097,7 +2366,7 @@ if __name__ == "__main__":
         s_feed=s_feed,
         nelectron=nelectron,
     )
-
+    calc_bands.get_repulsive_energy()
     # Run calculation
     print("Computing band structure...")
     eigenvalues_bands = calc_bands()
@@ -2105,156 +2374,10 @@ if __name__ == "__main__":
     # print("forces", calc_bands._compute_forces_finite_diff())
     # x, y = calc_bands.calculate_phonon_modes()
     print("\nPlotting band structure...")
+    import sys
+
+    sys.exit()
     fig_bands, ax_bands = calc_bands.plot_band_structure(
         fermi_shift=True, save_path="bands_enhanced.png"
     )
     plt.show()
-    import sys
-
-    sys.exit()
-    # Create calculator for DOS (with k-point grid)
-    calc_dos = SimpleDftb(
-        geometry,
-        shell_dict=shell_dict,
-        kpoints=kpoints2,
-        h_feed=h_feed,
-        s_feed=s_feed,
-        nelectron=nelectron,
-    )
-
-    print("Computing DOS...")
-    eigenvalues_dos = calc_dos()
-    properties = calc_dos.get_properties_dict(
-        include_bulk_modulus=True,  # Include bulk modulus calculation
-        include_dos_data=False,  # Include DOS data
-    )
-    # print("properties", properties)
-    import sys
-
-    sys.exit()
-
-    # Test that methods exist
-    print("Testing method availability...")
-    methods_to_test = [
-        "get_fermi_energy",
-        "calculate_band_gap",
-        "calculate_band_structure_properties",
-        "get_properties_dict",
-    ]
-    for method_name in methods_to_test:
-        if hasattr(calc_dos, method_name):
-            print(f"✓ {method_name}: Available")
-        else:
-            print(f"✗ {method_name}: Missing")
-
-    # Get comprehensive properties (including DOS and bulk modulus)
-    print("\n=== Comprehensive Electronic Properties ===")
-    properties = calc_dos.get_properties_dict(
-        include_bulk_modulus=True,  # Include bulk modulus calculation
-        include_dos_data=True,  # Include DOS data
-    )
-
-    # Print key properties (not the full DOS arrays)
-    key_properties = {
-        k: v for k, v in properties.items() if not isinstance(v, list)
-    }  # Skip DOS arrays for printing
-
-    for key, value in key_properties.items():
-        print(f"{key}: {value}")
-
-    # Calculate band gap
-    band_gap_info = calc_dos.calculate_band_gap()
-    print(f"\nBand gap: {band_gap_info['gap']:.3f} eV")
-    print(f"Direct gap: {band_gap_info['direct']}")
-
-    # Plot band structure
-    print("\nPlotting band structure...")
-    fig_bands, ax_bands = calc_bands.plot_band_structure(
-        fermi_shift=True, save_path="bands_enhanced.png"
-    )
-    plt.show()
-
-    # Plot DOS
-    print("Plotting DOS...")
-    fig_dos, ax_dos = calc_dos.plot_dos(
-        energy_range=(-8, 5),
-        sigma=0.1,
-        fermi_shift=True,
-        save_path="dos_enhanced.png",
-    )
-    plt.show()
-
-    # Calculate DOS tensor (stays on GPU for ML)
-    energy_grid, dos_tensor = calc_dos.calculate_dos(
-        energy_range=(-10, 8), fermi_shift=True
-    )
-    print(f"\nDOS tensor shape: {dos_tensor.shape}")
-    print(f"DOS tensor device: {dos_tensor.device}")
-    print(f"Energy grid device: {energy_grid.device}")
-
-    # Calculate bulk modulus (computationally intensive)
-    print("\n=== Bulk Modulus Calculation ===")
-    bulk_modulus_info = calc_dos.calculate_bulk_modulus(
-        strain_range=0.01, num_strains=5
-    )
-    print(f"Bulk modulus: {bulk_modulus_info['bulk_modulus'].item():.1f} GPa")
-    print(
-        f"Equilibrium volume: {bulk_modulus_info['equilibrium_volume'].item():.3f} Bohr³"
-    )
-    print(
-        f"Equilibrium energy: {bulk_modulus_info['equilibrium_energy'].item():.6f} Ha"
-    )
-
-    # Calculate and plot EV curve
-    print("\n=== Energy-Volume Curve ===")
-    try:
-        if hasattr(calc_dos, "calculate_ev_curve"):
-            ev_results = calc_dos.calculate_ev_curve(
-                strain_range=0.15,  # ±15% strain
-                num_points=8,  # Fewer points for faster calculation
-                method="polynomial",
-                plot=True,
-                save_path="EV_curve.png",
-            )
-
-            # Check if file was created
-            import os
-
-            if os.path.exists("EV_curve.png"):
-                print("✓ EV_curve.png successfully created")
-            else:
-                print("✗ EV_curve.png was not created")
-
-            # If tuple returned (with plot), extract the dict
-            if isinstance(ev_results, tuple):
-                fig, ax, ev_data = ev_results
-                print(
-                    f"EV curve bulk modulus: {ev_data['bulk_modulus'].item():.1f} GPa"
-                )
-            else:
-                print(
-                    f"EV curve bulk modulus: {ev_results['bulk_modulus'].item():.1f} GPa"
-                )
-        else:
-            print("✗ calculate_ev_curve method not available")
-
-    except Exception as e:
-        print(f"✗ EV curve calculation failed: {e}")
-        import traceback
-
-        traceback.print_exc()
-
-    # Get detailed band structure properties
-    print("\n=== Band Structure Analysis ===")
-    band_props = calc_dos.calculate_band_structure_properties()
-    print(f"Valence band width: {band_props['valence_band_width']:.3f} eV")
-    print(
-        f"Conduction band width: {band_props['conduction_band_width']:.3f} eV"
-    )
-    if band_props["minimum_direct_gap"] is not None:
-        print(f"Minimum direct gap: {band_props['minimum_direct_gap']:.3f} eV")
-    else:
-        print("Minimum direct gap: Not available")
-    print(f"Is direct semiconductor: {band_props['is_direct_semiconductor']}")
-
-    print("\nCalculation completed successfully!")

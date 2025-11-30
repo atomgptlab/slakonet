@@ -202,6 +202,7 @@ def hs_matrix(
     an_mat_a = basis.atomic_number_matrix("atomic")
 
     dist_mat_a = geometry.distances
+    # print("dist_mat_a",dist_mat_a,dist_mat_a.shape,dist_mat_a.device)
     vec_mat_a = -normalize(geometry.distance_vectors, 2, -1)  # Unit vectors
 
     # Build mask for l-like distances matrix to select atomic pairs
