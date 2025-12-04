@@ -281,6 +281,8 @@ def poly_interp(xp: Tensor, yp: Tensor, rr: Tensor) -> Tensor:
     """
     assert xp.dim() == 2, "xp is not 2D Tensor"
     device = xp.device
+    rr = rr.to(device)
+    yp = yp.to(device)
     nn0, nn1 = xp.shape[0], xp.shape[1]
     index_nn0 = torch.arange(nn0, device=device)
     icl = torch.zeros(nn0, device=device).long()

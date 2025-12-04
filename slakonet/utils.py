@@ -582,7 +582,54 @@ def _eig_sort_out(
     return w, v
 
 
-def eighb(
+def eighb(h_k, s_k, scheme="chol"):
+    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
+
+    # Add regularization to prevent singular matrices
+    eps = 1e-8
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    # Regularize overlap matrix
+    eye = torch.eye(n, device=device, dtype=dtype)
+
+    s_k_reg = s_k  # + eps * eye
+
+    if scheme == "chol":
+        try:
+            # Cholesky decomposition: S = L·L†
+            L = torch.linalg.cholesky(s_k_reg)
+
+            # Solve L·L†·C = H·C·E  →  L⁻¹·H·L⁻†·(L†·C) = (L†·C)·E
+            L_inv = torch.linalg.inv(L)
+            H_tilde = L_inv @ h_k @ L_inv.mH  # .mH is Hermitian transpose
+
+            # Standard eigenvalue problem
+            eigenvals, eigenvecs_tilde = torch.linalg.eigh(H_tilde)
+
+            # Transform back: C = L⁻†·C_tilde
+            eigenvecs = L_inv.mH @ eigenvecs_tilde
+
+        except RuntimeError as e:
+            print(f"Cholesky failed: {e}, falling back to eig")
+            # Fall back to direct method
+            eigenvals, eigenvecs = torch.linalg.eig(
+                torch.linalg.solve(s_k_reg, h_k)
+            )
+            eigenvals = eigenvals.real
+
+    else:
+        # Direct method: solve S⁻¹·H
+        eigenvals, eigenvecs = torch.linalg.eig(
+            torch.linalg.solve(s_k_reg, h_k)
+        )
+        eigenvals = eigenvals.real
+
+    return eigenvals, eigenvecs
+
+
+def eighbX(
     a: Tensor,
     b: Tensor = None,
     scheme: Literal["chol", "lowd"] = "chol",

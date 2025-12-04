@@ -124,7 +124,8 @@ class SimpleDftb:
         self.kpoints = self.periodic.kpoints
         self.k_weights = self.periodic.k_weights.to(self.device)
         self.max_nk = torch.max(self.periodic.n_kpoints)
-
+        self._original_kpoints = kpoints
+        self._original_klines = klines
         # Cache for computed properties
         self._fermi_energy = None
         self._forces = None
@@ -278,10 +279,26 @@ class SimpleDftb:
 
     def get_total_energy(self):
         rep = self.get_repulsive_energy()
+        original_cell = self.geometry.cell.clone()
+
+        original_positions = self.geometry.positions.clone()
+        original_positions.requires_grad_(True)
+        # rep_forces, _ = torch.autograd.grad(
+        #        rep,
+        #        self.geometry.positions,
+        #        create_graph=True,
+        #    )
+        # print('rep forces',rep_forces)
         elec = self._calculate_electronic_energy()
+        elec_forces = torch.autograd.grad(
+            elec,
+            self.periodic.positions,
+            create_graph=True,
+        )
+        print("elec forces", elec_forces)
         print("rep", rep)
         print("elec", elec)
-        return rep  # +elec
+        return rep + elec
 
     def get_repulsive_energy(self):
         self.rep_energy = torch.zeros(self.periodic.n_atoms.shape)
@@ -301,6 +318,7 @@ class SimpleDftb:
         from jarvis.core.specie import atomic_numbers_to_symbols
 
         zz = [i for i in range(1, 100)]
+        # self.periodic.distances=self.periodic.distances.to(device)
         z = atomic_numbers_to_symbols(zz)
         atomic_num_to_symbol = dict(zip(zz, z))
         dist_mat = self.periodic.distances.to(device)
@@ -462,7 +480,7 @@ class SimpleDftb:
         # Clear cache
         self._fermi_energy = None
         self._band_gap = None
-
+        print("HERE Eigenvals", self.eigenvalue)
         return self.eigenvalue
 
     def _compute_forces_finite_diff(
@@ -917,14 +935,366 @@ class SimpleDftb:
 
         return self._forces
 
-    def get_forcess(self):
-        # original_cell = self.geometry.cell.clone()
+    def get_total_energy_forces_dos(
+        self, compute_forces=True, compute_dos=False, dos_params=None
+    ):
+        """
+        Unified function to compute total energy, forces, and optionally DOS.
 
-        # original_positions = self.geometry.positions.clone()
-        # original_positions.requires_grad_(True)
+        Parameters:
+        -----------
+        compute_forces : bool
+            Whether to compute forces
+        compute_dos : bool
+            Whether to compute DOS
+        dos_params : dict, optional
+            Parameters for DOS calculation (energy_range, num_points, sigma, etc.)
+
+        Returns:
+        --------
+        dict : Dictionary containing:
+            - 'total_energy': Total energy (Ha)
+            - 'electronic_energy': Electronic contribution (Ha)
+            - 'repulsive_energy': Repulsive contribution (Ha)
+            - 'forces': Forces on atoms (Ha/Bohr) if compute_forces=True
+            - 'dos_energy_grid': DOS energy grid if compute_dos=True
+            - 'dos_values': DOS values if compute_dos=True
+        """
+
+        # Step 1: Enable gradients on positions if computing forces
+        if compute_forces and not self.geometry.positions.requires_grad:
+            self.geometry.positions.requires_grad_(True)
+
+        # Step 2: Recreate Periodic with gradient-enabled positions
+        print("Recreating Periodic with gradient-enabled positions...")
+        periodic_kwargs = {}
+        if self._original_kpoints is not None:
+            periodic_kwargs["kpoints"] = self._original_kpoints
+        if self._original_klines is not None:
+            periodic_kwargs["klines"] = self._original_klines
+
+        self.periodic = Periodic(
+            self.geometry, self.geometry.cell, cutoff=20.0, **periodic_kwargs
+        )
+
+        # Update dependent attributes
+        self.kpoints = self.periodic.kpoints
+        self.k_weights = self.periodic.k_weights.to(self.device)
+        self.max_nk = torch.max(self.periodic.n_kpoints)
+
+        # Step 3: Compute H and S matrices with gradients
+        self.compute_hs_matrices()
+
+        # Step 4: Calculate electronic energy with proper gradient handling
+        print("Computing electronic energy...")
+        eigenvalues_list = []
+        occupations_list = []
+
+        for ik in range(self.max_nk):
+            h_k = self.ham[..., ik]
+            s_k = self.overlap[..., ik]
+
+            # Solve eigenvalue problem
+            eigenvals, eigenvecs = eighb(h_k, s_k)
+
+            # Get occupations
+            occ, fermi_level = fermi(eigenvals, self.nelectron)
+
+            eigenvalues_list.append(eigenvals)
+            occupations_list.append(occ)
+
+        eigenvalues = torch.stack(eigenvalues_list)
+        occupations = torch.stack(occupations_list)
+
+        # Store for DOS calculation
+        self.eigenvalue = eigenvalues.permute(1, 0, 2)
+        self._occupations = occupations.permute(1, 0, 2)
+
+        # Calculate electronic energy (ensure real part)
+        electronic_energy = torch.sum(
+            eigenvalues * occupations * self.k_weights.unsqueeze(-1)
+        )
+        if electronic_energy.is_complex():
+            electronic_energy = torch.real(electronic_energy)
+
+        # Step 5: Calculate repulsive energy
+        print("Computing repulsive energy...")
+        repulsive_energy = self.get_repulsive_energy()
+
+        # Ensure both energies have the same dtype
+        if electronic_energy.dtype != repulsive_energy.dtype:
+            repulsive_energy = repulsive_energy.to(electronic_energy.dtype)
+
+        # Step 6: Total energy
+        total_energy = electronic_energy + repulsive_energy
+
+        print(f"Electronic energy: {electronic_energy.item():.6f} Ha")
+        print(f"Repulsive energy: {repulsive_energy.item():.6f} Ha")
+        print(f"Total energy: {total_energy.item():.6f} Ha")
+
+        # Initialize results dictionary
+        results = {
+            "total_energy": total_energy,
+            "electronic_energy": electronic_energy,
+            "repulsive_energy": repulsive_energy,
+        }
+
+        # Step 7: Calculate forces if requested
+        if compute_forces:
+            print("Computing forces...")
+            if not total_energy.requires_grad:
+                print("WARNING: Total energy doesn't require gradients!")
+                forces = torch.zeros_like(self.geometry.positions)
+            else:
+                grad_outputs = torch.autograd.grad(
+                    outputs=total_energy,
+                    inputs=self.geometry.positions,
+                    create_graph=False,
+                    retain_graph=compute_dos,  # Retain if we need to compute DOS
+                    allow_unused=False,
+                )
+                forces = -grad_outputs[0]
+
+            results["forces"] = forces
+            self._forces = forces
+
+        # Step 8: Calculate DOS if requested
+        if compute_dos:
+            print("Computing DOS...")
+            if dos_params is None:
+                dos_params = {
+                    "energy_range": (-10, 5),
+                    "num_points": 5000,
+                    "sigma": 0.1,
+                    "fermi_shift": True,
+                    "unit": "eV",
+                }
+
+            try:
+                energy_grid, dos = self.calculate_dos(**dos_params)
+                results["dos_energy_grid"] = energy_grid
+                results["dos_values"] = dos
+            except Exception as e:
+                print(f"DOS calculation failed: {e}")
+                results["dos_energy_grid"] = None
+                results["dos_values"] = None
+
+        return results
+
+    def get_forcess(self):
+        """Calculate forces via automatic differentiation."""
+
+        # Step 1: Enable gradients on positions
+        if not self.geometry.positions.requires_grad:
+            self.geometry.positions.requires_grad_(True)
+
+        # Step 2: Recreate Periodic to capture gradients
+        print("Recreating Periodic with gradient-enabled positions...")
+
+        # Build kwargs for Periodic
+        periodic_kwargs = {}
+        if self._original_kpoints is not None:
+            periodic_kwargs["kpoints"] = self._original_kpoints
+        if self._original_klines is not None:
+            periodic_kwargs["klines"] = self._original_klines
+
+        # Recreate Periodic object
+        self.periodic = Periodic(
+            self.geometry, self.geometry.cell, cutoff=20.0, **periodic_kwargs
+        )
+
+        # Update dependent attributes
+        self.kpoints = self.periodic.kpoints
+        self.k_weights = self.periodic.k_weights.to(self.device)
+        self.max_nk = torch.max(self.periodic.n_kpoints)
+
+        # Step 3: Recompute matrices with new Periodic
+        self.compute_hs_matrices()
+
+        # Step 4: Recompute eigenvalues
+        print("Recomputing eigenvalues with gradients enabled...")
+        self()
+
+        # Step 5: Compute energy
+        print("Computing total energy...")
+        energy = self.get_total_energy()
+
+        # Debug: Check for NaN in intermediate values
+        print(f"\n=== Debugging ===")
+        print(f"Ham has NaN: {torch.isnan(self.ham).any()}")
+        print(f"Overlap has NaN: {torch.isnan(self.overlap).any()}")
+        print(f"Eigenvalues has NaN: {torch.isnan(self.eigenvalue).any()}")
+        print(f"Energy: {energy}")
+        print(f"Energy requires_grad: {energy.requires_grad}")
+
+        if not energy.requires_grad:
+            raise RuntimeError("Energy doesn't require grad after recreation!")
+
+        # Step 6: Calculate gradient
+        print("Computing gradients...")
+        try:
+            # Use torch.autograd.grad with specific settings for stability
+            grad_output = torch.autograd.grad(
+                outputs=energy,
+                inputs=self.geometry.positions,
+                grad_outputs=None,
+                retain_graph=False,
+                create_graph=False,
+                only_inputs=True,
+                allow_unused=False,
+            )[0]
+
+            # Check for NaN/Inf
+            if torch.isnan(grad_output).any():
+                nan_count = torch.isnan(grad_output).sum().item()
+                print(
+                    f"WARNING: {nan_count} NaN values detected in gradients!"
+                )
+
+                # Print more debug info
+                print(f"Gradient stats:")
+                print(
+                    f"  Min: {grad_output[~torch.isnan(grad_output)].min().item() if (~torch.isnan(grad_output)).any() else 'all NaN'}"
+                )
+                print(
+                    f"  Max: {grad_output[~torch.isnan(grad_output)].max().item() if (~torch.isnan(grad_output)).any() else 'all NaN'}"
+                )
+
+                # Fall back to finite differences
+                print("Falling back to finite differences...")
+                self._forces = self._compute_forces_finite_diff()
+
+            elif torch.isinf(grad_output).any():
+                inf_count = torch.isinf(grad_output).sum().item()
+                print(
+                    f"WARNING: {inf_count} Inf values detected in gradients!"
+                )
+                print("Falling back to finite differences...")
+                self._forces = self._compute_forces_finite_diff()
+
+            else:
+                self._forces = -grad_output
+                max_force = torch.max(torch.abs(self._forces)).item()
+                print(
+                    f"✓ Forces computed successfully! Max component: {max_force:.6f}"
+                )
+
+        except RuntimeError as e:
+            print(f"✗ Gradient computation failed: {e}")
+            print("Falling back to finite differences...")
+            self._forces = self._compute_forces_finite_diff()
+
+        return self._forces
+
+    def get_forcessX(self):
+        """Calculate forces via automatic differentiation."""
+
+        # Step 1: Enable gradients on positions
+        if not self.geometry.positions.requires_grad:
+            self.geometry.positions.requires_grad_(True)
+
+        # Step 2: CRITICAL - Recreate Periodic to capture gradients
+        # The old self.periodic.distances was computed before requires_grad was set!
+        print("Recreating Periodic with gradient-enabled positions...")
+
+        # Store original k-point configuration
+        if hasattr(self, "kpoints") and self.kpoints is not None:
+            kpoints = self.kpoints
+        else:
+            kpoints = None
+
+        if hasattr(self, "klines") and self.klines is not None:
+            klines = self.klines
+        else:
+            klines = None
+
+        # Recreate Periodic object - this will compute distances from gradient-enabled positions
+        if kpoints is not None and klines is not None:
+            self.periodic = Periodic(
+                self.geometry.to(self.device),
+                self.geometry.cell.to(self.device),
+                cutoff=20.0,
+                kpoints=kpoints,
+                klines=klines,
+            )
+        elif kpoints is not None:
+            self.periodic = Periodic(
+                self.geometry,
+                self.geometry.cell,
+                cutoff=20.0,
+                kpoints=kpoints,
+            )
+        elif klines is not None:
+            self.periodic = Periodic(
+                self.geometry,
+                self.geometry.cell,
+                cutoff=20.0,
+                klines=klines,
+            )
+        else:
+            self.periodic = Periodic(
+                self.geometry,
+                self.geometry.cell,
+                cutoff=20.0,
+            )
+
+        # Update dependent attributes
+        self.kpoints = self.periodic.kpoints
+        self.k_weights = self.periodic.k_weights.to(self.device)
+        self.max_nk = torch.max(self.periodic.n_kpoints)
+
+        # Step 3: Recompute matrices with new Periodic
+        self.compute_hs_matrices()
+
+        # Step 4: Recompute eigenvalues
+        print("Recomputing eigenvalues with gradients enabled...")
+        self()  # This calls __call__ which computes eigenvalues
+
+        # Step 5: Now compute energy - should have gradients
+        print("Computing total energy...")
+        energy = self.get_total_energy()
+
+        print(f"\n=== After recreation ===")
+        print(
+            f"Positions require_grad: {self.geometry.positions.requires_grad}"
+        )
+        print(
+            f"Periodic distances require_grad: {self.periodic.distances.requires_grad}"
+        )
+        print(f"Energy: {energy}")
+        print(f"Energy requires_grad: {energy.requires_grad}")
+        print(f"Energy grad_fn: {energy.grad_fn}")
+
+        if not energy.requires_grad:
+            raise RuntimeError(
+                "Energy still doesn't require grad after recreation!\n"
+                "Check your Periodic class - distances might not depend on positions."
+            )
+
+        # Step 6: Calculate gradient
+        print("Computing gradients...")
+        grad_output = torch.autograd.grad(
+            energy,
+            self.geometry.positions,
+            create_graph=True,
+        )[0]
+
+        self._forces = -grad_output
+
+        print(
+            f"Forces computed! Max component: {torch.max(torch.abs(self._forces)).item():.6f}"
+        )
+
+        return self._forces
+
+    def get_forcessX(self):
+        original_cell = self.geometry.cell.clone()
+
+        original_positions = self.geometry.positions.clone()
+        original_positions.requires_grad_(True)
         if self._forces is None:
             self._forces, _ = torch.autograd.grad(
-                self._calculate_electronic_energy(),
+                self.get_total_energy(),
                 self.geometry.positions,
                 create_graph=True,
             )

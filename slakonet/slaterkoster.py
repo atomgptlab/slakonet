@@ -158,17 +158,18 @@ def hs_matrix(
     # cutoff = kwargs.get("cutoff", 10.0)
     shape_orbs = basis.orbital_matrix_shape
     g_var = None
-
+    device = geometry.positions.device
     if not is_periodic:
         mat = torch.zeros(
             shape_orbs,  # <- Results matrix
-            device=geometry.positions.device,
+            device=device,
             dtype=geometry.dtype,
             # dtype=torch.float32,
         )
     else:
         # n_kpoints = kwargs.get("n_kpoints")
         n_kpoints = geometry.n_kpoints
+        # print("phase",geometry.phase,geometry.phase.device)
         phase = geometry.phase
         real_dtype = torch.get_default_dtype()
         assert n_kpoints is not None, "Please set n_kpoints if PBC is True"
@@ -179,7 +180,7 @@ def hs_matrix(
         mat = torch.zeros(
             *shape_orbs,
             n_kpoints,
-            device=geometry.positions.device,
+            device=device,
             dtype=dtype,
             # dtype=torch.complex128 if phase is not None else torch.float32,
         )
@@ -207,10 +208,13 @@ def hs_matrix(
 
     # Build mask for l-like distances matrix to select atomic pairs
     _, mask_dist_l, mask_dist_s = basis.mask(geometry, cutoff)
-
+    device = l_mat_s.device
     # Loop over each azimuthal-pair interaction (max ℓ=3 (f))
     l_pairs = [
-        torch.tensor([i, j]) for i in range(4) for j in range(4) if i <= j
+        torch.tensor([i, j], device=device)
+        for i in range(4)
+        for j in range(4)
+        if i <= j
     ]
     for l_pair in l_pairs:
 
@@ -307,7 +311,7 @@ def hs_matrix(
             integrals = integrals * scale
 
         # Make a call to the relevant Slater-Koster function to get the sk-block
-        if (l_pair == torch.tensor([0, 0])).all():
+        if (l_pair == torch.tensor([0, 0], device=device)).all():
             sk_data = integrals.unsqueeze(-2)
         else:
             sk_data = sub_block_rot(l_pair, g_vecs, integrals)
@@ -813,7 +817,7 @@ def _gather_on_site(
     an = geometry.atomic_numbers
     a_shape = basis.atomic_matrix_shape[:-1]
     o_shape = basis.orbital_matrix_shape[:-1]
-
+    device = basis.orbs_per_shell.device
     # Get the onsite values for all non-padding elements & pass on the indices
     # of the atoms just in case they are needed by the SkFeed
     mask = an.nonzero(as_tuple=True)
@@ -825,7 +829,7 @@ def _gather_on_site(
 
     os_flat = torch.cat(sk_feed.on_site(atomic_numbers=an[mask]))
     # os_flat = torch.cat(sk_feed.on_site(atomic_numbers=an[mask], **kwargs))
-
+    os_flat = os_flat.to(device)
     if not sk_feed.orbital_resolve:
         os_flat = torch.repeat_interleave(
             os_flat, basis.orbs_per_shell[basis.orbs_per_shell.ne(0)]
@@ -988,7 +992,7 @@ def _pe_sk_data2(
     else:
         # Only Gamma point
         sk_data = sk_data.unsqueeze(0)
-
+    device = sk_data.device
     # .  .  .  .  .  .  .  . n-batch .  .  .  .  . atom 1 .  .  .  . atom 2 .
     mask = torch.stack(
         [mask_img_dist[0], mask_img_dist[-2], mask_img_dist[-1]]
@@ -1009,7 +1013,7 @@ def _pe_sk_data2(
     ).permute(0, -1, 1, 2)
 
     sk_data = (
-        torch.zeros(shape, dtype=sk_data.dtype)
+        torch.zeros(shape, dtype=sk_data.dtype, device=device)
         .scatter_add_(1, origin_idx, sk_data)
         .permute(1, 2, 3, 0)
     )

@@ -166,21 +166,24 @@ class Periodic:
         """Get cell translation vectors."""
         pos_ext = kwargs.get("positive_extention", 1)
         neg_ext = kwargs.get("negative_extention", 1)
-
+        # print("self.cutoff",self.cutoff,self.cutoff.device)
+        # print("self.invlatvec,",self.invlatvec.device)
         _tmp = torch.floor(
-            self.cutoff * torch.norm(self.invlatvec, dim=-1).T
+            self.cutoff.to(self.invlatvec.device)
+            * torch.norm(self.invlatvec, dim=-1).T
         ).T
+        # print(" _tmp", _tmp,_tmp.device)
+        device = _tmp.device
         ranges = torch.stack([-(neg_ext + _tmp), pos_ext + _tmp])
-
         # 1D/ 2D cell translation
         ranges[torch.stack([self.mask_zero, self.mask_zero])] = 0
-
         # Length of the first, second and third column in ranges
         leng = ranges[1, :].long() - ranges[0, :].long() + 1
-
         # Number of cells
         ncell = leng[..., 0] * leng[..., 1] * leng[..., 2]
-
+        # print("ncell", ncell,ncell.device)
+        # print(" leng", leng,leng.device)
+        # print("ranges", ranges,ranges.device)
         # Cell translation vectors in relative coordinates
         # Large values are padded at the end of short cell vectors to exceed cutoff distance
         cellvec = pack(
@@ -188,14 +191,16 @@ class Periodic:
                 torch.stack(
                     [
                         torch.linspace(
-                            iran[0, 0], iran[1, 0], ile[0]
+                            iran[0, 0], iran[1, 0], ile[0], device=device
                         ).repeat_interleave(ile[2] * ile[1]),
-                        torch.linspace(iran[0, 1], iran[1, 1], ile[1])
+                        torch.linspace(
+                            iran[0, 1], iran[1, 1], ile[1], device=device
+                        )
                         .repeat(ile[0])
                         .repeat_interleave(ile[2]),
-                        torch.linspace(iran[0, 2], iran[1, 2], ile[2]).repeat(
-                            ile[0] * ile[1]
-                        ),
+                        torch.linspace(
+                            iran[0, 2], iran[1, 2], ile[2], device=device
+                        ).repeat(ile[0] * ile[1]),
                     ]
                 )
                 for ile, iran in zip(leng, ranges.transpose(1, 0))
@@ -217,6 +222,8 @@ class Periodic:
     def _periodic_distance(self):
         """Get distances between central cell and neighbour cells."""
         mask_central_cell = (self.rcellvec != 0).sum(-1) == 0
+        # print("self.positions.",self.positions.device)
+        # print("self.rcellvec",self.rcellvec.device)
         positions = self.rcellvec.unsqueeze(2) + self.positions.unsqueeze(1)
         size_system = self.atomic_numbers.ne(0).sum(-1)
         positions_vec = -positions.unsqueeze(-3) + self.positions.unsqueeze(
@@ -238,8 +245,8 @@ class Periodic:
                 )
             ],
             value=1e3,
-        )
-
+        )  # .to(self.rcellvec.device)
+        # print('distance',distance,distance.device)
         return mask_central_cell, positions, positions_vec, distance
 
     @property
@@ -365,21 +372,26 @@ class Periodic:
     def _inverse_lattice(self):
         """Get inverse lattice vectors."""
         # build a mask for zero vectors in 1D/ 2D lattice vectors
+        # print("self.latvec",self.latvec,self.latvec.device)
         mask_zero = self.latvec.eq(0).all(-1)
         _latvec = self.latvec + torch.diag_embed(
-            mask_zero.type(self.latvec.dtype)
+            mask_zero.type(self.latvec.dtype)  # .to(self.latvec.device)
         )
-
-        # inverse lattice vectors
+        # print("mask_zero",mask_zero,mask_zero.device)
+        # print("_latvec",_latvec,_latvec.device)
         _invlat = torch.transpose(
             torch.linalg.solve(
                 _latvec,
-                torch.eye(_latvec.shape[-1]).repeat(_latvec.shape[0], 1, 1),
+                torch.eye(_latvec.shape[-1], device=mask_zero.device).repeat(
+                    _latvec.shape[0], 1, 1
+                ),
             ),
             -1,
             -2,
         )
+        # print("_invlat1",_invlat,_invlat.device)
         _invlat[mask_zero] = 0
+        # print("_invlat2",_invlat,_invlat.device)
 
         return _invlat, mask_zero
 
@@ -572,9 +584,15 @@ class Periodic:
     @property
     def phase(self):
         """Select kpoint for each interactions."""
-        kpoint = 2.0 * np.pi * self.kpoints
-
+        # kpoint = 2.0 * np.pi * self.kpoints
+        device = self.cellvec_neighbour.device
         # shape: [n_batch, n_cell, 3]
+        kpoint = (
+            2.0
+            * np.pi
+            * torch.as_tensor(self.kpoints, dtype=torch.float32, device=device)
+        )
+
         cell_vec = self.cellvec_neighbour
 
         return pack(

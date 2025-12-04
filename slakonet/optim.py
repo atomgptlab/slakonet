@@ -1207,6 +1207,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
         # Compute properties
         eigenvalues = calc()
+        print("eigenvalues", eigenvalues)
         properties = calc.get_properties_dict(
             include_bulk_modulus=get_bulk_mod,
             include_dos_data=True,
