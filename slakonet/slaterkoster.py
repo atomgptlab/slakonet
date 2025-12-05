@@ -70,7 +70,8 @@ def fermi(eigenvalue: Tensor, nelectron: Tensor, kT=0.0, spin=None):
         occ[singly_occupied_mask] = 1.0
 
         # Calculate number of occupied states
-        nocc = torch.div(nelectron.float(), 2.0).ceil()
+        nocc = torch.div(nelectron, 2.0).ceil()
+        # nocc = torch.div(nelectron.float(), 2.0).ceil()
 
         return occ, nocc
 
@@ -95,7 +96,8 @@ def fermi(eigenvalue: Tensor, nelectron: Tensor, kT=0.0, spin=None):
         occ[occupied_mask] = 1.0
 
         # Calculate number of occupied states
-        nocc = torch.div(nelectron.float(), 2.0).ceil()
+        nocc = torch.div(nelectron, 2.0).ceil()
+        # nocc = torch.div(nelectron.float(), 2.0).ceil()
 
         return occ, nocc
 
@@ -172,10 +174,12 @@ def hs_matrix(
         # print("phase",geometry.phase,geometry.phase.device)
         phase = geometry.phase
         real_dtype = torch.get_default_dtype()
+        print(" real_dtype", real_dtype)
         assert n_kpoints is not None, "Please set n_kpoints if PBC is True"
         # assert phase is not None, "Please set phase if PBC is True"
         if isinstance(n_kpoints, Tensor):
             n_kpoints = torch.max(n_kpoints)
+        # dtype = torch.complex64 if phase is not None else real_dtype
         dtype = torch.complex128 if phase is not None else real_dtype
         mat = torch.zeros(
             *shape_orbs,
@@ -574,7 +578,7 @@ def add_kpoint(
     # assert geometry.positions.dtype is torch.float32, "dtype should be float32"
     is_periodic = geometry.is_periodic
     train_onsite = kwargs.get("train_onsite", True)
-    cutoff = kwargs.get("cutoff", 10.0)
+    cutoff = kwargs.get("cutoff", 5.0)
     shape_orbs = basis.orbital_matrix_shape
 
     n_kpoints = geometry.n_kpoints
@@ -583,6 +587,7 @@ def add_kpoint(
     # assert phase is not None, "Please set phase if PBC is True"
     if isinstance(n_kpoints, Tensor):
         n_kpoints = torch.max(n_kpoints)
+    # dtype = torch.complex64 if phase is not None else real_dtype
     dtype = torch.complex128 if phase is not None else real_dtype
     matc = torch.zeros(
         *shape_orbs,
@@ -1205,7 +1210,7 @@ def _rot_yz_p(unit_vector: Tensor) -> Tensor:
     """
     x, y, z = unit_vector.T
     zeros = torch.zeros_like(x)
-    alpha = torch.sqrt(1.0 - z * z)
+    alpha = torch.sqrt(1.0 - z * z + 1e-12)
     rot = stack(
         [
             stack([x / alpha, zeros, -y / alpha], -1),
@@ -1236,7 +1241,7 @@ def _rot_xy_p(unit_vector: Tensor) -> Tensor:
     """
     x, y, z = unit_vector.T
     zeros = torch.zeros_like(x)
-    alpha = torch.sqrt(1.0 - y * y)
+    alpha = torch.sqrt(1e-12 + 1.0 - y * y)
     rot = stack(
         [
             stack([alpha, -y * z / alpha, -x * y / alpha], -1),
@@ -1268,7 +1273,7 @@ def _rot_yz_d(unit_vector: Tensor) -> Tensor:
     x, y, z = unit_vector.T
     zeros = torch.zeros_like(x)
     a = 1.0 - z * z
-    b = torch.sqrt(a)
+    b = torch.sqrt(1e-12 + a)
     xz, xy, yz = unit_vector.T * unit_vector.roll(1, -1).T
     xyz = x * yz
     x2 = x * x
@@ -1333,7 +1338,7 @@ def _rot_xy_d(unit_vector: Tensor) -> Tensor:
     """
     x, y, z = unit_vector.T
     a = 1.0 - y * y
-    b = torch.sqrt(a)
+    b = torch.sqrt(1e-12 + a)
     xz, xy, yz = unit_vector.T * unit_vector.roll(1, -1).T
     xyz = x * yz
     z2 = z * z
@@ -1403,7 +1408,7 @@ def _rot_yz_f(unit_vector: Tensor) -> Tensor:
     xyz = x * yz
     zeros = torch.zeros_like(x)
     a = 1.0 - z * z
-    b = torch.sqrt(a)
+    b = torch.sqrt(1e-12 + a)
     c = b**3
     x2 = x * x
     rot = stack(
@@ -1521,7 +1526,7 @@ def _rot_xy_f(unit_vector: Tensor) -> Tensor:
     xz, xy, yz = unit_vector.T * unit_vector.roll(1, -1).T
     xyz = x * yz
     a = 1.0 - y * y
-    b = torch.sqrt(a)
+    b = torch.sqrt(1e-12 + a)
     c = b**3
     z2 = z * z
     rot = stack(

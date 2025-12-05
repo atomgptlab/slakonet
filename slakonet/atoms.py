@@ -16,6 +16,7 @@ from slakonet.units import length_units
 from slakonet.elements import chemical_symbols
 from slakonet.elements import atomic_numbers as data_numbers
 
+# torch.set_default_dtype(torch.float32)
 Tensor = torch.Tensor
 
 
@@ -229,10 +230,12 @@ class Periodic:
         positions_vec = -positions.unsqueeze(-3) + self.positions.unsqueeze(
             1
         ).unsqueeze(-2)
+        eps = 1e-12
         distance = pack(
             [
                 torch.sqrt(
-                    (
+                    eps
+                    + (
                         (
                             ipos[:, :inat].repeat(1, inat, 1)
                             - torch.repeat_interleave(icp[:inat], inat, 0)
@@ -590,7 +593,9 @@ class Periodic:
         kpoint = (
             2.0
             * np.pi
-            * torch.as_tensor(self.kpoints, dtype=torch.float32, device=device)
+            * torch.as_tensor(
+                self.kpoints, dtype=self.cellvec_neighbour.dtype, device=device
+            )
         )
 
         cell_vec = self.cellvec_neighbour
@@ -781,7 +786,7 @@ class Geometry:
             torch.diagonal(dist, dim1=-2, dim2=-1).zero_()
             return dist
         else:
-            return torch.sqrt((self.updated_dist_vec**2).sum(-1))
+            return torch.sqrt(1e-12 + (self.updated_dist_vec**2).sum(-1))
 
     @property
     def distance_vectors(self) -> Tensor:
@@ -884,7 +889,7 @@ class Geometry:
 
         positions = self.positions / length_units["angstrom"]
         cells = self.cell / length_units["angstrom"]
-        cell_xyz = torch.sqrt((cells**2).sum(-2)).unsqueeze(-2)
+        cell_xyz = torch.sqrt(1e-12 + (cells**2).sum(-2)).unsqueeze(-2)
         positions = positions / cell_xyz if direct else positions
 
         def write_single(number, position, cell):

@@ -21,6 +21,8 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 
+# torch.set_default_dtype(torch.float32)
+
 
 class PolyInterpU:
     """Polynomial interpolation method with uniform grid points.
@@ -280,9 +282,12 @@ def poly_interp(xp: Tensor, yp: Tensor, rr: Tensor) -> Tensor:
         systems interpolation. Therefore xp will be 2D Tensor.
     """
     assert xp.dim() == 2, "xp is not 2D Tensor"
+    target_dtype = rr.dtype
     device = xp.device
     rr = rr.to(device)
     yp = yp.to(device)
+    xp = xp.to(dtype=target_dtype)
+    yp = yp.to(dtype=target_dtype)
     nn0, nn1 = xp.shape[0], xp.shape[1]
     index_nn0 = torch.arange(nn0, device=device)
     icl = torch.zeros(nn0, device=device).long()

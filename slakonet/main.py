@@ -29,7 +29,7 @@ try:
     from phonopy.file_IO import write_FORCE_CONSTANTS, write_disp_yaml
 except Exception:
     pass
-torch.set_default_dtype(torch.float32)
+# torch.set_default_dtype(torch.float32)
 # torch.set_default_dtype(torch.float64)
 # torch.set_default_dtype(torch.float32)
 H2E = 27.211
@@ -84,8 +84,8 @@ class SimpleDftb:
         self.shell_dict = shell_dict
         self.h_feed = h_feed
         self.s_feed = s_feed
-        self.dtype = torch.complex64
-        # self.dtype = torch.complex128
+        # self.dtype = torch.complex64
+        self.dtype = torch.complex128
         self.repulsive = repulsive
         self.device = device
         self.with_eigenvectors = with_eigenvectors
