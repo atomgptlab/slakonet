@@ -82,8 +82,8 @@ class SimpleDftb:
         # Precompute electron lookup table (gradient-safe)
         self.electron_lookup = self._build_electron_lookup()
         self.nelectron = self._compute_nelectrons()
-        print("self.geometry", self.geometry)
-        print("self.geometry.cell", self.geometry.cell)
+        # print("self.geometry", self.geometry)
+        # print("self.geometry.cell", self.geometry.cell)
         # Setup periodic boundary conditions
         self.periodic = Periodic(
             self.geometry,

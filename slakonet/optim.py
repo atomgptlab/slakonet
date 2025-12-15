@@ -1992,6 +1992,8 @@ def train_multi_vasp_skf_parameters(
     dataset_losses = defaultdict(list)  # Track per-dataset performance
 
     klines = get_klines_example()
+    kpoints = torch.tensor([5, 5, 5])
+    # print("kpointss",kpoints)
     for epoch in range(num_epochs):
         t1 = time.time()
         optimizer.zero_grad()
@@ -2015,7 +2017,8 @@ def train_multi_vasp_skf_parameters(
                     multi_element_optimizer.compute_multi_element_properties(
                         geometry=dataset["geometry"],
                         shell_dict=shell_dict,
-                        klines=klines,
+                        kpoints=kpoints,
+                        # klines=klines,
                         # dataset["geometry"], shell_dict, kpoints
                     )
                 )

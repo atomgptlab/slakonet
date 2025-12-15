@@ -174,7 +174,7 @@ def hs_matrix(
         # print("phase",geometry.phase,geometry.phase.device)
         phase = geometry.phase
         real_dtype = torch.get_default_dtype()
-        print(" real_dtype", real_dtype)
+        # print(" real_dtype", real_dtype)
         assert n_kpoints is not None, "Please set n_kpoints if PBC is True"
         # assert phase is not None, "Please set phase if PBC is True"
         if isinstance(n_kpoints, Tensor):
