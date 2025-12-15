@@ -435,6 +435,76 @@ class Periodic:
 
             return self._super_sampling(_kpoints)
 
+    def _super_samplingX(self, _kpoints):
+        """Super sampling."""
+        # Get device from geometry
+        device = (
+            self.geometry.cell.device
+            if hasattr(self.geometry, "cell")
+            and self.geometry.cell is not None
+            else _kpoints.device
+        )
+
+        _n_kpoints = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
+        _n_kpoints = _n_kpoints.to(device)  # Ensure on correct device
+
+        _kpoints_inv = 0.5 / _kpoints
+        _kpoints_inv2 = 1.0 / _kpoints
+        _nkxyz = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
+        n_ind = tuple(_nkxyz)
+        _nkx, _nkyz = _kpoints[..., 0], _kpoints[..., 1] * _kpoints[..., 2]
+        _nky, _nkxz = _kpoints[..., 1], _kpoints[..., 0] * _kpoints[..., 2]
+        _nkz, _nkxy = _kpoints[..., 2], _kpoints[..., 0] * _kpoints[..., 1]
+
+        # create baseline of kpoints, if n_kpoint in x direction is N,
+        # the value will be [0.5 / N] * n_kpoint_x * n_kpoint_y * n_kpoint_z
+        _x_base = torch.repeat_interleave(_kpoints_inv[..., 0], _nkxyz)
+        _y_base = torch.repeat_interleave(_kpoints_inv[..., 1], _nkxyz)
+        _z_base = torch.repeat_interleave(_kpoints_inv[..., 2], _nkxyz)
+
+        # create K-mesh increase in each direction range from 0~1
+        _x_incr = torch.cat(
+            [
+                torch.repeat_interleave(
+                    torch.arange(ii, device=device) * iv, yz
+                )
+                for ii, yz, iv in zip(_nkx, _nkyz, _kpoints_inv2[..., 0])
+            ]
+        )
+        _y_incr = torch.cat(
+            [
+                torch.repeat_interleave(
+                    torch.arange(iy, device=device) * iv, iz
+                ).repeat(ix)
+                for ix, iy, iz, xz, iv in zip(
+                    _nkx, _nky, _nkz, _nkxz, _kpoints_inv2[..., 1]
+                )
+            ]
+        )
+        _z_incr = torch.cat(
+            [
+                (torch.arange(iz, device=device) * iv).repeat(xy)
+                for iz, xy, iv in zip(_nkz, _nkxy, _kpoints_inv2[..., 2])
+            ]
+        )
+
+        all_kpoints = torch.stack(
+            [
+                pack(torch.split((_x_base + _x_incr).unsqueeze(1), n_ind)),
+                pack(torch.split((_y_base + _y_incr).unsqueeze(1), n_ind)),
+                pack(torch.split((_z_base + _z_incr).unsqueeze(1), n_ind)),
+            ]
+        )
+
+        k_weights = pack(
+            torch.split(
+                torch.ones(_n_kpoints.sum(), device=device), tuple(_n_kpoints)
+            )
+        )
+        k_weights = k_weights / _n_kpoints.unsqueeze(-1)
+
+        return all_kpoints.squeeze(-1).permute(1, 2, 0), _n_kpoints, k_weights
+
     def _super_sampling(self, _kpoints):
         """Super sampling."""
         _n_kpoints = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
@@ -455,13 +525,19 @@ class Periodic:
         # create K-mesh increase in each direction range from 0~1
         _x_incr = torch.cat(
             [
-                torch.repeat_interleave(torch.arange(ii) * iv, yz)
+                torch.repeat_interleave(
+                    torch.arange(ii, device=yz.device) * iv, yz
+                )
+                # torch.repeat_interleave(torch.arange(ii) * iv, yz)
                 for ii, yz, iv in zip(_nkx, _nkyz, _kpoints_inv2[..., 0])
             ]
         )
         _y_incr = torch.cat(
             [
-                torch.repeat_interleave(torch.arange(iy) * iv, iz).repeat(ix)
+                torch.repeat_interleave(
+                    torch.arange(iy, device=iz.device) * iv, iz
+                ).repeat(ix)
+                # torch.repeat_interleave(torch.arange(iy) * iv, iz).repeat(ix)
                 for ix, iy, iz, xz, iv in zip(
                     _nkx, _nky, _nkz, _nkxz, _kpoints_inv2[..., 1]
                 )
@@ -469,7 +545,8 @@ class Periodic:
         )
         _z_incr = torch.cat(
             [
-                (torch.arange(iz) * iv).repeat(xy)
+                (torch.arange(iz, device=iv.device) * iv).repeat(xy)
+                # (torch.arange(iz) * iv).repeat(xy)
                 for iz, xy, iv in zip(_nkz, _nkxy, _kpoints_inv2[..., 2])
             ]
         )
@@ -485,6 +562,7 @@ class Periodic:
         k_weights = pack(
             torch.split(torch.ones(_n_kpoints.sum()), tuple(_n_kpoints))
         )
+        print("_n_kpoints.device", _n_kpoints.device)
         k_weights = k_weights / _n_kpoints.unsqueeze(-1)
 
         return all_kpoints.squeeze(-1).permute(1, 2, 0), _n_kpoints, k_weights

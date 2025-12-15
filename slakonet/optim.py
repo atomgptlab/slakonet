@@ -628,7 +628,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         t1 = time.time()
         load_file = Path(load_path).with_suffix(".pt")
         compact_data = torch.load(
-            load_file, map_location="cpu"
+            load_file, map_location="cuda"
         )  # ADD map_location
 
         if not compact_data["metadata"].get("ultra_compact", False):

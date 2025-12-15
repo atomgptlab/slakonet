@@ -916,3 +916,53 @@ def tetrahedral_root(x: Union[Tensor, Real]) -> Union[Tensor, Real]:
     """
     a = (9 * x**2 - (1 / 27)) ** 0.5
     return (3 * x + a) ** (1 / 3) + (3 * x - a) ** (1 / 3) - 1
+
+
+def create_feeds(updated_skfs, shell_dict, integral_type):
+    """Create feed for H or S integrals."""
+    from slakonet.interpolation import PolyInterpU
+    from slakonet.skfeed import (
+        SkfFeed,
+        SkfParamFeed,
+        _get_hs_dict,
+        _get_onsite_dict,
+    )
+
+    interpolator = PolyInterpU
+    hs_dict = {}
+    onsite_hs_dict = {}
+
+    for pair_key, skf in updated_skfs.items():
+        hs_dict = _get_hs_dict(hs_dict, interpolator, skf, integral_type)
+        elements = skf.to_dict()["atom_pair"]
+        if len(elements) >= 2 and elements[0] == elements[1]:
+            onsite_hs_dict = _get_onsite_dict(
+                onsite_hs_dict, skf, shell_dict, integral_type
+            )
+
+    return SkfFeed(hs_dict, onsite_hs_dict, shell_dict)
+
+
+def generate_shell_dict_upto_Z65():
+    """Generate shell_dict for atomic numbers 1-65."""
+    shell_dict = {}
+    for Z in range(1, 100):
+        if Z <= 2:  # H, He
+            shell_dict[Z] = [0]
+        elif Z <= 10:  # Li to Ne
+            shell_dict[Z] = [0, 1]
+        elif Z <= 20:  # Na to Ca
+            shell_dict[Z] = [0, 1]
+        elif Z <= 30:  # Sc to Zn
+            shell_dict[Z] = [0, 1, 2]
+        elif Z <= 36:  # Ga to Kr
+            shell_dict[Z] = [0, 1]
+        elif Z <= 48:  # transition metals
+            shell_dict[Z] = [0, 1, 2]
+        elif Z <= 54:  # In to Xe
+            shell_dict[Z] = [0, 1]
+        elif Z <= 57:  # Cs, Ba, La
+            shell_dict[Z] = [0, 1, 2]
+        else:  # lanthanides
+            shell_dict[Z] = [0, 1, 2, 3]
+    return shell_dict
