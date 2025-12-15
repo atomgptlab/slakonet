@@ -51,7 +51,9 @@ if __name__ == "__main__":
         model = default_model()
     else:
         model = MultiElementSkfParameterOptimizer.load_model(
-            model_path, method="state_dict"
+            model_path,
+            method="compact",
+            # model_path, method="state_dict"
         )
 
     trained_optimizer, history, data_loader = train_multi_vasp_skf_parameters(

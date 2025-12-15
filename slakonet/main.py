@@ -45,8 +45,9 @@ class SimpleDftb:
         self,
         geometry,
         model,
-        max_Z=65,
-        cutoff=20.0,
+        max_Z=100,
+        # max_Z=65,
+        cutoff=10.0,
         kpoints=None,
         klines=None,
         repulsive=True,
@@ -54,6 +55,10 @@ class SimpleDftb:
         device=None,
         kT=0.025,  # eV for Fermi smearing
         H2E=27.211,  # Hartree to eV
+        # shell_dict=None,
+        # h_feed=None,
+        # s_feed=None,
+        # nelectron=None,
     ):
         self.device = device or (
             "cuda" if torch.cuda.is_available() else "cpu"

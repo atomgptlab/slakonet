@@ -1185,34 +1185,40 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         if klines is not None:
             calc = SimpleDftb(
                 geometry,
-                shell_dict=shell_dict,
+                # shell_dict=shell_dict,
                 klines=klines,
-                h_feed=h_feed,
-                s_feed=s_feed,
-                nelectron=nelectron,
+                model=self,
+                # h_feed=h_feed,
+                # s_feed=s_feed,
+                # nelectron=nelectron,
                 device=device,
                 with_eigenvectors=with_eigenvectors,
             )
         else:
             calc = SimpleDftb(
                 geometry,
-                shell_dict=shell_dict,
+                # shell_dict=shell_dict,
                 kpoints=kpoints,
-                h_feed=h_feed,
-                s_feed=s_feed,
-                nelectron=nelectron,
+                # h_feed=h_feed,
+                # s_feed=s_feed,
+                # nelectron=nelectron,
                 device=device,
+                model=self,
                 with_eigenvectors=with_eigenvectors,
             )
 
         # Compute properties
-        eigenvalues = calc()
-        print("eigenvalues", eigenvalues)
-        properties = calc.get_properties_dict(
-            include_bulk_modulus=get_bulk_mod,
-            include_dos_data=True,
-        )
-        # """
+        properties = calc.calculate(compute_forces=False)
+        eigenvalues = properties[
+            "eigenvalues"
+        ]  # calc.calculate(compute_forces=False)
+        # eigenvalues = calc()
+        # print("eigenvalues", eigenvalues)
+        # properties = calc.get_properties_dict(
+        #    include_bulk_modulus=get_bulk_mod,
+        #    include_dos_data=True,
+        # )
+        """
         if get_fermi:
             kT = 0.025
             H2E = 27.211
@@ -1274,8 +1280,8 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         if get_forces:
             forces = calc._compute_forces_finite_diff()
             properties["forces"] = forces
-        # """
         properties["eigenvalues"] = eigenvalues
+        """
         return properties, True
 
     def _create_comprehensive_feed(
@@ -2024,30 +2030,30 @@ def train_multi_vasp_skf_parameters(
                 # print("properties",properties,"\n")
                 # print("dataset",dataset)
                 target_bandgap = dataset["target_bandgap"]
-                print("pred band_gap_eV", properties["band_gap_eV"])
+                print("pred band_gap_eV", properties["bandgap"])
                 print("target band_gap_eV", target_bandgap)
-                computed_dos = properties["dos_values_tensor"]
-                target_dos = dataset["target_dos"].to(computed_dos.device)
+                # computed_dos = properties["dos_values_tensor"]
+                # target_dos = dataset["target_dos"].to(computed_dos.device)
                 bandgap_weight = 1.0
                 dos_weight = 0.0
                 # Compute losses for this dataset
-                mse_loss = torch.mean((computed_dos - target_dos) ** 2)
-                mae_loss = torch.mean(torch.abs(computed_dos - target_dos))
+                # mse_loss = torch.mean((computed_dos - target_dos) ** 2)
+                # mae_loss = torch.mean(torch.abs(computed_dos - target_dos))
                 bandgap_mae_loss = torch.mean(
-                    torch.abs(target_bandgap - properties["band_gap_eV"])
+                    torch.abs(target_bandgap - properties["bandgap"])
                 )
 
-                # Peak matching
-                peak_mask = target_dos > target_dos.max() * 0.1
-                if peak_mask.sum() > 0:
-                    peak_loss = torch.mean(
-                        ((computed_dos - target_dos) * peak_mask.float()) ** 2
-                    )
-                else:
-                    peak_loss = torch.tensor(0.0, device=computed_dos.device)
+                ## Peak matching
+                # peak_mask = target_dos > target_dos.max() * 0.1
+                # if peak_mask.sum() > 0:
+                #    peak_loss = torch.mean(
+                #        ((computed_dos - target_dos) * peak_mask.float()) ** 2
+                #    )
+                # else:
+                #    peak_loss = torch.tensor(0.0, device=computed_dos.device)
 
                 # Dataset-specific loss
-                dataset_loss = mse_loss + 0.5 * mae_loss + 2.0 * peak_loss
+                # dataset_loss = mse_loss + 0.5 * mae_loss + 2.0 * peak_loss
                 dataset_loss = bandgap_mae_loss
                 # Weight by system size if requested
                 if weight_by_system_size:
