@@ -166,6 +166,118 @@ class SimpleDftb:
         z = atomic_numbers_to_symbols(zz)
         atomic_num_to_symbol = dict(zip(zz, z))
 
+        # Get distance matrix
+        atom_pairs = self.basis.atomic_number_matrix("atomic").to(self.device)
+        dist_vecs = self.periodic.distance_vectors.to(self.device)
+        dist_mat = torch.sqrt((dist_vecs**2).sum(-1) + 1e-10)
+
+        # Initialize total repulsive energy
+        total_rep_energy = torch.zeros(1, device=self.device)
+
+        # Get unique atom pairs
+        uan = self.periodic.unique_atomic_numbers()
+        n_global = len(uan)
+        uap = torch.stack(
+            [uan.repeat(n_global), uan.repeat_interleave(n_global)]
+        ).T.to(self.device)
+
+        # Loop over unique atom pairs
+        for iap in uap:
+            element_i = atomic_num_to_symbol.get(iap[0].item())
+            element_j = atomic_num_to_symbol.get(iap[1].item())
+
+            if element_i is None or element_j is None:
+                continue
+
+            element_pair = "-".join(tuple(sorted([element_i, element_j])))
+
+            if element_pair not in self.updated_skfs:
+                continue
+
+            skf = self.updated_skfs[element_pair]
+
+            # Create atom pair mask
+            mask_i = atom_pairs[..., 0] == iap[0]
+            mask_j = atom_pairs[..., 1] == iap[1]
+            mask_pair = mask_i & mask_j
+
+            # Only non-zero distances
+            mask_nonzero = dist_mat.gt(1e-8)
+            mask = mask_pair & mask_nonzero
+
+            if not mask.any():
+                continue
+
+            d_masked = dist_mat[mask]
+
+            # Get grid and coefficients
+            r_cutoff = skf.r_spline.cutoff
+            grid = skf.r_spline.grid.to(self.device)
+            exp_coef = skf.r_spline.exp_coef.to(self.device)
+            spline_coef = skf.r_spline.spline_coef.to(self.device)
+            tail_coef = skf.r_spline.tail_coef.to(self.device)
+
+            # Distance-based region masks (mutually exclusive!)
+            in_tail = (d_masked >= grid[0]) & (d_masked <= grid[1])
+            in_spline = (d_masked > grid[1]) & (d_masked < grid[-1])
+            in_exp = (d_masked >= grid[-1]) & (d_masked < r_cutoff)
+
+            # Initialize energy for this pair type
+            pair_energy = torch.zeros_like(d_masked)
+
+            # 1. Tail region (closest distances)
+            if in_tail.any():
+                d_tail = d_masked[in_tail]
+                ind = torch.searchsorted(grid[:2], d_tail) - 1
+                ind = torch.clamp(ind, 0, 0)  # Only one interval in tail
+                dr = d_tail - grid[ind]
+
+                pair_energy[in_tail] = (
+                    tail_coef[0]
+                    + tail_coef[1] * dr
+                    + tail_coef[2] * dr**2
+                    + tail_coef[3] * dr**3
+                    + tail_coef[4] * dr**4
+                    + tail_coef[5] * dr**5
+                )
+
+            # 2. Spline region (middle distances)
+            if in_spline.any():
+                d_spline = d_masked[in_spline]
+                ind = torch.searchsorted(grid, d_spline) - 1
+                ind = torch.clamp(ind, 0, len(grid) - 2)
+
+                r_pol = spline_coef[ind]
+                dr = d_spline - grid[ind]
+
+                pair_energy[in_spline] = (
+                    r_pol[..., 0]
+                    + r_pol[..., 1] * dr
+                    + r_pol[..., 2] * dr**2
+                    + r_pol[..., 3] * dr**3
+                )
+
+            # 3. Exponential region (far distances)
+            if in_exp.any():
+                d_exp = d_masked[in_exp]
+                pair_energy[in_exp] = (
+                    torch.exp(-exp_coef[0] * d_exp + exp_coef[1]) + exp_coef[2]
+                )
+
+            # Accumulate (0.5 to avoid double counting)
+            total_rep_energy += 0.5 * pair_energy.sum()
+
+        return total_rep_energy
+
+    def _compute_repulsive_energyX(self):
+        """Compute pair repulsive potential energy."""
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        # Build atomic number to symbol mapping
+        zz = list(range(1, self.max_Z))
+        z = atomic_numbers_to_symbols(zz)
+        atomic_num_to_symbol = dict(zip(zz, z))
+
         # Get unique atom pairs
         uan = self.periodic.unique_atomic_numbers()
         n_global = len(uan)
@@ -319,11 +431,19 @@ class SimpleDftb:
         electronic_energy = torch.sum(
             occupations * eigenvalues * self.k_weights.unsqueeze(-1)
         )
-
-        # Repulsive energy
         if self.repulsive:
-            potential_energy = self._compute_repulsive_energy()
-            total_energy = electronic_energy - potential_energy
+            potential_energy = (
+                self._compute_repulsive_energy() * self.H2E
+            )  # Convert to eV
+            total_energy = (
+                electronic_energy + potential_energy
+            )  # Add repulsive (positive)
+            # Repulsive energy
+            # if self.repulsive:
+            #   potential_energy = self._compute_repulsive_energy()
+            #   total_energy = electronic_energy - potential_energy
+            print("potential_energy", potential_energy)
+            print("electronic_energy", electronic_energy)
         else:
             potential_energy = torch.tensor(0.0, device=self.device)
             total_energy = electronic_energy
@@ -486,12 +606,23 @@ class SimpleDftbCalculator(Calculator):
         self.results["forces"] = forces.detach().cpu().numpy()
 
 
-def run_calc(ase_atoms=None, model_path=None):
-    model = MultiElementSkfParameterOptimizer.load_ultra_compact(model_path)
+def run_calc(
+    ase_atoms=None,
+    model_path=None,
+    model=None,
+    kpoints_array=[1, 1, 1],
+    device="cuda",
+):
+    if model_path is not None:
+        from slakonet.optim import MultiElementSkfParameterOptimizer
+
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+            model_path
+        )
     geometry = Geometry.from_ase_atoms([ase_atoms])
     geometry.positions.requires_grad_(True)
-    kpoints = torch.tensor([2, 2, 2])  # For DOS
-    device = "cuda"
+    kpoints = torch.tensor(kpoints_array)  # For DOS
+    # device = "cuda"
     model = model.to(device)
     model.eval()
 
@@ -500,7 +631,7 @@ def run_calc(ase_atoms=None, model_path=None):
     ##s = SimpleDftb(geometry,klines=klines,model=model)
     # print('ele',s.nelectron)
     res = s.calculate()
-    print("res", res)
+    # print("res", res)
     return res
 
 
@@ -540,6 +671,74 @@ class SlakoNetCalculatorX(Calculator):
         # Store results
         self.results["energy"] = results["energy"].sum().detach().cpu().item()
         self.results["forces"] = results["forces"][0].detach().cpu().numpy()
+
+
+from ase.calculators.calculator import Calculator, all_changes
+from ase import Atoms as AseAtoms
+import numpy as np
+import torch
+from jarvis.core.atoms import Atoms as JarvisAtoms
+from jarvis.core.atoms import ase_to_atoms
+
+
+class SlakoNetCalculator(Calculator):
+    """ASE Calculator interface for SlakoNet"""
+
+    implemented_properties = ["energy", "forces", "stress"]
+
+    def __init__(self, model, **kwargs):
+        """
+        Initialize SlakoNet calculator
+
+        Args:
+            model: Loaded SlakoNet model (MultiElementSkfParameterOptimizer)
+            **kwargs: Additional arguments passed to Calculator
+        """
+        Calculator.__init__(self, **kwargs)
+        self.model = model
+
+    def calculate(
+        self,
+        atoms=None,
+        properties=["energy", "forces"],
+        system_changes=all_changes,
+    ):
+        """
+        Calculate properties using SlakoNet
+
+        Args:
+            atoms: ASE Atoms object
+            properties: List of properties to calculate
+            system_changes: Changes since last calculation
+        """
+        Calculator.calculate(self, atoms, properties, system_changes)
+
+        # Run SlakoNet calculation
+        result = run_calc(ase_atoms=atoms, model=self.model)
+
+        # Extract results and convert to numpy arrays on CPU
+        self.results["energy"] = result["energy"].detach().cpu().numpy().item()
+
+        if "forces" in properties:
+            forces = result["forces"].detach().cpu().numpy()
+            # Reshape forces to (n_atoms, 3)
+            self.results["forces"] = forces.reshape(-1, 3)
+
+        # Optional: Add other properties
+        if "fermi_energy" in result:
+            self.results["fermi_energy"] = (
+                result["fermi_energy"].detach().cpu().numpy().item()
+            )
+
+        if "bandgap" in result:
+            self.results["bandgap"] = (
+                result["bandgap"].detach().cpu().numpy().item()
+            )
+
+        if "eigenvalues" in result:
+            self.results["eigenvalues"] = (
+                result["eigenvalues"].detach().cpu().numpy()
+            )
 
 
 # Example usage
