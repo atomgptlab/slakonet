@@ -78,7 +78,9 @@ class SimpleDftb:
         self.updated_skfs = self.model.get_updated_skfs()
         self.h_feed = create_feeds(self.updated_skfs, self.shell_dict, "H")
         self.s_feed = create_feeds(self.updated_skfs, self.shell_dict, "S")
-
+        # ===== CRITICAL: Store original kpoints/klines for force calculations =====
+        self._original_kpoints = kpoints
+        self._original_klines = klines
         # Precompute electron lookup table (gradient-safe)
         self.electron_lookup = self._build_electron_lookup()
         self.nelectron = self._compute_nelectrons()
@@ -361,12 +363,24 @@ class SimpleDftb:
 
         return total_rep_energy
 
-    def calculate(self, compute_forces=True):
+    def calculate(self, compute_forces=True, include_dos_data=False):
         """Main calculation method."""
         # Enable gradient tracking for positions if forces needed
         if compute_forces:
-            self.geometry.positions.requires_grad_(True)
-
+            needs_recreation = not self.geometry.positions.requires_grad
+            if needs_recreation:
+                # CRITICAL: Set requires_grad BEFORE creating Periodic object
+                # if not self.geometry.positions.requires_grad:
+                self.geometry.positions.requires_grad_(True)
+                self.periodic = Periodic(
+                    self.geometry,
+                    self.geometry.cell,
+                    cutoff=self.cutoff,
+                    kpoints=self._original_kpoints,  # Use stored original
+                    klines=self._original_klines,  # Use stored original
+                )
+                self.k_weights = self.periodic.k_weights.to(self.device)
+                self.max_nk = self.periodic.n_kpoints.max()
         # Build Hamiltonian and overlap matrices
         H = hs_matrix(self.periodic, self.basis, self.h_feed).to(self.device)
         S = hs_matrix(self.periodic, self.basis, self.s_feed).to(self.device)
@@ -388,17 +402,10 @@ class SimpleDftb:
         electronic_energy = torch.sum(
             occupations * eigenvalues * self.k_weights.unsqueeze(-1)
         )
+
         if self.repulsive:
-            potential_energy = (
-                self._compute_repulsive_energy() * self.H2E
-            )  # Convert to eV
-            total_energy = (
-                electronic_energy + potential_energy
-            )  # Add repulsive (positive)
-            # Repulsive energy
-            # if self.repulsive:
-            #   potential_energy = self._compute_repulsive_energy()
-            #   total_energy = electronic_energy - potential_energy
+            potential_energy = self._compute_repulsive_energy() * self.H2E
+            total_energy = electronic_energy + potential_energy
             print("potential_energy", potential_energy)
             print("electronic_energy", electronic_energy)
         else:
@@ -435,22 +442,24 @@ class SimpleDftb:
         # Compute forces
         forces = None
         if compute_forces:
-            forces = torch.autograd.grad(
-                total_energy,
-                self.geometry.positions,
-                create_graph=True,
-                # create_graph=False,
-                retain_graph=False,
-            )[0]
+            try:
+                grad_outputs = torch.autograd.grad(
+                    total_energy,
+                    self.geometry.positions,
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=False,  # Change back to False - should work now
+                )
 
-        # energy_grid, dos = self.calculate_dos(
-        #            energy_range=(-10, 10),
-        #            num_points=5000,
-        #            sigma=0.1,
-        #            fermi_shift=True,
-        #        )
+                forces = -grad_outputs[0]  # Forces are negative gradient
+                # print("forcessssssss", forces)
 
-        # Store results
+            except RuntimeError as e:
+                print(f"❌ Error computing forces: {e}")
+                print(
+                    "⚠️  Forces set to zero - positions may not be in computation graph"
+                )
+                forces = torch.zeros_like(self.geometry.positions)
         self._results = {
             "energy": total_energy,
             "eigenvalues": eigenvalues_shifted,
@@ -462,11 +471,10 @@ class SimpleDftb:
             "occupations": occupations,
             "geometry": self.geometry,
             "basis": self.basis,
-            "basis": self.basis,
         }
-        include_dos_data = True
+        # Calculate DOS data if needed
+        # include_dos_data=False
         if include_dos_data:
-            # print("Calculating DOS data for properties dict...")
             energy_grid, dos = self.calculate_dos(
                 energy_range=(-10, 10),
                 num_points=5000,
@@ -474,44 +482,34 @@ class SimpleDftb:
                 fermi_shift=True,
             )
 
-            # Keep everything as tensors for ML compatibility
-            # Find DOS at Fermi level (energy closest to 0 when fermi_shifted)
             fermi_idx = torch.argmin(torch.abs(energy_grid))
             dos_at_fermi = dos[fermi_idx]
 
-            # Find band gap from DOS (where DOS is minimum near Fermi level)
-            # Create mask for region around Fermi level (±2 eV)
             fermi_region_mask = torch.abs(energy_grid) < 2.0
             fermi_region_dos = dos[fermi_region_mask]
             fermi_region_energies = energy_grid[fermi_region_mask]
 
-            # Find minimum DOS in Fermi region
             min_dos_idx_local = torch.argmin(fermi_region_dos)
             gap_center_energy = fermi_region_energies[min_dos_idx_local]
 
-            # Calculate total states using trapezoidal integration
-            # torch.trapz equivalent
-            dx = energy_grid[1] - energy_grid[0]  # Uniform grid spacing
+            dx = energy_grid[1] - energy_grid[0]
             total_states = torch.trapz(dos, energy_grid)
 
-            self._results.update(
-                {
-                    # Store as Python scalars for JSON serialization, but computed with torch
-                    "dos_at_fermi": dos_at_fermi.item(),
-                    "dos_gap_center_eV": gap_center_energy.item(),
-                    "dos_total_states": total_states.item(),
-                    # For ML training, you might want to keep these as tensors:
-                    "dos_at_fermi_tensor": dos_at_fermi,  # Keep tensor for gradients
-                    "dos_gap_center_tensor": gap_center_energy,  # Keep tensor
-                    "dos_total_states_tensor": total_states,  # Keep tensor
-                    # Optionally store full arrays as tensors (memory intensive)
-                    "dos_energy_grid_tensor": energy_grid,  # Full tensor
-                    "dos_values_tensor": dos,  # Full tensor
-                    # Convert to lists for JSON compatibility
-                    #'dos_energy_grid_eV': energy_grid.detach().cpu().numpy().tolist(),
-                    #'dos_values': dos.detach().cpu().numpy().tolist(),
-                }
-            )
+            dos_data = {
+                "dos_at_fermi": dos_at_fermi.item(),
+                "dos_gap_center_eV": gap_center_energy.item(),
+                "dos_total_states": total_states.item(),
+                "dos_at_fermi_tensor": dos_at_fermi,
+                "dos_gap_center_tensor": gap_center_energy,
+                "dos_total_states_tensor": total_states,
+                "dos_energy_grid_tensor": energy_grid,
+                "dos_values_tensor": dos,
+            }
+        else:
+            dos_data = {}
+        self._results.update(dos_data)
+        # Store results
+
         if self.with_eigenvectors:
             self._results["eigenvectors"] = eigenvectors
 

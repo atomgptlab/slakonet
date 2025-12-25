@@ -59,6 +59,11 @@ os.environ["PYTHONHASHSEED"] = str(random_seed)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(":4096:8")
 torch.use_deterministic_algorithms(True)
 
+torch.autograd.set_detect_anomaly(True)
+
+# Optional: Make it raise errors immediately
+torch.set_anomaly_enabled(True)
+
 
 def get_atoms(jid="", dataset=None, id_tag="jid"):
     if dataset is None:
@@ -1074,7 +1079,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             )
 
         # Compute properties
-        properties = calc.calculate(compute_forces=False)
+        properties = calc.calculate(compute_forces=get_forces)
         eigenvalues = properties[
             "eigenvalues"
         ]  # calc.calculate(compute_forces=False)
@@ -1958,10 +1963,11 @@ def train_multi_vasp_skf_parameters(
     save_directory="multi_vasp_optimization_all",
     weight_by_system_size=True,
     early_stopping_patience=20,
-    target_property="forces",  # "energy", "forces", "bandgap", or "both"
+    target_property="both",  # "energy", "forces", "bandgap", or "both"
     force_weight=0.1,
     energy_weight=1.0,
     bandgap_weight=1.0,
+    device="cuda",
 ):
     """
     Enhanced training function for multiple VASP datasets with flexible loss targets
@@ -1991,6 +1997,7 @@ def train_multi_vasp_skf_parameters(
 
     # Determine if we need forces
     load_forces = target_property in ["forces", "both"]
+    print("load_forces", load_forces)
     data_loader = MultiVaspDataLoader(vasprun_paths, load_forces=load_forces)
 
     if len(data_loader) == 0:
@@ -2064,6 +2071,7 @@ def train_multi_vasp_skf_parameters(
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     for epoch in range(num_epochs):
+        print("EPOCHHHH", epoch)
         t1 = time.time()
         optimizer.zero_grad()
 
@@ -2072,6 +2080,7 @@ def train_multi_vasp_skf_parameters(
 
         # Get batch of datasets
         require_forces = target_property in ["forces", "both"]
+        print("require_forces HERE ", require_forces)
         batch_datasets = data_loader.get_batch(
             batch_size=batch_size, shuffle=True, require_forces=require_forces
         )
@@ -2085,15 +2094,23 @@ def train_multi_vasp_skf_parameters(
         epoch_force_losses = []
 
         # Process each dataset in the batch
-        for dataset in batch_datasets:
+        for i, dataset in enumerate(batch_datasets):
+            print(
+                f"\n  Processing dataset {i+1}/{len(batch_datasets)} (index={dataset['index']})"
+            )
+            print("datset", dataset, len(dataset))
             # Compute properties for this system
             properties, success = (
                 multi_element_optimizer.compute_multi_element_properties(
                     geometry=dataset["geometry"],
                     shell_dict=shell_dict,
                     kpoints=kpoints,
+                    get_forces=True,
+                    device=device,
                 )
             )
+            print(f"    Properties computed, success={success}")
+            # print('properties',properties)
 
             # if not success:
             #    print(
@@ -2104,7 +2121,7 @@ def train_multi_vasp_skf_parameters(
             total_dataset_loss = 0.0
 
             # Energy loss
-            if target_property in ["energy"]:
+            if target_property in ["energy", "both"]:
                 target_energy = torch.tensor(
                     [dataset["target_energy"]], device=device
                 )
@@ -2114,7 +2131,7 @@ def train_multi_vasp_skf_parameters(
                 epoch_energy_losses.append(energy_loss.item())
 
             # Bandgap loss
-            if target_property in ["bandgap"]:
+            if target_property in ["bandgap", "both"]:
                 target_bandgap = torch.tensor(
                     [dataset["target_bandgap"]], device=device
                 )
@@ -2124,7 +2141,7 @@ def train_multi_vasp_skf_parameters(
                 epoch_bandgap_losses.append(bandgap_loss.item())
 
             # Force loss
-            if target_property in ["forces"]:
+            if target_property in ["forces", "both"]:
                 if (
                     dataset["target_forces"] is not None
                     and properties["forces"] is not None
@@ -2192,9 +2209,37 @@ def train_multi_vasp_skf_parameters(
         # Final loss
         total_loss = batch_loss + regularization
 
+        # if torch.isnan(total_loss):
+        #    print(f"Epoch {epoch}: NaN loss detected, skipping...")
+        #    continue
+        # Around line 2200, before total_loss.backward()
+
+        print(f"\n=== Epoch {epoch} Loss Debug ===")
+        print(f"epoch_losses: {epoch_losses}")
+        print(f"total_weight: {total_weight}")
+        print(f"batch_loss: {batch_loss}")
+        print(f"regularization: {regularization}")
+        print(f"total_loss: {total_loss}")
+
+        # Check for NaN/Inf in loss components
+        if torch.isnan(batch_loss):
+            print("❌ NaN in batch_loss!")
+            print(f"  epoch_losses: {epoch_losses}")
+            print(f"  total_weight: {total_weight}")
+
+        if torch.isnan(regularization):
+            print("❌ NaN in regularization!")
+
         if torch.isnan(total_loss):
-            print(f"Epoch {epoch}: NaN loss detected, skipping...")
+            print(f"❌ NaN in total_loss before backward!")
+            print(f"  Skipping this epoch...")
             continue
+
+        # Check for very small values that could cause issues
+        if batch_loss < 1e-10:
+            print(f"⚠️  Very small batch_loss: {batch_loss}")
+
+        print("=" * 40)
 
         # Backward pass
         total_loss.backward()
