@@ -363,7 +363,7 @@ class SimpleDftb:
 
         return total_rep_energy
 
-    def calculate(self, compute_forces=True, include_dos_data=False):
+    def calculate(self, compute_forces=True, include_dos_data=True):
         """Main calculation method."""
         # Enable gradient tracking for positions if forces needed
         if compute_forces:
