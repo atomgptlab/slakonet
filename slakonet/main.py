@@ -99,6 +99,97 @@ class SimpleDftb:
         # Cache for computed properties
         self._results = None
 
+    def calculate_dos(
+        self,
+        energy_range=(-10, 5),
+        num_points=5000,
+        sigma=0.1,
+        fermi_shift=True,
+        unit="eV",
+    ):
+        """
+        Calculate density of states with Gaussian broadening.
+
+        Parameters:
+        -----------
+        energy_range : tuple
+            Energy range (E_min, E_max) for DOS calculation
+        num_points : int
+            Number of energy grid points
+        sigma : float
+            Gaussian broadening parameter (in same units as energy_range)
+        fermi_shift : bool
+            If True, shift energies so Fermi energy is at zero
+        unit : str
+            'eV' or 'Ha' for energy units (currently only 'eV' supported)
+
+        Returns:
+        --------
+        tuple : (energy_grid, dos) both as torch.Tensors
+        """
+        # Ensure we have results
+        if self._results is None:
+            self.calculate()
+
+        # Get eigenvalues (already in eV from calculate())
+        eigenvals = self._results["eigenvalues"]  # [batch, nk, nb] in eV
+
+        # Apply Fermi shift if requested
+        if fermi_shift:
+            # eigenvalues are already Fermi-shifted in calculate()
+            pass  # Already shifted
+        else:
+            # Add Fermi energy back
+            fermi_energy = self._results["fermi_energy"]  # in eV
+            eigenvals = eigenvals + fermi_energy
+
+        # Create energy grid
+        energy_grid = torch.linspace(
+            energy_range[0], energy_range[1], num_points, device=self.device
+        )
+        dos = torch.zeros(num_points, device=self.device)
+
+        # Convert sigma to tensor on same device
+        sigma_tensor = torch.tensor(
+            sigma, device=self.device, dtype=energy_grid.dtype
+        )
+
+        # Gaussian broadening function (vectorized)
+        def gaussian(x_grid, mu_val, sig):
+            pi_tensor = torch.tensor(
+                torch.pi, device=self.device, dtype=x_grid.dtype
+            )
+            return torch.exp(-0.5 * ((x_grid - mu_val) / sig) ** 2) / (
+                sig * torch.sqrt(2 * pi_tensor)
+            )
+
+        # Calculate DOS using vectorized approach
+        nbatch, nkpoints, nbands = eigenvals.shape
+
+        for ik in range(nkpoints):
+            # Get k-point weight - handle different k_weights shapes
+            if len(self.k_weights.shape) == 2:
+                weight = self.k_weights[0, ik]  # Extract scalar from 2D tensor
+            elif ik < len(self.k_weights):
+                weight = self.k_weights[ik]
+            else:
+                weight = torch.tensor(1.0 / nkpoints, device=self.device)
+
+            # Get all bands for this k-point
+            kpoint_eigenvals = eigenvals[0, ik, :]  # Shape: (nbands,)
+
+            # Process each band individually
+            for ib in range(nbands):
+                eigenval = kpoint_eigenvals[ib]  # Single eigenvalue
+
+                # Add Gaussian contribution for this eigenvalue
+                gaussian_contrib = gaussian(
+                    energy_grid, eigenval, sigma_tensor
+                )
+                dos += weight * gaussian_contrib
+
+        return energy_grid, dos
+
     def _build_electron_lookup(self):
         """Build gradient-preserving electron count lookup table."""
         from jarvis.core.specie import Specie
@@ -195,7 +286,8 @@ class SimpleDftb:
                 continue
 
             skf = self.updated_skfs[element_pair]
-
+            if not skf.r_spline:
+                return 0
             # Create atom pair mask
             mask_i = atom_pairs[..., 0] == iap[0]
             mask_j = atom_pairs[..., 1] == iap[1]
@@ -211,11 +303,11 @@ class SimpleDftb:
             d_masked = dist_mat[mask]
 
             # Get grid and coefficients
-            r_cutoff = skf.r_spline.cutoff
-            grid = skf.r_spline.grid.to(self.device)
-            exp_coef = skf.r_spline.exp_coef.to(self.device)
-            spline_coef = skf.r_spline.spline_coef.to(self.device)
-            tail_coef = skf.r_spline.tail_coef.to(self.device)
+            r_cutoff = skf.r_spline.cutoff  # *2
+            grid = skf.r_spline.grid.to(self.device)  # *2
+            exp_coef = skf.r_spline.exp_coef.to(self.device) * 27.211
+            spline_coef = skf.r_spline.spline_coef.to(self.device) * 27.211
+            tail_coef = skf.r_spline.tail_coef.to(self.device) * 27.211
 
             # Distance-based region masks (mutually exclusive!)
             in_tail = (d_masked >= grid[0]) & (d_masked <= grid[1])
@@ -351,6 +443,13 @@ class SimpleDftb:
                 retain_graph=False,
             )[0]
 
+        # energy_grid, dos = self.calculate_dos(
+        #            energy_range=(-10, 10),
+        #            num_points=5000,
+        #            sigma=0.1,
+        #            fermi_shift=True,
+        #        )
+
         # Store results
         self._results = {
             "energy": total_energy,
@@ -361,8 +460,58 @@ class SimpleDftb:
             "forces": forces,
             "bandgap": bandgap,
             "occupations": occupations,
+            "geometry": self.geometry,
+            "basis": self.basis,
+            "basis": self.basis,
         }
+        include_dos_data = True
+        if include_dos_data:
+            # print("Calculating DOS data for properties dict...")
+            energy_grid, dos = self.calculate_dos(
+                energy_range=(-10, 10),
+                num_points=5000,
+                sigma=0.1,
+                fermi_shift=True,
+            )
 
+            # Keep everything as tensors for ML compatibility
+            # Find DOS at Fermi level (energy closest to 0 when fermi_shifted)
+            fermi_idx = torch.argmin(torch.abs(energy_grid))
+            dos_at_fermi = dos[fermi_idx]
+
+            # Find band gap from DOS (where DOS is minimum near Fermi level)
+            # Create mask for region around Fermi level (±2 eV)
+            fermi_region_mask = torch.abs(energy_grid) < 2.0
+            fermi_region_dos = dos[fermi_region_mask]
+            fermi_region_energies = energy_grid[fermi_region_mask]
+
+            # Find minimum DOS in Fermi region
+            min_dos_idx_local = torch.argmin(fermi_region_dos)
+            gap_center_energy = fermi_region_energies[min_dos_idx_local]
+
+            # Calculate total states using trapezoidal integration
+            # torch.trapz equivalent
+            dx = energy_grid[1] - energy_grid[0]  # Uniform grid spacing
+            total_states = torch.trapz(dos, energy_grid)
+
+            self._results.update(
+                {
+                    # Store as Python scalars for JSON serialization, but computed with torch
+                    "dos_at_fermi": dos_at_fermi.item(),
+                    "dos_gap_center_eV": gap_center_energy.item(),
+                    "dos_total_states": total_states.item(),
+                    # For ML training, you might want to keep these as tensors:
+                    "dos_at_fermi_tensor": dos_at_fermi,  # Keep tensor for gradients
+                    "dos_gap_center_tensor": gap_center_energy,  # Keep tensor
+                    "dos_total_states_tensor": total_states,  # Keep tensor
+                    # Optionally store full arrays as tensors (memory intensive)
+                    "dos_energy_grid_tensor": energy_grid,  # Full tensor
+                    "dos_values_tensor": dos,  # Full tensor
+                    # Convert to lists for JSON compatibility
+                    #'dos_energy_grid_eV': energy_grid.detach().cpu().numpy().tolist(),
+                    #'dos_values': dos.detach().cpu().numpy().tolist(),
+                }
+            )
         if self.with_eigenvectors:
             self._results["eigenvectors"] = eigenvectors
 
