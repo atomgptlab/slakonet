@@ -26,6 +26,17 @@ import numpy as np
 from slakonet.utils import eighb, create_feeds, generate_shell_dict_upto_Z65
 from slakonet.fermi import fermi_smearing
 from slakonet.interpolation import PolyInterpU
+import torch
+from ase.calculators.calculator import Calculator, all_changes
+import torch
+from ase.calculators.calculator import Calculator, all_changes
+from slakonet.atoms import Geometry
+from ase.calculators.calculator import Calculator, all_changes
+from ase import Atoms as AseAtoms
+import numpy as np
+import torch
+from jarvis.core.atoms import Atoms as JarvisAtoms
+from jarvis.core.atoms import ase_to_atoms
 
 try:
     from phonopy import Phonopy
@@ -55,6 +66,9 @@ class SimpleDftb:
         device=None,
         kT=0.025,  # eV for Fermi smearing
         H2E=27.211,  # Hartree to eV
+        compute_forces=True,
+        include_dos_data=True,
+        include_HS=True,
         # shell_dict=None,
         # h_feed=None,
         # s_feed=None,
@@ -71,7 +85,9 @@ class SimpleDftb:
         self.with_eigenvectors = with_eigenvectors
         self.kT = kT
         self.H2E = H2E
-
+        self.compute_forces = compute_forces
+        self.include_dos_data = include_dos_data
+        self.include_HS = include_HS
         # Setup basis and feeds
         self.shell_dict = generate_shell_dict_upto_Z65()
         self.basis = Basis(self.geometry.atomic_numbers, self.shell_dict)
@@ -363,8 +379,640 @@ class SimpleDftb:
 
         return total_rep_energy
 
-    def calculate(self, compute_forces=True, include_dos_data=True):
+    def _evaluate_wavefunction_on_grid(self, grid_cart, psi_coef, positions):
+        """
+        Evaluate wavefunction on a real-space grid.
+
+        This is a simplified version using Gaussian-type orbitals.
+        For production, you'd want to use the actual DFTB basis functions.
+        """
+        nx, ny, nz, _ = grid_cart.shape
+        psi_grid = np.zeros(
+            (nx, ny, nz), dtype=np.complex128
+        )  # Changed to complex!
+
+        # Get basis information
+        atomic_numbers = self.geometry.atomic_numbers[0].cpu().numpy()
+
+        orbital_idx = 0
+        for iatom, Z in enumerate(atomic_numbers):
+            if Z == 0:  # Skip padding
+                continue
+
+            pos = positions[iatom]  # [3]
+
+            # Get shells for this atom
+            shells = self.shell_dict.get(int(Z), [])
+
+            for shell in shells:
+                n_orbitals = 2 * shell + 1  # Number of orbitals in this shell
+
+                for m in range(n_orbitals):
+                    if orbital_idx >= len(psi_coef):
+                        break
+
+                    coef = psi_coef[orbital_idx]  # This is complex
+
+                    # Simple Gaussian approximation for orbital
+                    # In reality, you'd use proper Slater-Koster basis
+                    zeta = 2.0  # Orbital exponent (simplified)
+
+                    # Distance from atom to grid points
+                    dx = grid_cart[..., 0] - pos[0]
+                    dy = grid_cart[..., 1] - pos[1]
+                    dz = grid_cart[..., 2] - pos[2]
+                    r = np.sqrt(dx**2 + dy**2 + dz**2)
+
+                    # Gaussian approximation: φ(r) ∝ exp(-ζr²)
+                    if shell == 0:  # s orbital
+                        orbital = np.exp(-zeta * r**2)
+                    elif shell == 1:  # p orbital
+                        if m == 0:
+                            orbital = dx * np.exp(-zeta * r**2)
+                        elif m == 1:
+                            orbital = dy * np.exp(-zeta * r**2)
+                        else:
+                            orbital = dz * np.exp(-zeta * r**2)
+                    else:  # d orbitals (simplified)
+                        orbital = r**2 * np.exp(-zeta * r**2)
+
+                    psi_grid += coef * orbital
+                    orbital_idx += 1
+
+        return psi_grid
+
+    def calculate_charge_density(
+        self,
+        grid_spacing=0.1,  # Angstrom
+        padding=2.0,  # Angstrom padding around cell
+    ):
+        """
+        Calculate electron charge density on a real-space grid.
+
+        Returns:
+            grid_points: (nx, ny, nz, 3) array of grid point coordinates
+            charge_density: (nx, ny, nz) array of charge density values
+        """
+        # Ensure we have eigenvectors
+        if self._results is None or "eigenvectors" not in self._results:
+            self.with_eigenvectors = True
+            self.calculate()
+
+        eigenvectors = self._results[
+            "eigenvectors"
+        ]  # [batch, nk, nbands, norbitals]
+        occupations = self._results["occupations"]  # [batch, nk, nbands]
+
+        # Get cell information
+        cell = self.geometry.cell.cpu().numpy()[0]  # [3, 3]
+        positions = (
+            self.geometry.positions.detach().cpu().numpy()[0]
+        )  # [natoms, 3]
+
+        # Create real-space grid
+        # Determine grid dimensions
+        cell_lengths = np.linalg.norm(cell, axis=1)
+        nx = int(np.ceil(cell_lengths[0] / grid_spacing)) + int(
+            2 * padding / grid_spacing
+        )
+        ny = int(np.ceil(cell_lengths[1] / grid_spacing)) + int(
+            2 * padding / grid_spacing
+        )
+        nz = int(np.ceil(cell_lengths[2] / grid_spacing)) + int(
+            2 * padding / grid_spacing
+        )
+
+        # Create grid in fractional coordinates
+        x = np.linspace(
+            -padding / cell_lengths[0], 1 + padding / cell_lengths[0], nx
+        )
+        y = np.linspace(
+            -padding / cell_lengths[1], 1 + padding / cell_lengths[1], ny
+        )
+        z = np.linspace(
+            -padding / cell_lengths[2], 1 + padding / cell_lengths[2], nz
+        )
+
+        grid_frac = np.meshgrid(x, y, z, indexing="ij")
+        grid_frac = np.stack(grid_frac, axis=-1)  # [nx, ny, nz, 3]
+
+        # Convert to Cartesian coordinates
+        grid_cart = np.dot(grid_frac, cell)  # [nx, ny, nz, 3]
+
+        # Initialize charge density (real-valued)
+        charge_density = np.zeros((nx, ny, nz), dtype=np.float64)
+
+        # Evaluate wavefunctions on grid
+        nbatch, nkpoints, nbands, norbitals = eigenvectors.shape
+
+        print(f"Calculating charge density on {nx}×{ny}×{nz} grid...")
+
+        for ik in range(nkpoints):
+            # Get k-point weight
+            if len(self.k_weights.shape) == 2:
+                weight = self.k_weights[0, ik].cpu().item()
+            else:
+                weight = self.k_weights[ik].cpu().item()
+
+            for ib in range(nbands):
+                occ = occupations[0, ik, ib].cpu().item()
+                if occ < 1e-6:  # Skip unoccupied states
+                    continue
+
+                # Get wavefunction coefficients for this k-point and band
+                psi_coef = (
+                    eigenvectors[0, ik, ib, :].detach().cpu().numpy()
+                )  # [norbitals], complex
+
+                # Evaluate atomic orbitals on grid and sum with coefficients
+                psi_grid = self._evaluate_wavefunction_on_grid(
+                    grid_cart, psi_coef, positions
+                )  # Complex array
+
+                # Add contribution to charge density: ρ += weight * occ * |ψ|²
+                # Take absolute value squared to get real density
+                charge_density += weight * occ * np.abs(psi_grid) ** 2
+
+            print(f"  k-point {ik+1}/{nkpoints} done")
+
+        print("✅ Charge density calculation complete")
+
+        return grid_cart, charge_density
+
+    def plot_charge_density_slice(
+        self, plane="xy", slice_coord=0.5, grid_spacing=0.2
+    ):
+        """
+        Plot a 2D slice of the charge density.
+
+        Args:
+            plane: 'xy', 'xz', or 'yz'
+            slice_coord: Fractional coordinate along the perpendicular axis (0 to 1)
+            grid_spacing: Grid spacing in Angstrom
+        """
+        import matplotlib.pyplot as plt
+
+        grid_cart, charge_density = self.calculate_charge_density(
+            grid_spacing=grid_spacing
+        )
+
+        nx, ny, nz = charge_density.shape
+
+        if plane == "xy":
+            iz = int(slice_coord * nz)
+            data = charge_density[:, :, iz]
+            extent = [0, grid_cart.shape[1], 0, grid_cart.shape[0]]
+            xlabel, ylabel = "Y (Å)", "X (Å)"
+        elif plane == "xz":
+            iy = int(slice_coord * ny)
+            data = charge_density[:, iy, :]
+            extent = [0, grid_cart.shape[2], 0, grid_cart.shape[0]]
+            xlabel, ylabel = "Z (Å)", "X (Å)"
+        else:  # yz
+            ix = int(slice_coord * nx)
+            data = charge_density[ix, :, :]
+            extent = [0, grid_cart.shape[2], 0, grid_cart.shape[1]]
+            xlabel, ylabel = "Z (Å)", "Y (Å)"
+
+        plt.figure(figsize=(10, 8))
+        plt.imshow(data, origin="lower", extent=extent, cmap="viridis")
+        plt.colorbar(label="Charge Density (e/Å³)")
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        plt.title(
+            f"Charge Density - {plane.upper()} plane at {slice_coord:.2f}"
+        )
+
+        # Overlay atomic positions
+        positions = self.geometry.positions.detach().cpu().numpy()[0]
+        if plane == "xy":
+            plt.scatter(
+                positions[:, 1],
+                positions[:, 0],
+                c="red",
+                marker="o",
+                s=100,
+                edgecolors="white",
+            )
+        elif plane == "xz":
+            plt.scatter(
+                positions[:, 2],
+                positions[:, 0],
+                c="red",
+                marker="o",
+                s=100,
+                edgecolors="white",
+            )
+        else:
+            plt.scatter(
+                positions[:, 2],
+                positions[:, 1],
+                c="red",
+                marker="o",
+                s=100,
+                edgecolors="white",
+            )
+
+        plt.tight_layout()
+        plt.savefig(f"charge_density_{plane}.png", dpi=300)
+        plt.show()
+
+    def calculate_planar_averaged_potential(
+        self,
+        axis="z",  # Direction perpendicular to interface
+        num_points=200,
+    ):
+        """
+        Calculate planar-averaged electrostatic potential along an axis.
+
+        This is needed for band offset calculations at interfaces.
+
+        Args:
+            axis: 'x', 'y', or 'z' - direction to average along
+            num_points: Number of points along the axis
+
+        Returns:
+            positions: Array of positions along axis (Angstrom)
+            potential: Planar-averaged potential (eV)
+        """
+        # Ensure calculation is done
+        if self._results is None:
+            self.calculate()
+
+        # Get charge density on grid
+        grid_spacing = 0.2  # Angstrom
+        grid_cart, charge_density = self.calculate_charge_density(
+            grid_spacing=grid_spacing
+        )
+
+        # Determine axis
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        axis_idx = axis_map[axis.lower()]
+
+        # Get cell information
+        cell = self.geometry.cell.cpu().numpy()[0]
+        cell_length = np.linalg.norm(cell[axis_idx])
+
+        # Average over perpendicular directions
+        other_axes = [0, 1, 2]
+        other_axes.remove(axis_idx)
+        other_axes = tuple(other_axes)
+
+        # Planar average
+        planar_avg = np.mean(charge_density, axis=other_axes)
+
+        # Create position array
+        positions = np.linspace(0, cell_length, len(planar_avg))
+
+        # Convert charge density to potential using Poisson equation
+        # For a simple approximation, integrate twice
+        # ∇²V = -ρ/ε₀
+
+        # This is simplified - for production, solve Poisson equation properly
+        potential = self._charge_to_potential(planar_avg, positions)
+
+        return positions, potential
+
+    def _charge_to_potential(self, charge_density, positions):
+        """
+        Convert charge density to electrostatic potential.
+        Simplified Poisson solver for 1D.
+        """
+        # Physical constants
+        epsilon_0 = 8.854187817e-12  # F/m
+        e_charge = 1.602176634e-19  # C
+
+        # Convert units and solve Poisson equation
+        # This is a simplified version - integrate charge density twice
+
+        # First integration: electric field
+        dx = positions[1] - positions[0] if len(positions) > 1 else 1.0
+        electric_field = np.cumsum(charge_density) * dx
+
+        # Second integration: potential
+        potential = -np.cumsum(electric_field) * dx
+
+        # Shift so minimum is at zero
+        potential -= np.min(potential)
+
+        return potential
+
+    def calculate_macroscopic_average(
+        self,
+        positions,
+        potential,
+        period_length=None,
+    ):
+        """
+        Calculate macroscopic average of potential (removes atomic oscillations).
+
+        This implements the method from the InterMat code.
+
+        Args:
+            positions: Position array
+            potential: Potential array
+            period_length: Period for averaging (auto-detect if None)
+
+        Returns:
+            positions_avg: Positions for averaged potential
+            potential_avg: Macroscopically averaged potential
+        """
+        from scipy.interpolate import CubicSpline
+
+        # Create spline interpolation
+        S = CubicSpline(positions, potential)
+
+        # Auto-detect period if not provided
+        if period_length is None:
+            from scipy.signal import find_peaks
+
+            # Find peaks to estimate periodicity
+            peaks, _ = find_peaks(potential, prominence=0.1)
+
+            if len(peaks) > 1:
+                # Estimate period from peak spacing
+                peak_spacing = np.diff(positions[peaks])
+                period_length = np.median(peak_spacing)
+            else:
+                # Default fallback
+                period_length = (positions[-1] - positions[0]) / 10
+
+        print(f"Using period length: {period_length:.3f} Å")
+
+        # Do macroscopic averaging
+        positions_avg = []
+        potential_avg = []
+
+        for pos in positions:
+            if pos - period_length / 2 < positions[0]:
+                continue
+            if pos + period_length / 2 > positions[-1]:
+                continue
+
+            # Integrate over period
+            from scipy.integrate import quad
+
+            integral = quad(
+                S, pos - period_length / 2, pos + period_length / 2
+            )[0]
+            avg_val = integral / period_length
+
+            positions_avg.append(pos)
+            potential_avg.append(avg_val)
+
+        return np.array(positions_avg), np.array(potential_avg)
+
+    def calculate_interface_band_offset(
+        self,
+        film_region,  # (start, end) positions for film in Angstrom
+        substrate_region,  # (start, end) positions for substrate in Angstrom
+        film_bandgap,  # Film band gap (eV)
+        substrate_bandgap,  # Substrate band gap (eV)
+        axis="z",
+        plot=True,
+    ):
+        """
+        Calculate valence and conduction band offsets at an interface.
+
+        Args:
+            film_region: Tuple (start, end) defining film region
+            substrate_region: Tuple (start, end) defining substrate region
+            film_bandgap: Band gap of film material (eV)
+            substrate_bandgap: Band gap of substrate material (eV)
+            axis: Direction perpendicular to interface
+            plot: Whether to create visualization
+
+        Returns:
+            dict with 'VBO' (valence band offset) and 'CBO' (conduction band offset)
+        """
+        # Calculate planar-averaged potential
+        positions, potential = self.calculate_planar_averaged_potential(
+            axis=axis
+        )
+
+        # Calculate macroscopic average
+        pos_avg, pot_avg = self.calculate_macroscopic_average(
+            positions, potential
+        )
+
+        # Get average potential in film region
+        film_mask = (pos_avg >= film_region[0]) & (pos_avg <= film_region[1])
+        film_potential = np.mean(pot_avg[film_mask])
+
+        # Fit linear trend in film region for polar correction
+        from numpy import ones, vstack
+        from numpy.linalg import lstsq
+
+        film_pos = pos_avg[film_mask]
+        film_pot = pot_avg[film_mask]
+        A = vstack([film_pos, ones(len(film_pos))]).T
+        m_film, c_film = lstsq(A, film_pot, rcond=None)[0]
+
+        # Get average potential in substrate region
+        subs_mask = (pos_avg >= substrate_region[0]) & (
+            pos_avg <= substrate_region[1]
+        )
+        substrate_potential = np.mean(pot_avg[subs_mask])
+
+        # Fit linear trend in substrate region
+        subs_pos = pos_avg[subs_mask]
+        subs_pot = pot_avg[subs_mask]
+        A = vstack([subs_pos, ones(len(subs_pos))]).T
+        m_subs, c_subs = lstsq(A, subs_pot, rcond=None)[0]
+
+        # Calculate potential difference
+        # Check if polar (significant slope in either region)
+        is_polar = abs(m_film) > 0.01 or abs(m_subs) > 0.01
+
+        if is_polar:
+            # For polar interfaces, use midpoint
+            mid_point = (positions[-1] - positions[0]) / 2
+            film_pot_mid = m_film * mid_point + c_film
+            subs_pot_mid = m_subs * mid_point + c_subs
+            delta_V = subs_pot_mid - film_pot_mid
+            print(f"⚠️  Polar interface detected")
+        else:
+            delta_V = substrate_potential - film_potential
+
+        print(f"Potential difference (ΔV): {delta_V:.3f} eV")
+
+        # Calculate band offset
+        # ΔE_v (VBM difference) = ΔV (from band gaps of bulk materials)
+        # For now, assume we know the VBM positions from bulk calculations
+        # In practice, you'd calculate this from bulk SlakoNet calculations
+
+        # Get VBM and CBM from current calculation
+        fermi = self._results["fermi_energy"].cpu().item()
+        bandgap = self._results["bandgap"].cpu().item()
+
+        # Valence Band Offset (simplified)
+        # VBO = ΔV + (E_v^film - E_v^substrate)
+        # where E_v are VBM energies from bulk calculations
+
+        VBO = delta_V  # Simplified - add bulk corrections
+
+        # Conduction Band Offset
+        CBO = VBO + (substrate_bandgap - film_bandgap)
+
+        results = {
+            "VBO": VBO,
+            "CBO": CBO,
+            "delta_V": delta_V,
+            "is_polar": is_polar,
+            "film_potential": film_potential,
+            "substrate_potential": substrate_potential,
+        }
+
+        if plot:
+            self._plot_band_offset(
+                positions,
+                potential,
+                pos_avg,
+                pot_avg,
+                film_region,
+                substrate_region,
+                results,
+            )
+
+        return results
+
+    def _plot_band_offset(
+        self,
+        positions,
+        potential,
+        pos_avg,
+        pot_avg,
+        film_region,
+        substrate_region,
+        results,
+    ):
+        """Create band offset visualization."""
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(10, 6))
+
+        # Plot raw potential
+        plt.plot(positions, potential, "k-", alpha=0.3, label="Raw potential")
+
+        # Plot macroscopic average
+        plt.plot(
+            pos_avg, pot_avg, "b-", linewidth=2, label="Macroscopic average"
+        )
+
+        # Mark film region
+        plt.axvspan(
+            film_region[0],
+            film_region[1],
+            alpha=0.2,
+            color="red",
+            label="Film",
+        )
+        film_pot = results["film_potential"]
+        plt.axhline(y=film_pot, color="red", linestyle="--", alpha=0.5)
+
+        # Mark substrate region
+        plt.axvspan(
+            substrate_region[0],
+            substrate_region[1],
+            alpha=0.2,
+            color="blue",
+            label="Substrate",
+        )
+        subs_pot = results["substrate_potential"]
+        plt.axhline(y=subs_pot, color="blue", linestyle="--", alpha=0.5)
+
+        # Add offset annotation
+        mid_pos = (positions[-1] - positions[0]) / 2
+        plt.annotate(
+            f"ΔV = {results['delta_V']:.3f} eV\nVBO = {results['VBO']:.3f} eV\nCBO = {results['CBO']:.3f} eV",
+            xy=(mid_pos, (film_pot + subs_pot) / 2),
+            fontsize=12,
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
+
+        plt.xlabel("Position (Å)", fontsize=12)
+        plt.ylabel("Potential (eV)", fontsize=12)
+        plt.title("Interface Band Offset", fontsize=14)
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("band_offset.png", dpi=300)
+        print("✅ Band offset plot saved to band_offset.png")
+        plt.close()
+
+    def write_locpot(self, filename="LOCPOT", grid_spacing=0.1):
+        """
+        Write charge density in VASP LOCPOT format.
+        """
+        grid_cart, charge_density = self.calculate_charge_density(
+            grid_spacing=grid_spacing
+        )
+
+        nx, ny, nz = charge_density.shape
+        cell = self.geometry.cell.detach().cpu().numpy()[0]
+        positions = self.geometry.positions.detach().cpu().numpy()[0]
+        atomic_numbers = self.geometry.atomic_numbers[0].detach().cpu().numpy()
+
+        # Convert to Bohr for VASP format
+        cell_angstrom = cell * 0.529177  # Bohr to Angstrom
+
+        with open(filename, "w") as f:
+            # Header
+            f.write("Charge density from SlakoNet\n")
+            f.write("   1.00000000000000\n")
+
+            # Lattice vectors
+            for i in range(3):
+                f.write(
+                    f"  {cell_angstrom[i,0]:21.16f} {cell_angstrom[i,1]:21.16f} {cell_angstrom[i,2]:21.16f}\n"
+                )
+
+            # Atom types and counts
+            from jarvis.core.specie import atomic_numbers_to_symbols
+
+            unique_Z = np.unique(atomic_numbers[atomic_numbers > 0])
+            symbols = atomic_numbers_to_symbols(unique_Z.tolist())
+
+            f.write("  " + "  ".join(symbols) + "\n")
+
+            counts = [np.sum(atomic_numbers == z) for z in unique_Z]
+            f.write("  " + "  ".join(map(str, counts)) + "\n")
+
+            f.write("Direct\n")
+
+            # Atomic positions (fractional)
+            for z in unique_Z:
+                mask = atomic_numbers == z
+                atom_pos = positions[mask]
+                # Convert to fractional coordinates
+                frac_pos = np.linalg.solve(cell.T, atom_pos.T).T
+                for pos in frac_pos:
+                    f.write(
+                        f"  {pos[0]:19.16f} {pos[1]:19.16f} {pos[2]:19.16f}\n"
+                    )
+
+            f.write("\n")
+            f.write(f"  {nx} {ny} {nz}\n")
+
+            # Write charge density
+            # VASP format: fast index z, then y, then x
+            density_flat = charge_density.transpose(2, 1, 0).flatten()
+
+            for i, val in enumerate(density_flat):
+                f.write(f" {val:17.11E}")
+                if (i + 1) % 5 == 0:
+                    f.write("\n")
+
+            if len(density_flat) % 5 != 0:
+                f.write("\n")
+
+        print(f"✅ Charge density written to {filename}")
+
+    def calculate(self):
         """Main calculation method."""
+        compute_forces = self.compute_forces
+        include_dos_data = self.include_dos_data
+        include_HS = self.include_HS
         # Enable gradient tracking for positions if forces needed
         if compute_forces:
             needs_recreation = not self.geometry.positions.requires_grad
@@ -509,7 +1157,9 @@ class SimpleDftb:
             dos_data = {}
         self._results.update(dos_data)
         # Store results
-
+        if self.include_HS:
+            self._results["hamiltonian"] = H
+            self._results["overlap"] = S
         if self.with_eigenvectors:
             self._results["eigenvectors"] = eigenvectors
 
@@ -548,6 +1198,7 @@ class SimpleDftb:
 
     @property
     def forces(self):
+        # TODO: Check running calculate twice??
         if self._results is None:
             self.calculate()
         return self._results["forces"]
@@ -564,9 +1215,17 @@ class SimpleDftb:
             self.calculate()
         return self._results["occupations"]
 
+    @property
+    def hamiltonian(self):
+        if self._results is None:
+            self.calculate()
+        return self._results["hamiltonian"]
 
-import torch
-from ase.calculators.calculator import Calculator, all_changes
+    @property
+    def overlap(self):
+        if self._results is None:
+            self.calculate()
+        return self._results["overlap"]
 
 
 def run_calc(
@@ -598,25 +1257,19 @@ def run_calc(
     return res
 
 
-import torch
-from ase.calculators.calculator import Calculator, all_changes
-from slakonet.atoms import Geometry
-
-
-from ase.calculators.calculator import Calculator, all_changes
-from ase import Atoms as AseAtoms
-import numpy as np
-import torch
-from jarvis.core.atoms import Atoms as JarvisAtoms
-from jarvis.core.atoms import ase_to_atoms
-
-
 class SlakoNetCalculator(Calculator):
     """ASE Calculator interface for SlakoNet"""
 
     implemented_properties = ["energy", "forces", "stress"]
 
-    def __init__(self, model, **kwargs):
+    def __init__(
+        self,
+        model=None,
+        kpoints_array=[1, 1, 1],
+        device="cuda",
+        model_path=None,
+        **kwargs,
+    ):
         """
         Initialize SlakoNet calculator
 
@@ -626,11 +1279,14 @@ class SlakoNetCalculator(Calculator):
         """
         Calculator.__init__(self, **kwargs)
         self.model = model
+        self.kpoints_array = kpoints_array
+        self.device = device
+        self.model_path = model_path
 
     def calculate(
         self,
         atoms=None,
-        properties=["energy", "forces"],
+        properties=["energy", "forces", "results"],
         system_changes=all_changes,
     ):
         """
@@ -644,10 +1300,19 @@ class SlakoNetCalculator(Calculator):
         Calculator.calculate(self, atoms, properties, system_changes)
 
         # Run SlakoNet calculation
-        result = run_calc(ase_atoms=atoms, model=self.model)
+        result = run_calc(
+            ase_atoms=atoms,
+            model=self.model,
+            model_path=self.model_path,
+            device=self.device,
+            kpoints_array=self.kpoints_array,
+        )
 
         # Extract results and convert to numpy arrays on CPU
         self.results["energy"] = result["energy"].detach().cpu().numpy().item()
+        self.results["result"] = (
+            result  # ["energy"].detach().cpu().numpy().item()
+        )
 
         if "forces" in properties:
             forces = result["forces"].detach().cpu().numpy()
