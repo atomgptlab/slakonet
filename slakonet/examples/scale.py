@@ -1,4 +1,5 @@
 from slakonet.main import SimpleDftb
+import gc
 from slakonet.atoms import Geometry
 import torch
 from jarvis.io.vasp.inputs import Poscar
@@ -36,14 +37,23 @@ shell_dict = generate_shell_dict_upto_Z65()
 h_feed = create_feeds(updated_skfs, shell_dict, "H")
 s_feed = create_feeds(updated_skfs, shell_dict, "S")
 times = []
-cells = list(range(1, 15))
+cells = list(range(1, 19))
 print(cells)
 for i in cells:
     t1 = time.time()
     new_atoms = atoms.make_supercell([i])
     ase_atoms = new_atoms.ase_converter()
     geometry = Geometry.from_ase_atoms([ase_atoms])
-
+    kpoints = torch.tensor([1, 1, 1])
+    with torch.no_grad():
+        s = SimpleDftb(
+            geometry, kpoints=kpoints, model=model, compute_forces=False
+        )
+        ##s = SimpleDftb(geometry,klines=klines,model=model)
+        # print('ele',s.nelectron)
+        res = s.calculate()
+        H = res["hamiltonian"]
+    """
     periodic = Periodic(
         geometry,
         geometry.cell,
@@ -55,9 +65,13 @@ for i in cells:
     # Build Hamiltonian and overlap matrices
     H = hs_matrix(periodic, basis, h_feed)
     S = hs_matrix(periodic, basis, s_feed)
+    """
+
     t2 = time.time()
     tot_time = t2 - t1
     print(new_atoms.num_atoms, H.shape, tot_time)
     times.append([new_atoms.num_atoms, tot_time])
     print(times)
     print()
+    torch.cuda.empty_cache()
+    gc.collect()

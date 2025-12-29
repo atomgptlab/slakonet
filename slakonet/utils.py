@@ -582,6 +582,246 @@ def _eig_sort_out(
     return w, v
 
 
+def eighb_cpu(h_k, s_k, scheme="chol"):
+    """
+    Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with memory optimization.
+
+    Args:
+        h_k: Hamiltonian matrix [batch, n, n] or [n, n]
+        s_k: Overlap matrix [batch, n, n] or [n, n]
+        scheme: 'chol' for Cholesky (faster), 'eigh' for direct solve
+
+    Returns:
+        eigenvals: Eigenvalues [batch, n] or [n]
+        eigenvecs: Eigenvectors [batch, n, n] or [n, n]
+    """
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    # ========================================
+    # Strategy 1: Large systems → CPU
+    # ========================================
+    if n > 10000:
+        print(f"⚠️  Large system (n={n}), using CPU eigensolve")
+        torch.cuda.empty_cache()
+
+        h_k_cpu = h_k.cpu()
+        s_k_cpu = s_k.cpu()
+
+        try:
+            eigenvals, eigenvecs = torch.linalg.eigh(
+                torch.linalg.solve(s_k_cpu, h_k_cpu)
+            )
+            return eigenvals.to(device), eigenvecs.to(device)
+        except Exception as e:
+            print(f"❌ CPU eigensolve failed: {e}")
+            # Try with regularization
+            eps = 1e-8
+            eye = torch.eye(n, device="cpu", dtype=dtype)
+            s_k_reg = s_k_cpu + eps * eye
+            eigenvals, eigenvecs = torch.linalg.eigh(
+                torch.linalg.solve(s_k_reg, h_k_cpu)
+            )
+            return eigenvals.to(device), eigenvecs.to(device)
+
+    # ========================================
+    # Strategy 2: Cholesky decomposition (faster but less stable)
+    # ========================================
+    if scheme == "chol":
+        try:
+            # S = L·L^T (Cholesky decomposition)
+            L = torch.linalg.cholesky(s_k)
+
+            # Transform: L^-1 · H · L^-T
+            L_inv = torch.linalg.inv(L)
+            h_transformed = L_inv @ h_k @ L_inv.transpose(-2, -1)
+
+            # Standard eigenvalue problem
+            eigenvals, eigenvecs_transformed = torch.linalg.eigh(h_transformed)
+
+            # Back-transform eigenvectors: ψ = L^-T · ψ'
+            eigenvecs = L_inv.transpose(-2, -1) @ eigenvecs_transformed
+
+            return eigenvals, eigenvecs
+
+        except RuntimeError as e:
+            if (
+                "cholesky" in str(e).lower()
+                or "out of memory" in str(e).lower()
+            ):
+                print(f"⚠️  Cholesky failed: {e}, falling back to eigh")
+                # Fall through to eigh method
+            else:
+                raise
+
+    # ========================================
+    # Strategy 3: Direct solve (more stable)
+    # ========================================
+    try:
+        # Solve H·ψ = E·S·ψ as (S^-1·H)·ψ = E·ψ
+        eigenvals, eigenvecs = torch.linalg.eigh(torch.linalg.solve(s_k, h_k))
+        return eigenvals, eigenvecs
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            # ========================================
+            # Strategy 4: OOM → CPU fallback
+            # ========================================
+            print(f"⚠️  GPU OOM (n={n}), falling back to CPU")
+            torch.cuda.empty_cache()
+
+            h_k_cpu = h_k.cpu()
+            s_k_cpu = s_k.cpu()
+
+            try:
+                eigenvals, eigenvecs = torch.linalg.eigh(
+                    torch.linalg.solve(s_k_cpu, h_k_cpu)
+                )
+                return eigenvals.to(device), eigenvecs.to(device)
+
+            except Exception as e2:
+                print(f"❌ CPU fallback also failed: {e2}")
+                # Last resort: regularization
+                print("⚠️  Attempting regularization...")
+                eps = 1e-8
+                eye = torch.eye(n, device="cpu", dtype=dtype)
+                s_k_reg = s_k_cpu + eps * eye
+                eigenvals, eigenvecs = torch.linalg.eigh(
+                    torch.linalg.solve(s_k_reg, h_k_cpu)
+                )
+                return eigenvals.to(device), eigenvecs.to(device)
+
+        elif (
+            "singular" in str(e).lower()
+            or "not positive definite" in str(e).lower()
+        ):
+            # ========================================
+            # Strategy 5: Singular matrix → regularization
+            # ========================================
+            print(f"⚠️  Singular matrix detected, adding regularization")
+            eps = 1e-8
+            eye = torch.eye(n, device=device, dtype=dtype)
+            s_k_reg = s_k + eps * eye
+
+            eigenvals, eigenvecs = torch.linalg.eigh(
+                torch.linalg.solve(s_k_reg, h_k)
+            )
+            return eigenvals, eigenvecs
+
+        else:
+            # Unknown error, re-raise
+            raise
+
+
+def eighb_occupied_only(h_k, s_k, n_occupied, scheme="lobpcg"):
+    """
+    Solve for only occupied states (memory-efficient for very large systems).
+
+    Args:
+        h_k: Hamiltonian [n, n]
+        s_k: Overlap [n, n]
+        n_occupied: Number of occupied states to compute
+        scheme: 'lobpcg' (iterative, memory-efficient)
+
+    Returns:
+        eigenvals: [n_occupied] lowest eigenvalues
+        eigenvecs: [n, n_occupied] corresponding eigenvectors
+    """
+    import scipy.sparse.linalg as spla
+
+    n = h_k.shape[-1]
+    device = h_k.device
+
+    # Convert to numpy (scipy requires numpy)
+    h_np = h_k.cpu().numpy()
+    s_np = s_k.cpu().numpy()
+
+    # Use sparse eigensolvers (much more memory efficient)
+    try:
+        # Solve for n_occupied+10 states (with buffer)
+        k = min(n_occupied + 10, n - 2)
+
+        eigenvals, eigenvecs = spla.eigsh(
+            h_np, k=k, M=s_np, which="SA"  # SA = smallest algebraic
+        )
+
+        # Take only the n_occupied lowest
+        eigenvals = eigenvals[:n_occupied]
+        eigenvecs = eigenvecs[:, :n_occupied]
+
+        # Convert back to torch
+        eigenvals = torch.tensor(eigenvals, device=device, dtype=h_k.dtype)
+        eigenvecs = torch.tensor(eigenvecs, device=device, dtype=h_k.dtype)
+
+        return eigenvals, eigenvecs
+
+    except Exception as e:
+        print(f"❌ Sparse eigensolve failed: {e}")
+        print("⚠️  Falling back to full eigensolve")
+        return eighb(h_k, s_k, scheme="chol")
+
+
+def estimate_eigensolve_memory(n_orbitals, dtype=torch.complex128):
+    """
+    Estimate memory required for eigenvalue problem.
+
+    Args:
+        n_orbitals: Number of orbitals
+        dtype: Data type
+
+    Returns:
+        memory_gb: Estimated memory in GB
+    """
+    bytes_per_element = 16 if dtype in [torch.complex128, torch.cfloat] else 8
+
+    # H matrix
+    h_memory = n_orbitals**2 * bytes_per_element
+
+    # S matrix
+    s_memory = n_orbitals**2 * bytes_per_element
+
+    # Workspace for eigensolve (conservative estimate)
+    workspace = 3 * n_orbitals**2 * bytes_per_element
+
+    # Eigenvectors
+    eigenvec_memory = n_orbitals**2 * bytes_per_element
+
+    total_bytes = h_memory + s_memory + workspace + eigenvec_memory
+    total_gb = total_bytes / (1024**3)
+
+    return total_gb
+
+
+def choose_eigensolve_strategy(
+    n_orbitals, n_electrons, available_memory_gb=40
+):
+    """
+    Automatically choose best eigensolve strategy.
+
+    Args:
+        n_orbitals: Number of orbitals
+        n_electrons: Number of electrons (for occupied-only option)
+        available_memory_gb: Available GPU memory
+
+    Returns:
+        strategy: 'gpu_full', 'cpu_full', or 'sparse_occupied'
+    """
+    estimated_memory = estimate_eigensolve_memory(n_orbitals)
+    n_occupied = n_electrons // 2  # Assuming closed shell
+
+    print(
+        f"Eigensolve: n={n_orbitals}, estimated memory={estimated_memory:.1f}GB"
+    )
+
+    if estimated_memory < available_memory_gb * 0.6:
+        return "gpu_full"
+    elif estimated_memory < available_memory_gb * 1.5:
+        return "cpu_full"
+    else:
+        return "sparse_occupied"
+
+
 def eighb(h_k, s_k, scheme="chol"):
     """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
     eps = 1e-8
