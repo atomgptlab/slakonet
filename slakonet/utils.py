@@ -823,6 +823,151 @@ def choose_eigensolve_strategy(
 
 
 def eighb(h_k, s_k, scheme="chol"):
+    """
+    Memory-optimized eigensolve with automatic fallback strategies.
+
+    Strategies (in order):
+    1. GPU Cholesky (fastest)
+    2. GPU direct solve
+    3. GPU with memory cleanup
+    4. Give up and raise error (CPU is too slow for large systems)
+    """
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    # ========================================
+    # Strategy 1: GPU Cholesky (fastest)
+    # ========================================
+    if scheme == "chol":
+        try:
+            L = torch.linalg.cholesky(s_k)
+            L_inv = torch.linalg.inv(L)
+            h_transformed = L_inv @ h_k @ L_inv.transpose(-2, -1)
+            eigenvals, eigenvecs_transformed = torch.linalg.eigh(h_transformed)
+            eigenvecs = L_inv.transpose(-2, -1) @ eigenvecs_transformed
+            return eigenvals, eigenvecs
+
+        except RuntimeError as e:
+            error_msg = str(e).lower()
+            if "out of memory" in error_msg:
+                print(f"⚠️  Cholesky OOM (n={n}), trying memory cleanup...")
+                torch.cuda.empty_cache()
+            elif (
+                "cholesky" in error_msg or "not positive definite" in error_msg
+            ):
+                print(
+                    f"⚠️  Cholesky failed (not positive definite), switching to direct solve"
+                )
+            else:
+                raise
+
+    # ========================================
+    # Strategy 2: GPU direct solve
+    # ========================================
+    try:
+        eigenvals, eigenvecs = torch.linalg.eigh(torch.linalg.solve(s_k, h_k))
+        return eigenvals, eigenvecs
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(f"⚠️  GPU OOM on direct solve (n={n})")
+            torch.cuda.empty_cache()
+        else:
+            raise
+
+    # ========================================
+    # Strategy 3: Aggressive memory cleanup + retry
+    # ========================================
+    print(f"⚠️  Attempting aggressive memory cleanup for n={n}...")
+
+    # Move to CPU temporarily to free GPU memory
+    h_k_cpu_temp = h_k.cpu()
+    s_k_cpu_temp = s_k.cpu()
+    del h_k, s_k
+    torch.cuda.empty_cache()
+
+    # Try again on GPU with cleaned memory
+    try:
+        h_k = h_k_cpu_temp.to(device)
+        s_k = s_k_cpu_temp.to(device)
+        del h_k_cpu_temp, s_k_cpu_temp
+
+        eigenvals, eigenvecs = torch.linalg.eigh(torch.linalg.solve(s_k, h_k))
+        return eigenvals, eigenvecs
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(f"❌ GPU memory insufficient even after cleanup")
+            print(f"   Required: ~{(n*n*16)/(1024**3):.1f} GB for matrices")
+            print(f"   System too large for available GPU memory")
+            print(f"   Consider using fewer atoms or CPU eigensolve")
+            torch.cuda.empty_cache()
+            raise MemoryError(
+                f"Cannot solve eigenvalue problem for n={n} on GPU"
+            )
+        else:
+            raise
+
+
+def eighb_memory_efficient(h_k, s_k, n_electrons=None):
+    """
+    Ultra memory-efficient: compute only occupied states using iterative solver.
+    Use this for systems where full eigensolve fails.
+
+    Args:
+        h_k: Hamiltonian [n, n]
+        s_k: Overlap [n, n]
+        n_electrons: Number of electrons (if None, compute all)
+
+    Returns:
+        eigenvals: Eigenvalues (all or occupied only)
+        eigenvecs: Eigenvectors (all or occupied only)
+    """
+    n = h_k.shape[-1]
+    device = h_k.device
+
+    if n_electrons is None or n_electrons >= n:
+        # Need all eigenvalues, use standard method
+        return eighb(h_k, s_k, scheme="chol")
+
+    # Compute only occupied states (much more memory efficient)
+    print(
+        f"⚠️  Using memory-efficient solver: computing {n_electrons//2} of {n} states"
+    )
+
+    try:
+        import scipy.sparse.linalg as spla
+
+        # Move to CPU for scipy
+        h_np = h_k.cpu().numpy()
+        s_np = s_k.cpu().numpy()
+
+        # Number of states to compute (occupied + small buffer)
+        n_states = min(n_electrons // 2 + 20, n - 2)
+
+        # Use sparse eigenvalue solver (memory efficient)
+        eigenvals, eigenvecs = spla.eigsh(
+            h_np,
+            k=n_states,
+            M=s_np,
+            which="SA",  # Smallest algebraic
+            maxiter=1000,
+        )
+
+        # Convert back to torch on original device
+        eigenvals = torch.tensor(eigenvals, device=device, dtype=h_k.dtype)
+        eigenvecs = torch.tensor(eigenvecs, device=device, dtype=h_k.dtype)
+
+        return eigenvals, eigenvecs
+
+    except Exception as e:
+        print(f"❌ Memory-efficient solver failed: {e}")
+        print(f"   Falling back to standard solver...")
+        return eighb(h_k, s_k, scheme="chol")
+
+
+def eighb_4394(h_k, s_k, scheme="chol"):
     """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
     eps = 1e-8
     device = h_k.device
