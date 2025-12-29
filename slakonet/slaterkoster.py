@@ -856,6 +856,145 @@ def _gather_off_site(
     g_var: Tensor = None,
     **kwargs,
 ) -> Tensor:
+    """Retrieves integrals from a target feed in a batch-wise manner - OPTIMIZED."""
+
+    n_shell = kwargs.get("n_shell", False)
+
+    if distances.ndim > 2:
+        raise ValueError(
+            'Argument "distances" must be a 1d or 2d torch.tensor.'
+        )
+
+    # Identify all unique [atom|atom|shell|shell] sets
+    as_pairs = torch.cat(
+        (atom_pairs, shell_pairs.repeat(atom_pairs.shape[0], 1)), -1
+    )
+    as_pairs_u = as_pairs.unique(dim=0)
+
+    # ===== OPTIMIZATION: Batch all SK evaluations =====
+    # Instead of looping and calling sk_feed.off_site individually,
+    # collect all data first, then make ONE batched call
+
+    all_masks = []
+    all_atom_pairs = []
+    all_shell_pairs = []
+    all_distances = []
+
+    # First pass: collect all data
+    for as_pair in as_pairs_u:
+        mask = torch.where((as_pairs == as_pair).all(1))[0]
+
+        if n_shell:
+            shell_pair = [
+                shell_dict[as_pair[0].tolist()][as_pair[2]],
+                shell_dict[as_pair[1].tolist()][as_pair[3]],
+            ]
+        else:
+            shell_pair = as_pair[..., -2:]
+
+        all_masks.append(mask)
+        all_atom_pairs.append(as_pair[..., :-2])
+        all_shell_pairs.append(shell_pair if n_shell else as_pair[..., -2:])
+        all_distances.append(distances[mask])
+
+    # Concatenate all distances for batched evaluation
+    all_distances_cat = torch.cat(all_distances)
+
+    # Stack atom pairs and shell pairs for batch processing
+    all_atom_pairs_stacked = torch.stack(
+        [ap for ap in all_atom_pairs]
+    )  # [n_unique, 2]
+
+    # Create expanded versions for batched call
+    # Repeat each atom/shell pair for its corresponding distances
+    repeats = [len(d) for d in all_distances]
+    atom_pairs_expanded = torch.repeat_interleave(
+        all_atom_pairs_stacked, torch.tensor(repeats), dim=0
+    )
+
+    # For shell pairs, handle both tensor and list cases
+    if isinstance(all_shell_pairs[0], list):
+        # Convert to tensor if it's a list
+        shell_pairs_expanded = []
+        for sp, rep in zip(all_shell_pairs, repeats):
+            shell_pairs_expanded.extend([sp] * rep)
+    else:
+        shell_pairs_stacked = torch.stack([sp for sp in all_shell_pairs])
+        shell_pairs_expanded = torch.repeat_interleave(
+            shell_pairs_stacked, torch.tensor(repeats), dim=0
+        )
+
+    # ===== SINGLE BATCHED SK FEED CALL =====
+    # This replaces the loop with ONE forward pass through the neural network
+    if isinstance(shell_pairs_expanded, list):
+        # If we have a list, need to handle differently
+        # For now, fall back to loop (rare case)
+        integrals = None
+        for mask, atom_pair, shell_pair, dists in zip(
+            all_masks, all_atom_pairs, all_shell_pairs, all_distances
+        ):
+            off_sites = sk_feed.off_site(
+                atom_pair=atom_pair,
+                shell_pair=shell_pair,
+                distances=dists,
+            )
+
+            if integrals is None:
+                integrals = torch.zeros(
+                    (len(as_pairs), off_sites.shape[-1]),
+                    dtype=distances.dtype,
+                    device=distances.device,
+                )
+
+            try:
+                integrals[mask] = off_sites
+            except RuntimeError as e:
+                if str(e).startswith("shape mismatch"):
+                    raise type(e)(
+                        f"{e!s}. This could be due to shells with mismatching "
+                        "angular momenta being provided."
+                    )
+    else:
+        # Batched evaluation (much faster!)
+        all_off_sites = sk_feed.off_site_batched(
+            atom_pairs=atom_pairs_expanded,
+            shell_pairs=shell_pairs_expanded,
+            distances=all_distances_cat,
+        )
+
+        # Initialize output tensor
+        integrals = torch.zeros(
+            (len(as_pairs), all_off_sites.shape[-1]),
+            dtype=distances.dtype,
+            device=distances.device,
+        )
+
+        # Scatter results back to original positions
+        start_idx = 0
+        for mask, dists in zip(all_masks, all_distances):
+            end_idx = start_idx + len(dists)
+            try:
+                integrals[mask] = all_off_sites[start_idx:end_idx]
+            except RuntimeError as e:
+                if str(e).startswith("shape mismatch"):
+                    raise type(e)(
+                        f"{e!s}. This could be due to shells with mismatching "
+                        "angular momenta being provided."
+                    )
+            start_idx = end_idx
+
+    return integrals
+
+
+def _gather_off_site_old(
+    atom_pairs: Tensor,
+    shell_pairs: Tensor,
+    distances: Tensor,
+    sk_feed: SkFeed,
+    shell_dict: dict = None,
+    g_var: Tensor = None,
+    **kwargs,
+) -> Tensor:
     """Retrieves integrals from a target feed in a batch-wise manner.
 
     This convenience function mediates the integral retrieval operation by

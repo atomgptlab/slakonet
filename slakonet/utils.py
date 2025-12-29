@@ -582,6 +582,39 @@ def _eig_sort_out(
     return w, v
 
 
+def eighb_new(h_k, s_k, scheme="chol"):
+    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability - OPTIMIZED."""
+
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    try:
+        # Solve generalized eigenvalue problem: H @ v = λ * S @ v
+        # Transform to standard problem: S^(-1) @ H @ v = λ * v
+        # Use solve instead of explicit inverse (more stable)
+
+        # Method 1: Direct solve (most stable for well-conditioned S)
+        eigenvals, eigenvecs = torch.linalg.eig(torch.linalg.solve(s_k, h_k))
+        eigenvals = eigenvals.real
+        eigenvecs = eigenvecs.real
+
+    except RuntimeError as e:
+        # If that fails, add regularization
+        print(f"eig failed: {e}, adding regularization")
+        eps = 1e-7
+        eye = torch.eye(n, device=device, dtype=dtype)
+        s_k_reg = s_k + eps * eye
+
+        eigenvals, eigenvecs = torch.linalg.eig(
+            torch.linalg.solve(s_k_reg, h_k)
+        )
+        eigenvals = eigenvals.real
+        eigenvecs = eigenvecs.real
+
+    return eigenvals, eigenvecs
+
+
 def eighb(h_k, s_k, scheme="chol"):
     """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
 

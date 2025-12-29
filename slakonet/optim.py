@@ -1063,6 +1063,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 # s_feed=s_feed,
                 # nelectron=nelectron,
                 device=device,
+                compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
             )
         else:
@@ -1075,11 +1076,12 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 # nelectron=nelectron,
                 device=device,
                 model=self,
+                compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
             )
 
         # Compute properties
-        properties = calc.calculate(compute_forces=get_forces)
+        properties = calc.calculate()
         eigenvalues = properties[
             "eigenvalues"
         ]  # calc.calculate(compute_forces=False)
@@ -1550,6 +1552,80 @@ class SkfParameterOptimizer(nn.Module):
         )
 
     def get_updated_skf(self):
+        """Create updated SKF with current parameters"""
+        updated_dict = self.skf_dict.copy()
+
+        # Check if this is repulsive-only mode
+        is_repulsive_only = getattr(self, "optimize_repulsive_only", False)
+
+        if not is_repulsive_only:
+            # Use trainable H and S parameters
+            updated_h = {key: param for key, param in self.h_params.items()}
+            updated_s = {key: param for key, param in self.s_params.items()}
+        else:
+            # Use frozen H and S (from original)
+            updated_h = self.original_h_params
+            updated_s = self.original_s_params
+
+        updated_dict["hamiltonian"] = updated_h
+        updated_dict["overlap"] = updated_s
+
+        # FIX: Handle r_spline with proper priority order
+        # Priority 1: If we have trainable r_spline parameters (repulsive-only mode)
+        if hasattr(self, "r_exp_coef"):
+            r_spline = self.get_updated_r_spline()
+            if r_spline is not None:
+                updated_dict["r_spline"] = {
+                    "grid": r_spline.grid,
+                    "cutoff": r_spline.cutoff,
+                    "spline_coef": r_spline.spline_coef,
+                    "exp_coef": r_spline.exp_coef,
+                    "tail_coef": r_spline.tail_coef,
+                }
+        # Priority 2: If we have a stored r_spline object (from loading)
+        elif hasattr(self, "r_spline") and self.r_spline is not None:
+            updated_dict["r_spline"] = {
+                "grid": self.r_spline.grid,
+                "cutoff": self.r_spline.cutoff,
+                "spline_coef": self.r_spline.spline_coef,
+                "exp_coef": self.r_spline.exp_coef,
+                "tail_coef": self.r_spline.tail_coef,
+            }
+        # Priority 3: Use what's in skf_dict (allows direct modification)
+        elif "r_spline" in self.skf_dict and self.skf_dict["r_spline"]:
+            # Make a deep copy to avoid reference issues
+            r_spline_data = self.skf_dict["r_spline"]
+            updated_dict["r_spline"] = {
+                "grid": (
+                    r_spline_data["grid"].clone()
+                    if isinstance(r_spline_data["grid"], torch.Tensor)
+                    else torch.tensor(r_spline_data["grid"])
+                ),
+                "cutoff": (
+                    r_spline_data["cutoff"].clone()
+                    if isinstance(r_spline_data["cutoff"], torch.Tensor)
+                    else torch.tensor(r_spline_data["cutoff"])
+                ),
+                "spline_coef": (
+                    r_spline_data["spline_coef"].clone()
+                    if isinstance(r_spline_data["spline_coef"], torch.Tensor)
+                    else torch.tensor(r_spline_data["spline_coef"])
+                ),
+                "exp_coef": (
+                    r_spline_data["exp_coef"].clone()
+                    if isinstance(r_spline_data["exp_coef"], torch.Tensor)
+                    else torch.tensor(r_spline_data["exp_coef"])
+                ),
+                "tail_coef": (
+                    r_spline_data["tail_coef"].clone()
+                    if isinstance(r_spline_data["tail_coef"], torch.Tensor)
+                    else torch.tensor(r_spline_data["tail_coef"])
+                ),
+            }
+
+        return Skf.from_dict(updated_dict)
+
+    def get_updated_skfX(self):
         """Create updated SKF with current parameters"""
         updated_dict = self.skf_dict.copy()
 

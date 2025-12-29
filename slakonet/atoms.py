@@ -141,6 +141,65 @@ class Periodic:
 
         return latvec, cutoff
 
+    def get_cell_translations(self, **kwargs):
+        """Get cell translation vectors - OPTIMIZED."""
+        pos_ext = kwargs.get("positive_extention", 1)
+        neg_ext = kwargs.get("negative_extention", 1)
+
+        device = self.invlatvec.device
+        _tmp = torch.floor(
+            self.cutoff.to(device) * torch.norm(self.invlatvec, dim=-1).T
+        ).T
+
+        ranges = torch.stack([-(neg_ext + _tmp), pos_ext + _tmp])
+        ranges[torch.stack([self.mask_zero, self.mask_zero])] = 0
+
+        leng = ranges[1, :].long() - ranges[0, :].long() + 1
+        ncell = leng[..., 0] * leng[..., 1] * leng[..., 2]
+
+        # VECTORIZED cell vector generation using meshgrid
+        cellvec_list = []
+        rcellvec_list = []
+
+        for ibatch, (ile, iran, ilv) in enumerate(
+            zip(leng, ranges.transpose(1, 0), self.latvec)
+        ):
+            # Create 1D arrays
+            x = torch.arange(
+                iran[0, 0], iran[1, 0] + 1, device=device, dtype=torch.float32
+            )
+            y = torch.arange(
+                iran[0, 1], iran[1, 1] + 1, device=device, dtype=torch.float32
+            )
+            z = torch.arange(
+                iran[0, 2], iran[1, 2] + 1, device=device, dtype=torch.float32
+            )
+
+            # Meshgrid is MUCH faster than nested repeats
+            zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
+
+            # Stack and flatten - shape: [3, n_cells]
+            cellvec_batch = torch.stack(
+                [xx.flatten(), yy.flatten(), zz.flatten()]
+            )
+            cellvec_list.append(cellvec_batch)
+
+            # Compute real-space cell vectors
+            # ilv is [3, 3], cellvec_batch is [3, n_cells]
+            # Result should be [3, n_cells]
+            rcellvec_batch = torch.matmul(ilv.T, cellvec_batch)
+            rcellvec_list.append(rcellvec_batch)
+
+        # Pack expects list of [3, n_cells], outputs [n_batch, 3, n_cells]
+        cellvec = pack(cellvec_list, value=1e3)
+        rcellvec = pack(rcellvec_list, value=1e3)
+
+        # Transpose to match original format: [n_batch, n_cells, 3]
+        cellvec = cellvec.transpose(1, 2)
+        rcellvec = rcellvec.transpose(1, 2)
+
+        return cellvec, rcellvec, ncell
+
     def _positions_check(self):
         """Check positions type (fraction or not) and unit."""
         is_frac = self.geometry.frac_list
@@ -163,7 +222,7 @@ class Periodic:
         )
         self.positions[self.mask_pe] = position_pe
 
-    def get_cell_translations(self, **kwargs):
+    def get_cell_translations_old(self, **kwargs):
         """Get cell translation vectors."""
         pos_ext = kwargs.get("positive_extention", 1)
         neg_ext = kwargs.get("negative_extention", 1)
@@ -221,6 +280,37 @@ class Periodic:
         return cellvec, rcellvec, ncell
 
     def _periodic_distance(self):
+        """Get distances between central cell and neighbour cells - fully vectorized."""
+        mask_central_cell = (self.rcellvec != 0).sum(-1) == 0
+
+        positions = self.rcellvec.unsqueeze(2) + self.positions.unsqueeze(1)
+        size_system = self.atomic_numbers.ne(0).sum(-1)
+
+        positions_vec = -positions.unsqueeze(-3) + self.positions.unsqueeze(
+            1
+        ).unsqueeze(-2)
+
+        eps = 1e-12
+
+        # Fully vectorized distance calculation
+        # positions: [n_batch, n_cells, n_atoms, 3]
+        # Compute: sqrt(sum((pos_cell - pos_central)^2))
+        distance = torch.sqrt(
+            eps + (positions_vec**2).sum(-1)
+        )  # [n_batch, n_cells, n_atoms, n_atoms]
+
+        # If there's padding, mask it
+        if not self.atomic_numbers.ne(0).all():
+            mask = self.atomic_numbers.ne(0)  # [n_batch, n_atoms]
+            distance_mask = ~(
+                mask.unsqueeze(1).unsqueeze(-1)
+                & mask.unsqueeze(1).unsqueeze(-2)
+            )
+            distance = distance.masked_fill(distance_mask, 1e3)
+
+        return mask_central_cell, positions, positions_vec, distance
+
+    def _periodic_distance_old(self):
         """Get distances between central cell and neighbour cells."""
         mask_central_cell = (self.rcellvec != 0).sum(-1) == 0
         # print("self.positions.",self.positions.device)
@@ -249,6 +339,7 @@ class Periodic:
             ],
             value=1e3,
         )  # .to(self.rcellvec.device)
+
         # print('distance',distance,distance.device)
         return mask_central_cell, positions, positions_vec, distance
 
@@ -346,6 +437,44 @@ class Periodic:
         )
 
     def _neighbourlist(self):
+        """Get distance matrix of neighbour list - OPTIMIZED."""
+        _mask = self.neighbour.any(-1).any(-1)  # [n_batch, n_cells]
+
+        # Check if we can fully vectorize (single batch or uniform mask)
+        if _mask.shape[0] == 1:
+            # Single batch - fully vectorized, no loop needed
+            neighbour_pos = self.positions_pe[0][_mask[0]].unsqueeze(0)
+            neighbour_vec = self.positions_vec[0][_mask[0]].unsqueeze(0)
+            neighbour_dis = self.periodic_distances[0][_mask[0]].unsqueeze(0)
+        else:
+            # Multiple batches - use list comprehension (still faster than old approach)
+            neighbour_pos = pack(
+                [
+                    self.positions_pe[i][_mask[i]]
+                    for i in range(_mask.shape[0])
+                ],
+                value=1e3,
+            )
+
+            neighbour_vec = pack(
+                [
+                    self.positions_vec[i][_mask[i]]
+                    for i in range(_mask.shape[0])
+                ],
+                value=1e3,
+            )
+
+            neighbour_dis = pack(
+                [
+                    self.periodic_distances[i][_mask[i]]
+                    for i in range(_mask.shape[0])
+                ],
+                value=1e3,
+            )
+
+        return neighbour_pos, neighbour_vec, neighbour_dis
+
+    def _neighbourlist_old(self):
         """Get distance matrix of neighbour list according to periodic boundary condition."""
         _mask = self.neighbour.any(-1).any(-1)
         neighbour_pos = pack(
@@ -506,6 +635,64 @@ class Periodic:
         return all_kpoints.squeeze(-1).permute(1, 2, 0), _n_kpoints, k_weights
 
     def _super_sampling(self, _kpoints):
+        """Super sampling - OPTIMIZED with meshgrid."""
+        # Get device from the first non-None tensor we can find
+        device = (
+            self.invlatvec.device
+            if hasattr(self, "invlatvec")
+            else _kpoints.device
+        )
+
+        _n_kpoints = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
+        _kpoints_inv = 0.5 / _kpoints.to(device)
+        _kpoints_inv2 = 1.0 / _kpoints.to(device)
+
+        # Vectorized k-point generation using meshgrid
+        all_kpoints_list = []
+
+        for ibatch in range(_kpoints.shape[0]):
+            nx, ny, nz = _kpoints[ibatch].long()
+
+            # Create base grid using meshgrid (MUCH faster than repeat/cat)
+            kx = (
+                torch.arange(nx, device=device, dtype=_kpoints.dtype)
+                * _kpoints_inv2[ibatch, 0]
+                + _kpoints_inv[ibatch, 0]
+            )
+            ky = (
+                torch.arange(ny, device=device, dtype=_kpoints.dtype)
+                * _kpoints_inv2[ibatch, 1]
+                + _kpoints_inv[ibatch, 1]
+            )
+            kz = (
+                torch.arange(nz, device=device, dtype=_kpoints.dtype)
+                * _kpoints_inv2[ibatch, 2]
+                + _kpoints_inv[ibatch, 2]
+            )
+
+            # meshgrid creates the full 3D grid
+            kzz, kyy, kxx = torch.meshgrid(kz, ky, kx, indexing="ij")
+
+            # Stack into [n_kpoints, 3]
+            kpoints_batch = torch.stack(
+                [kxx.flatten(), kyy.flatten(), kzz.flatten()], dim=1
+            )
+            all_kpoints_list.append(kpoints_batch)
+
+        # Pack into [n_batch, n_kpoints, 3]
+        all_kpoints = pack(all_kpoints_list)
+
+        # Weights: [n_batch, n_kpoints]
+        k_weights = pack(
+            [
+                torch.ones(nk, device=device, dtype=_kpoints.dtype) / nk
+                for nk in _n_kpoints
+            ]
+        )
+
+        return all_kpoints, _n_kpoints, k_weights
+
+    def _super_sampling_old(self, _kpoints):
         """Super sampling."""
         _n_kpoints = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
         _kpoints_inv = 0.5 / _kpoints
@@ -562,7 +749,7 @@ class Periodic:
         k_weights = pack(
             torch.split(torch.ones(_n_kpoints.sum()), tuple(_n_kpoints))
         )
-        print("_n_kpoints.device", _n_kpoints.device)
+        # print("_n_kpoints.device", _n_kpoints.device)
         k_weights = k_weights / _n_kpoints.unsqueeze(-1)
 
         return all_kpoints.squeeze(-1).permute(1, 2, 0), _n_kpoints, k_weights
@@ -649,6 +836,25 @@ class Periodic:
 
     @property
     def cellvec_neighbour(self):
+        """Return cell vector which distances between all atoms in return cell
+        and center cell are smaller than cutoff."""
+        _mask = self.neighbour.any(-1).any(-1)  # [n_batch, n_cells]
+
+        # cellvec is now already [n_batch, n_cells, 3] after our optimization
+        # No need to permute before indexing
+        _neighbour_vec = pack(
+            [
+                self.cellvec[ibatch][_mask[ibatch]]
+                for ibatch in range(self.cutoff.size(0))
+            ]
+        )
+
+        # Output should be [n_batch, 3, n_neighbor_cells]
+        # _neighbour_vec is [n_batch, n_neighbor_cells, 3]
+        return _neighbour_vec.permute(0, 2, 1)
+
+    @property
+    def cellvec_neighbour_old(self):
         """Return cell vector which distances between all atoms in return cell
         and center cell are smaller than cutoff."""
         _mask = self.neighbour.any(-1).any(-1)

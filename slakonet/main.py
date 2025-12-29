@@ -69,6 +69,7 @@ class SimpleDftb:
         compute_forces=True,
         include_dos_data=True,
         include_HS=True,
+        use_float32=True,
         # shell_dict=None,
         # h_feed=None,
         # s_feed=None,
@@ -77,6 +78,7 @@ class SimpleDftb:
         self.device = device or (
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        self.use_float32 = use_float32
         self.geometry = geometry
         self.model = model
         self.max_Z = max_Z
@@ -235,6 +237,50 @@ class SimpleDftb:
         return total_electrons.unsqueeze(0)
 
     def _solve_eigenvalue_problem(self, H, S):
+        """Solve H*c = E*S*c with appropriate precision."""
+        n_kpoints = self.max_nk.item()
+        eigenvalues_list = []
+        eigenvecs_list = []
+        occupations_list = []
+
+        for ik in range(n_kpoints):
+            h_k = H[..., ik]
+            s_k = S[..., ik]
+
+            # CRITICAL: Use float64 for eigenvalue decomposition
+            # This is where precision matters most
+            if self.use_float32:
+                h_k = h_k.to(torch.complex128)  # Complex128 for stability
+                s_k = s_k.to(torch.complex128)
+
+            # Solve generalized eigenvalue problem
+            eigenvals, eigenvecs = eighb(h_k, s_k, scheme="chol")
+
+            # Convert back to float32 after solve (if needed)
+            if self.use_float32:
+                eigenvals = eigenvals.to(torch.float32)
+                if eigenvecs is not None:
+                    eigenvecs = eigenvecs.to(torch.complex64)
+
+            # Fermi occupation
+            occ, _ = fermi(eigenvals, self.nelectron.to(self.device))
+
+            eigenvalues_list.append(eigenvals)
+            eigenvecs_list.append(eigenvecs)
+            occupations_list.append(occ)
+
+        # Stack and convert to eV
+        eigenvalues = torch.stack(eigenvalues_list, dim=1) * self.H2E
+        eigenvectors = (
+            torch.stack(eigenvecs_list, dim=1)
+            if self.with_eigenvectors
+            else None
+        )
+        occupations = torch.stack(occupations_list, dim=1)
+
+        return eigenvalues, eigenvectors, occupations
+
+    def _solve_eigenvalue_problem_old(self, H, S):
         """Solve H*c = E*S*c for all k-points."""
         n_kpoints = self.max_nk.item()
         eigenvalues_list = []
