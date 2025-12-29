@@ -1,4 +1,3 @@
-
 from slakonet.main import SimpleDftb
 from slakonet.atoms import Geometry
 import torch
@@ -8,13 +7,15 @@ import torch
 import numpy as np
 from slakonet.slaterkoster import fermi, hs_matrix
 from slakonet.optim import MultiElementSkfParameterOptimizer
-from slakonet.main import run_calc,SlakoNetCalculator
+from slakonet.main import run_calc, SlakoNetCalculator
 from slakonet.utils import eighb, create_feeds, generate_shell_dict_upto_Z65
 from slakonet.basis import Basis
 import time
 
 model_path = "../tests/Si_only.pt"
 model = MultiElementSkfParameterOptimizer.load_ultra_compact(model_path)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
 updated_skfs = model.get_updated_skfs()
 
 # Test 1: Unit verification
@@ -34,31 +35,29 @@ atoms = Poscar.from_string(poscar).atoms
 shell_dict = generate_shell_dict_upto_Z65()
 h_feed = create_feeds(updated_skfs, shell_dict, "H")
 s_feed = create_feeds(updated_skfs, shell_dict, "S")
-times=[]
-cells=list(range(1,10))
+times = []
+cells = list(range(1, 15))
 print(cells)
 for i in cells:
-    t1=time.time()
-    new_atoms=atoms.make_supercell([i])
+    t1 = time.time()
+    new_atoms = atoms.make_supercell([i])
     ase_atoms = new_atoms.ase_converter()
     geometry = Geometry.from_ase_atoms([ase_atoms])
 
     periodic = Periodic(
-                    geometry,
-                    geometry.cell,
-                    cutoff=7.1,
-                    kpoints=torch.tensor([2,2,2]),  # Use stored original
+        geometry,
+        geometry.cell,
+        cutoff=7.1,
+        kpoints=torch.tensor([2, 2, 2]),  # Use stored original
     )
     basis = Basis(geometry.atomic_numbers, shell_dict)
 
     # Build Hamiltonian and overlap matrices
     H = hs_matrix(periodic, basis, h_feed)
     S = hs_matrix(periodic, basis, s_feed)
-    t2=time.time()
-    tot_time=t2-t1
-    print(new_atoms.num_atoms, H.shape,tot_time)
-    times.append([new_atoms.num_atoms,tot_time])
+    t2 = time.time()
+    tot_time = t2 - t1
+    print(new_atoms.num_atoms, H.shape, tot_time)
+    times.append([new_atoms.num_atoms, tot_time])
     print(times)
     print()
-
-

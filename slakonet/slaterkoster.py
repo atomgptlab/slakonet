@@ -102,6 +102,328 @@ def fermi(eigenvalue: Tensor, nelectron: Tensor, kT=0.0, spin=None):
         return occ, nocc
 
 
+def hs_matrix_timing(
+    geometry: Geometry,
+    basis: Basis,
+    sk_feed: SkFeed,
+    train_onsite=None,
+    ml_onsite=None,
+    scale_dict=None,
+    orbital_resolved=False,
+    cutoff=10.0,
+    multi_varible=None,
+    use_sparse=True,  # Disabled by default for now
+) -> Tensor:
+    """Build Hamiltonian or overlap matrix.
+
+    Note: Sparse implementation is experimental. Set use_sparse=False (default)
+    to use the stable dense version.
+    """
+    import time
+
+    t_total = time.time()
+    timings = {}
+
+    # Setup
+    is_periodic = geometry.is_periodic
+    shape_orbs = basis.orbital_matrix_shape
+    g_var = None
+    device = geometry.positions.device
+
+    # Force dense for now (sparse has indexing issues)
+    use_sparse = False
+
+    # Initialize matrix - DENSE ONLY
+    if not is_periodic:
+        mat = torch.zeros(
+            shape_orbs,
+            device=device,
+            dtype=geometry.dtype,
+        )
+    else:
+        n_kpoints = geometry.n_kpoints
+        phase = geometry.phase
+        real_dtype = torch.get_default_dtype()
+
+        if isinstance(n_kpoints, Tensor):
+            n_kpoints = torch.max(n_kpoints)
+
+        dtype = torch.complex128 if phase is not None else real_dtype
+        mat = torch.zeros(
+            *shape_orbs,
+            n_kpoints,
+            device=device,
+            dtype=dtype,
+        )
+
+    # Matrix initialization
+    if not is_periodic:
+        l_mat_f = basis.azimuthal_matrix(mask_diag=True, mask_on_site=True)
+        l_mat_s = basis.azimuthal_matrix("shell", mask_on_site=True)
+    else:
+        l_mat_f = basis.azimuthal_matrix(mask_diag=False, mask_on_site=False)
+        l_mat_s = basis.azimuthal_matrix("shell", mask_on_site=False)
+
+    i_mat_s = basis.index_matrix("shell")
+    i_mat_f = basis.index_matrix("full")
+    an_mat_a = basis.atomic_number_matrix("atomic")
+
+    dist_mat_a = geometry.distances
+    vec_mat_a = -normalize(geometry.distance_vectors, 2, -1)
+
+    # Build mask for l-like distances matrix
+    _, mask_dist_l, mask_dist_s = basis.mask(geometry, cutoff)
+
+    # Define l_pairs
+    l_pairs = [
+        torch.tensor([i, j], device=device)
+        for i in range(4)
+        for j in range(4)
+        if i <= j
+    ]
+
+    # Start profiled loop
+    t0 = time.time()
+    for l_pair in l_pairs:
+
+        # Profile index masking
+        t_mask = time.time()
+
+        # Mask identifying indices
+        if l_pair[0] == l_pair[1]:
+            index_mask_s = torch.nonzero(
+                (l_mat_s == l_pair).all(dim=-1)
+                * (i_mat_s[..., 0] <= i_mat_s[..., 1])
+                * mask_dist_s
+            ).T
+        else:
+            index_mask_s = torch.nonzero(
+                (l_mat_s == l_pair).all(dim=-1) * mask_dist_s
+            ).T
+
+        timings["masking"] = timings.get("masking", 0) + (time.time() - t_mask)
+
+        if len(index_mask_s[0]) == 0:
+            continue
+
+        # Gather from i_mat_s to get the atom index mask
+        index_mask_a = index_mask_s.clone()
+        index_mask_a[-2:] = i_mat_s[tuple(index_mask_s)].T
+
+        # Gather the atomic numbers, distances, and unit vectors
+        atom_pairs_l = an_mat_a[tuple(index_mask_a)]
+
+        if not is_periodic:
+            g_dist = dist_mat_a[tuple(index_mask_a)]
+            g_vecs = vec_mat_a[tuple(index_mask_a)]
+        else:
+            g_dist = dist_mat_a[tuple(index_mask_a)].T
+            g_dist[g_dist.eq(0)] = 99999
+            g_vecs = vec_mat_a.permute(0, 2, 3, 4, 1)[
+                tuple(index_mask_a)
+            ].permute(2, 0, 1)
+            atom_pairs_l = atom_pairs_l.repeat(g_dist.shape[0], 1, 1)
+
+            if multi_varible is not None:
+                g_var = multi_varible.repeat(
+                    g_dist.shape[0], 1, 1, 1, 1
+                ).permute(1, 2, 3, 0, -1)
+                g_var = g_var[tuple(index_mask_a)].transpose(0, 1)
+            else:
+                g_var = None
+
+            if scale_dict is not None:
+                scale = scale_dict[tuple(l_pair.tolist())][
+                    tuple(index_mask_a)
+                ].T
+
+        # Mask the distances
+        mask_dist = g_dist.lt(cutoff) * g_dist.gt(0)
+        if not mask_dist.any():
+            continue
+
+        g_dist = g_dist[mask_dist]
+        g_vecs = g_vecs[mask_dist]
+        atom_pairs_l = atom_pairs_l[mask_dist]
+
+        if multi_varible is not None and is_periodic:
+            g_var = g_var[mask_dist]
+
+        if scale_dict is not None:
+            scale = scale[mask_dist].unsqueeze(-1)
+
+        # gather multi_varible
+        if not is_periodic and multi_varible is not None:
+            g_var = _gether_var(multi_varible, index_mask_a)
+
+        # Profile SK integral gathering
+        t_sk = time.time()
+        integrals = _gather_off_site(
+            atom_pairs_l,
+            l_pair,
+            g_dist,
+            sk_feed,
+            shell_dict=basis.shell_dict,
+            g_var=g_var,
+        )
+        timings["sk_integrals"] = timings.get("sk_integrals", 0) + (
+            time.time() - t_sk
+        )
+
+        if scale_dict is not None:
+            integrals = integrals * scale
+
+        # Profile SK rotation
+        t_rot = time.time()
+        if (l_pair == torch.tensor([0, 0], device=device)).all():
+            sk_data = integrals.unsqueeze(-2)
+        else:
+            sk_data = sub_block_rot(l_pair, g_vecs, integrals)
+        timings["rotation"] = timings.get("rotation", 0) + (
+            time.time() - t_rot
+        )
+
+        # Generate SK data in various K-points
+        if is_periodic:
+            t_phase = time.time()
+
+            mask_img_dist = torch.nonzero(mask_dist)
+            mask_batch = index_mask_a[0][mask_img_dist[..., 1]]
+            mask_atm1 = index_mask_a[1][mask_img_dist[..., 1]]
+            mask_atm2 = index_mask_a[2][mask_img_dist[..., 1]]
+
+            mask_img_dist = (
+                mask_batch,
+                mask_img_dist[..., 0],
+                mask_atm1,
+                mask_atm2,
+            )
+            sk_data = _pe_sk_data2(sk_data, phase, mask_img_dist)
+
+            timings["phase"] = timings.get("phase", 0) + (
+                time.time() - t_phase
+            )
+
+        # the indices to bridge the gap between blocks and flatten data
+        if l_pair.ne(0).all():
+            # size of block, row/col
+            nr, nc = l_pair * 2 + 1
+
+            # Get total orbital index
+            idx_mask_u, nl = index_mask_s[:2].unique(
+                dim=-1, return_counts=True
+            )
+            n_tot = torch.arange(int(nr * len(index_mask_s[-1]))) + 1
+
+            # Get flatted indices
+            r = pack(torch.split(n_tot, tuple(nl * nr))).reshape(
+                len(nl), -1, nr
+            )
+            r = r.transpose(-1, -2).flatten()
+            r = r[r.ne(0)] - 1
+
+            # Perform the reordering
+            if not is_periodic:
+                sk_data = sk_data.reshape(-1, nc)[r]
+            else:
+                sk_data = sk_data.reshape(-1, nc, sk_data.shape[-1])[r]
+
+        if not is_periodic:
+            sk_data = sk_data.flatten()
+        elif l_pair[0] == 0 or l_pair[1] == 0:
+            sk_data = sk_data.flatten(0, 2)
+        else:
+            sk_data = sk_data.flatten(0, 1)
+
+        # Profile matrix assignment
+        t_assign = time.time()
+
+        # Create the full sized index mask and assign the results
+        if l_pair[0] == l_pair[1]:
+            a_mask = torch.nonzero(
+                (l_mat_f == l_pair).all(-1)
+                * (i_mat_f[..., 0] <= i_mat_f[..., 1])
+                * mask_dist_l
+            ).T
+
+            # This mask is used to reproduce the lower triangle integrals
+            a_mask1 = torch.nonzero(
+                (l_mat_f == l_pair).all(-1)
+                * mask_dist_l
+                * (i_mat_f[..., 0] < i_mat_f[..., 1])
+            ).T
+        else:
+            a_mask = torch.nonzero((l_mat_f == l_pair).all(-1) * mask_dist_l).T
+
+        sk_data = sk_data.to(dtype=mat.dtype)
+        mat[tuple(a_mask)] = sk_data
+
+        if not is_periodic:
+            mat.transpose(-1, -2)[tuple(a_mask)] = sk_data
+        else:
+            if l_pair[0] == l_pair[1]:
+                mat.transpose(-2, -3)[tuple(a_mask1)] = torch.conj(
+                    mat[tuple(a_mask1)]
+                )
+            else:
+                mat.transpose(-2, -3)[tuple(a_mask)] = torch.conj(sk_data)
+
+        timings["assignment"] = timings.get("assignment", 0) + (
+            time.time() - t_assign
+        )
+
+    timings["total_loop"] = time.time() - t0
+
+    # Set the onsite terms (diagonal)
+    t_onsite = time.time()
+    if not train_onsite or train_onsite == "global" or ml_onsite is None:
+        _onsite = _gather_on_site(geometry, basis, sk_feed)
+    elif train_onsite == "local":
+        if not orbital_resolved:
+            _onsite = ml_onsite
+            _onsite = torch.repeat_interleave(
+                _onsite, basis.orbs_per_shell[basis.orbs_per_shell.ne(0)]
+            )
+            c = torch.unique_consecutive(
+                (basis.on_atoms != -1).nonzero().T[0], return_counts=True
+            )[1]
+            _onsite = pack(torch.split(_onsite, tuple(c))).view(
+                basis.orbital_matrix_shape[:-1]
+            )
+        else:
+            _onsite = (
+                sk_feed.on_site_dict["ml_onsite"]
+                if ml_onsite is None
+                else ml_onsite
+            )
+
+    if not is_periodic:
+        mat.diagonal(0, -2, -1)[:] = mat.diagonal(0, -2, -1)[:] + _onsite
+    else:
+        _onsite = _onsite.repeat(n_kpoints, 1, 1).permute(1, 0, 2)
+        mat.diagonal(0, -2, -3)[:] = mat.diagonal(0, -2, -3)[:] + _onsite
+
+    timings["onsite"] = time.time() - t_onsite
+    timings["total"] = time.time() - t_total
+
+    # Print breakdown
+    print(f"\n📊 hs_matrix timing breakdown:")
+    for key, val in sorted(timings.items(), key=lambda x: -x[1]):
+        pct = val / timings["total"] * 100
+        print(f"  {key:20s}: {val:6.3f}s ({pct:4.1f}%)")
+    print()
+
+    return mat
+
+
+# Helper function: convert sparse to dense if needed for eigensolvers
+def sparse_to_dense_if_needed(mat):
+    """Convert sparse matrix to dense for eigensolver."""
+    if mat.is_sparse:
+        return mat.to_dense()
+    return mat
+
+
 def hs_matrix(
     geometry: Geometry,
     basis: Basis,

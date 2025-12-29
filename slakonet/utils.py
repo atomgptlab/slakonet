@@ -582,7 +582,40 @@ def _eig_sort_out(
     return w, v
 
 
-def eighb_new(h_k, s_k, scheme="chol"):
+def eighb(h_k, s_k, scheme="chol"):
+    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
+    eps = 1e-8
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    eye = torch.eye(n, device=device, dtype=dtype)
+    s_k_reg = s_k  # + eps * eye  # Optional regularization
+
+    if scheme == "chol":
+        try:
+            L = torch.linalg.cholesky(s_k_reg)
+            L_inv = torch.linalg.inv(L)
+            H_tilde = L_inv @ h_k @ L_inv.mH
+            eigenvals, eigenvecs_tilde = torch.linalg.eigh(H_tilde)
+            eigenvecs = L_inv.mH @ eigenvecs_tilde
+        except RuntimeError as e:
+            print(f"Cholesky failed: {e}, falling back to eig")
+            eigenvals, eigenvecs = torch.linalg.eig(
+                torch.linalg.solve(s_k_reg, h_k)
+            )
+            eigenvals = eigenvals.real
+    else:
+        # Direct method (more stable)
+        eigenvals, eigenvecs = torch.linalg.eig(
+            torch.linalg.solve(s_k_reg, h_k)
+        )
+        eigenvals = eigenvals.real
+
+    return eigenvals, eigenvecs
+
+
+def eighb_fastest(h_k, s_k, scheme="chol"):
     """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability - OPTIMIZED."""
 
     device = h_k.device
@@ -615,7 +648,7 @@ def eighb_new(h_k, s_k, scheme="chol"):
     return eigenvals, eigenvecs
 
 
-def eighb(h_k, s_k, scheme="chol"):
+def eighb_old(h_k, s_k, scheme="chol"):
     """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
 
     # Add regularization to prevent singular matrices
