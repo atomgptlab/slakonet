@@ -323,6 +323,64 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         print(f"✅ Universal parameters saved to: {save_file}")
 
     @classmethod
+    def load_with_cache(
+        cls, model_path, cache_dir=".model_cache", force_reload=False
+    ):
+        """
+        Load model with filesystem cache for faster subsequent loads.
+
+        Args:
+            model_path: Path to the .pt model file
+            cache_dir: Directory to store cached models
+            force_reload: If True, bypass cache and reload from .pt file
+
+        Returns:
+            Loaded MultiElementSkfParameterOptimizer instance
+        """
+        import pickle
+        import hashlib
+        from pathlib import Path
+        import time
+
+        model_path = Path(model_path)
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(exist_ok=True)
+
+        # Create cache key from model file hash
+        with open(model_path, "rb") as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+
+        cache_file = cache_dir / f"{model_path.stem}_{file_hash}.pkl"
+
+        # Try loading from cache
+        if not force_reload and cache_file.exists():
+            print(f"📦 Loading from cache: {cache_file.name}")
+            t0 = time.time()
+            try:
+                with open(cache_file, "rb") as f:
+                    model = pickle.load(f)
+                print(f"✅ Cache load time: {time.time()-t0:.2f}s")
+                return model
+            except Exception as e:
+                print(f"⚠️  Cache load failed: {e}")
+                print("   Falling back to normal loading...")
+
+        # Load normally and cache
+        print("🔄 Cache miss - loading model from .pt file...")
+        model = cls.load_ultra_compact(model_path)
+
+        # Save to cache
+        print("💾 Saving to cache...")
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"✅ Cached to: {cache_file}")
+        except Exception as e:
+            print(f"⚠️  Failed to cache model: {e}")
+
+        return model
+
+    @classmethod
     def load_model(cls, load_path, method="state_dict", skf_directory=None):
         """
         Load the model using different methods
@@ -344,6 +402,287 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             return cls._load_universal_params_method(load_path, skf_directory)
         else:
             raise ValueError(f"Unknown load method: {method}")
+
+    @classmethod
+    def load_ultra_compact_lazy(cls, load_path, elements_needed=None):
+        """Load model but only initialize SKF optimizers for needed element pairs."""
+        import time
+
+        t_total = time.time()
+
+        # 1. Load file
+        t1 = time.time()
+        load_file = Path(load_path).with_suffix(".pt")
+        compact_data = torch.load(
+            load_file, map_location="cuda", weights_only=False
+        )
+        print(f"⏱️  torch.load took: {time.time()-t1:.2f}s")
+
+        if not compact_data["metadata"].get("ultra_compact", False):
+            raise ValueError("This is not an ultra-compact model file")
+
+        metadata = compact_data["metadata"]
+        state_dict = compact_data["trained_parameters"]
+        skf_metadata = compact_data["skf_metadata"]
+        r_spline_data = compact_data.get("r_spline_data", {})
+
+        # 2. Create instance
+        t2 = time.time()
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+        print(f"⏱️  Instance setup took: {time.time()-t2:.2f}s")
+
+        # 3. Filter pairs
+        t3 = time.time()
+        if elements_needed:
+            elements_needed = set(elements_needed)
+            pairs_to_load = [
+                pair
+                for pair in metadata["available_pairs"]
+                if pair.split("-")[0] in elements_needed
+                and pair.split("-")[1] in elements_needed
+            ]
+            print(
+                f"🎯 Lazy loading: {len(pairs_to_load)}/{len(metadata['available_pairs'])} pairs for elements {elements_needed}"
+            )
+        else:
+            pairs_to_load = metadata["available_pairs"]
+            print(f"📦 Loading all {len(pairs_to_load)} pairs")
+        print(f"⏱️  Pair filtering took: {time.time()-t3:.2f}s")
+
+        # 4. Pre-group state_dict
+        t4 = time.time()
+        pair_params = {}
+        for key, value in state_dict.items():
+            if key.startswith("skf_optimizers."):
+                parts = key.split(".")
+                if len(parts) >= 4:
+                    pair_key = parts[1]
+                    if pair_key not in pairs_to_load:
+                        continue  # Skip pairs we don't need
+
+                    param_type = parts[2]
+                    param_name = ".".join(parts[3:])
+
+                    if pair_key not in pair_params:
+                        pair_params[pair_key] = {
+                            "h_params": {},
+                            "s_params": {},
+                        }
+
+                    if param_type in ["h_params", "s_params"]:
+                        pair_params[pair_key][param_type][param_name] = value
+        print(f"⏱️  Parameter grouping took: {time.time()-t4:.2f}s")
+
+        # 5. Create optimizers
+        t5 = time.time()
+        instance.skf_optimizers = nn.ModuleDict()
+        from slakonet.skf import Skf
+
+        for pair_key in pairs_to_load:
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            skf_dict = skf_metadata[pair_key].copy()
+            h_params = pair_params.get(pair_key, {}).get("h_params", {})
+            s_params = pair_params.get(pair_key, {}).get("s_params", {})
+
+            skf_dict["hamiltonian"] = h_params
+            skf_dict["overlap"] = s_params
+            optimizer.skf_dict = skf_dict
+
+            optimizer.h_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in h_params.items()}
+            )
+            optimizer.s_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in s_params.items()}
+            )
+
+            optimizer.grid = skf_dict.get("grid", None)
+            optimizer.atomic_data = skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+            if pair_key in r_spline_data:
+                rspl_data = r_spline_data[pair_key]
+                optimizer.r_spline = Skf.RSpline(
+                    grid=rspl_data["grid"],
+                    cutoff=rspl_data["cutoff"],
+                    spline_coef=rspl_data["spline_coef"],
+                    exp_coef=rspl_data["exp_coef"],
+                    tail_coef=rspl_data["tail_coef"],
+                )
+            else:
+                optimizer.r_spline = None
+
+            instance.skf_optimizers[pair_key] = optimizer
+        print(f"⏱️  Optimizer creation took: {time.time()-t5:.2f}s")
+
+        # 6. Load state dict
+        t6 = time.time()
+        filtered_state = {
+            k: v
+            for k, v in state_dict.items()
+            if any(
+                k.startswith(f"skf_optimizers.{pair}")
+                for pair in pairs_to_load
+            )
+        }
+        instance.load_state_dict(filtered_state, strict=False)
+        print(f"⏱️  State dict loading took: {time.time()-t6:.2f}s")
+
+        print(f"✅ Total load time: {time.time()-t_total:.2f}s")
+        return instance
+
+    @classmethod
+    def load_ultra_compact_lazy_old(cls, load_path, elements_needed=None):
+        """
+        Load model but only initialize SKF optimizers for needed element pairs.
+
+        Args:
+            load_path: Path to model file
+            elements_needed: Set of element symbols (e.g., {'Si', 'Ge'})
+                            If None, loads all pairs
+        """
+        import time
+
+        t1 = time.time()
+        load_file = Path(load_path).with_suffix(".pt")
+        compact_data = torch.load(
+            load_file, map_location="cuda", weights_only=False
+        )
+
+        if not compact_data["metadata"].get("ultra_compact", False):
+            raise ValueError("This is not an ultra-compact model file")
+
+        metadata = compact_data["metadata"]
+        state_dict = compact_data["trained_parameters"]
+        skf_metadata = compact_data["skf_metadata"]
+        r_spline_data = compact_data.get("r_spline_data", {})
+
+        # Create new instance
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+
+        # Restore basic attributes
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        # Recreate atomic number mapping
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+
+        # Filter pairs if elements_needed is specified
+        if elements_needed:
+            elements_needed = set(elements_needed)
+            pairs_to_load = [
+                pair
+                for pair in metadata["available_pairs"]
+                if pair.split("-")[0] in elements_needed
+                and pair.split("-")[1] in elements_needed
+            ]
+            print(
+                f"🎯 Lazy loading: {len(pairs_to_load)}/{len(metadata['available_pairs'])} pairs for elements {elements_needed}"
+            )
+        else:
+            pairs_to_load = metadata["available_pairs"]
+            print(f"📦 Loading all {len(pairs_to_load)} pairs")
+
+        # Pre-group state_dict
+        pair_params = {}
+        for key, value in state_dict.items():
+            if key.startswith("skf_optimizers."):
+                parts = key.split(".")
+                if len(parts) >= 4:
+                    pair_key = parts[1]
+                    if pair_key not in pairs_to_load:
+                        continue  # Skip pairs we don't need
+
+                    param_type = parts[2]
+                    param_name = ".".join(parts[3:])
+
+                    if pair_key not in pair_params:
+                        pair_params[pair_key] = {
+                            "h_params": {},
+                            "s_params": {},
+                        }
+
+                    if param_type in ["h_params", "s_params"]:
+                        pair_params[pair_key][param_type][param_name] = value
+
+        # Create optimizers
+        instance.skf_optimizers = nn.ModuleDict()
+        from slakonet.skf import Skf
+
+        for pair_key in pairs_to_load:
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            skf_dict = skf_metadata[pair_key].copy()
+            h_params = pair_params.get(pair_key, {}).get("h_params", {})
+            s_params = pair_params.get(pair_key, {}).get("s_params", {})
+
+            skf_dict["hamiltonian"] = h_params
+            skf_dict["overlap"] = s_params
+            optimizer.skf_dict = skf_dict
+
+            optimizer.h_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in h_params.items()}
+            )
+            optimizer.s_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in s_params.items()}
+            )
+
+            optimizer.grid = skf_dict.get("grid", None)
+            optimizer.atomic_data = skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+            if pair_key in r_spline_data:
+                rspl_data = r_spline_data[pair_key]
+                optimizer.r_spline = Skf.RSpline(
+                    grid=rspl_data["grid"],
+                    cutoff=rspl_data["cutoff"],
+                    spline_coef=rspl_data["spline_coef"],
+                    exp_coef=rspl_data["exp_coef"],
+                    tail_coef=rspl_data["tail_coef"],
+                )
+            else:
+                optimizer.r_spline = None
+
+            instance.skf_optimizers[pair_key] = optimizer
+
+        # Only load state dict for the pairs we created
+        filtered_state = {
+            k: v
+            for k, v in state_dict.items()
+            if any(
+                k.startswith(f"skf_optimizers.{pair}")
+                for pair in pairs_to_load
+            )
+        }
+        instance.load_state_dict(filtered_state, strict=False)
+
+        t2 = time.time()
+        print(f"✅ Loaded in {t2-t1:.2f}s")
+        return instance
 
     @classmethod
     def _load_state_dict_method(cls, load_path):
@@ -579,6 +918,137 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
     @classmethod
     def load_ultra_compact(cls, load_path):
+        """
+        Load ultra-compact model with optimized pair reconstruction
+        """
+        t1 = time.time()
+        load_file = Path(load_path).with_suffix(".pt")
+        compact_data = torch.load(
+            load_file, map_location="cuda", weights_only=False
+        )
+
+        if not compact_data["metadata"].get("ultra_compact", False):
+            raise ValueError("This is not an ultra-compact model file")
+
+        metadata = compact_data["metadata"]
+        state_dict = compact_data["trained_parameters"]
+        skf_metadata = compact_data["skf_metadata"]
+        r_spline_data = compact_data.get("r_spline_data", {})
+
+        # Create new instance
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+
+        # Restore basic attributes
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        # Recreate atomic number mapping
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+
+        # OPTIMIZATION 1: Pre-group state_dict by pair_key
+        print("Grouping parameters by pair...")
+        t_group_start = time.time()
+
+        pair_params = {}
+        for key, value in state_dict.items():
+            if key.startswith("skf_optimizers."):
+                parts = key.split(".")
+                if len(parts) >= 4:
+                    pair_key = parts[1]
+                    param_type = parts[2]  # 'h_params' or 's_params'
+                    param_name = ".".join(parts[3:])
+
+                    if pair_key not in pair_params:
+                        pair_params[pair_key] = {
+                            "h_params": {},
+                            "s_params": {},
+                        }
+
+                    if param_type in ["h_params", "s_params"]:
+                        pair_params[pair_key][param_type][param_name] = value
+
+        print(f"Parameter grouping took: {time.time() - t_group_start:.2f}s")
+
+        # OPTIMIZATION 2: Batch create optimizers
+        print(f"Creating {len(metadata['available_pairs'])} SKF optimizers...")
+        t_create_start = time.time()
+
+        instance.skf_optimizers = nn.ModuleDict()
+
+        # Pre-import to avoid repeated imports
+        from slakonet.skf import Skf
+
+        for pair_key in metadata["available_pairs"]:
+            # Create optimizer
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            # Get metadata
+            skf_dict = skf_metadata[pair_key].copy()
+
+            # Get pre-grouped parameters (much faster than searching state_dict each time)
+            h_params = pair_params.get(pair_key, {}).get("h_params", {})
+            s_params = pair_params.get(pair_key, {}).get("s_params", {})
+
+            # Reconstruct full skf_dict
+            skf_dict["hamiltonian"] = h_params
+            skf_dict["overlap"] = s_params
+            optimizer.skf_dict = skf_dict
+
+            # OPTIMIZATION 3: Direct parameter assignment without clone() if not needed
+            optimizer.h_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in h_params.items()}
+            )
+            optimizer.s_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in s_params.items()}
+            )
+
+            # Set other attributes
+            optimizer.grid = skf_dict.get("grid", None)
+            optimizer.atomic_data = skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+            # Restore r_spline if it exists
+            if pair_key in r_spline_data:
+                rspl_data = r_spline_data[pair_key]
+                optimizer.r_spline = Skf.RSpline(
+                    grid=rspl_data["grid"],
+                    cutoff=rspl_data["cutoff"],
+                    spline_coef=rspl_data["spline_coef"],
+                    exp_coef=rspl_data["exp_coef"],
+                    tail_coef=rspl_data["tail_coef"],
+                )
+            else:
+                optimizer.r_spline = None
+
+            instance.skf_optimizers[pair_key] = optimizer
+
+        print(f"Optimizer creation took: {time.time() - t_create_start:.2f}s")
+
+        # Load state dict
+        t_state_start = time.time()
+        instance.load_state_dict(state_dict)
+        print(f"State dict loading took: {time.time() - t_state_start:.2f}s")
+
+        t2 = time.time()
+
+        print(f"✅ Compact model loaded from: {load_file}")
+        if r_spline_data:
+            print(f"   Restored r_spline for {len(r_spline_data)} pairs")
+        print(f"Total time: {t2 - t1:.2f}s")
+        return instance
+
+    @classmethod
+    def load_ultra_compact_old(cls, load_path):
         """
         Load ultra-compact model and reconstruct skf_dict from trained parameters
         """

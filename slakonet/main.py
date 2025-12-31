@@ -27,9 +27,7 @@ from slakonet.utils import eighb, create_feeds, generate_shell_dict_upto_Z65
 from slakonet.fermi import fermi_smearing
 from slakonet.interpolation import PolyInterpU
 import torch
-from ase.calculators.calculator import Calculator, all_changes
 import torch
-from ase.calculators.calculator import Calculator, all_changes
 from slakonet.atoms import Geometry
 from ase.calculators.calculator import Calculator, all_changes
 from ase import Atoms as AseAtoms
@@ -37,6 +35,7 @@ import numpy as np
 import torch
 from jarvis.core.atoms import Atoms as JarvisAtoms
 from jarvis.core.atoms import ase_to_atoms
+import torch.nn as nn
 
 try:
     from phonopy import Phonopy
@@ -70,6 +69,9 @@ class SimpleDftb:
         include_dos_data=True,
         include_HS=True,
         use_float32=True,
+        alpha=0.1,
+        beta=0.1,
+        updated_skfs=None,
         # shell_dict=None,
         # h_feed=None,
         # s_feed=None,
@@ -93,7 +95,12 @@ class SimpleDftb:
         # Setup basis and feeds
         self.shell_dict = generate_shell_dict_upto_Z65()
         self.basis = Basis(self.geometry.atomic_numbers, self.shell_dict)
-        self.updated_skfs = self.model.get_updated_skfs()
+        # Use provided SKFs or get from model
+        if updated_skfs is not None:
+            self.updated_skfs = updated_skfs
+        else:
+            self.updated_skfs = self.model.get_updated_skfs()
+
         self.h_feed = create_feeds(self.updated_skfs, self.shell_dict, "H")
         self.s_feed = create_feeds(self.updated_skfs, self.shell_dict, "S")
         # ===== CRITICAL: Store original kpoints/klines for force calculations =====
@@ -118,6 +125,8 @@ class SimpleDftb:
 
         # Cache for computed properties
         self._results = None
+        self.alpha = alpha
+        self.beta = beta
 
     def calculate_dos(
         self,
@@ -1061,11 +1070,15 @@ class SimpleDftb:
         include_HS = self.include_HS
         # Enable gradient tracking for positions if forces needed
         if compute_forces:
-            needs_recreation = not self.geometry.positions.requires_grad
+            needs_recreation = (
+                not self.geometry.positions.requires_grad
+                or not self.geometry.cell.requires_grad
+            )
             if needs_recreation:
                 # CRITICAL: Set requires_grad BEFORE creating Periodic object
                 # if not self.geometry.positions.requires_grad:
                 self.geometry.positions.requires_grad_(True)
+                self.geometry.cell.requires_grad_(True)
                 self.periodic = Periodic(
                     self.geometry,
                     self.geometry.cell,
@@ -1099,7 +1112,7 @@ class SimpleDftb:
 
         if self.repulsive:
             potential_energy = self._compute_repulsive_energy() * self.H2E
-            total_energy = electronic_energy + potential_energy
+            total_energy = self.alpha * electronic_energy + potential_energy
             print("potential_energy", potential_energy)
             print("electronic_energy", electronic_energy)
         else:
@@ -1135,6 +1148,7 @@ class SimpleDftb:
 
         # Compute forces
         forces = None
+        stress = None
         if compute_forces:
             try:
                 grad_outputs = torch.autograd.grad(
@@ -1142,11 +1156,47 @@ class SimpleDftb:
                     self.geometry.positions,
                     create_graph=True,
                     retain_graph=True,
-                    allow_unused=False,  # Change back to False - should work now
+                    allow_unused=False,
                 )
 
-                forces = -grad_outputs[0]  # Forces are negative gradient
+                forces = (
+                    -self.beta * grad_outputs[0]
+                )  # Forces are negative gradient
                 # print("forcessssssss", forces)
+                dE_dh = torch.autograd.grad(
+                    total_energy,
+                    self.geometry.cell,
+                    retain_graph=True,
+                    create_graph=True,
+                )[0]
+                cell = self.geometry.cell[0]
+                volume = torch.abs(torch.det(cell))
+                # stress = 160.21766208* dE_dh[0] @ cell.T / volume
+                # ===== VIRIAL TERM =====
+                positions = self.geometry.positions[0]
+                mask = self.geometry.atomic_numbers[0] > 0
+                stress_virial = torch.einsum(
+                    "ia,ib->ab", forces[0][mask], positions[mask]
+                )
+
+                # ===== TOTAL STRESS =====
+                stress_tensor = (stress_virial - dE_dh[0] @ cell.T) / volume
+
+                # Voigt + GPa
+                stress = (
+                    torch.tensor(
+                        [
+                            stress_tensor[0, 0],
+                            stress_tensor[1, 1],
+                            stress_tensor[2, 2],
+                            stress_tensor[1, 2],
+                            stress_tensor[0, 2],
+                            stress_tensor[0, 1],
+                        ],
+                        device=self.device,
+                    )
+                    * 160.21766208
+                )
 
             except RuntimeError as e:
                 print(f"❌ Error computing forces: {e}")
@@ -1154,6 +1204,7 @@ class SimpleDftb:
                     "⚠️  Forces set to zero - positions may not be in computation graph"
                 )
                 forces = torch.zeros_like(self.geometry.positions)
+        # print('forces',forces)
         self._results = {
             "energy": total_energy,
             "eigenvalues": eigenvalues_shifted,
@@ -1161,6 +1212,7 @@ class SimpleDftb:
             "electronic_energy": electronic_energy,
             "potential_energy": potential_energy,
             "forces": forces,
+            "stress": stress,
             "bandgap": bandgap,
             "occupations": occupations,
             "geometry": self.geometry,
@@ -1280,40 +1332,113 @@ def run_calc(
     model=None,
     kpoints_array=[1, 1, 1],
     device="cuda",
+    compute_forces=True,
+    alpha=0.1,
+    beta=0.1,
+    elements_needed=None,
+    updated_skfs=None,  # NEW
 ):
-    if model_path is not None:
+    if model is None:
+        if model_path is None:
+            raise ValueError("Either model or model_path must be provided")
         from slakonet.optim import MultiElementSkfParameterOptimizer
 
-        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
-            model_path
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact_lazy(
+            model_path, elements_needed=elements_needed
         )
-    geometry = Geometry.from_ase_atoms([ase_atoms])
-    geometry.positions.requires_grad_(True)
-    kpoints = torch.tensor(kpoints_array)  # For DOS
-    # device = "cuda"
-    model = model.to(device)
+        model = model.to(device).float()
+        model.eval()
+
     model.eval()
 
-    model = model.float()
-    s = SimpleDftb(geometry, kpoints=kpoints, model=model)
-    ##s = SimpleDftb(geometry,klines=klines,model=model)
-    # print('ele',s.nelectron)
+    geometry = Geometry.from_ase_atoms([ase_atoms])
+    geometry.positions.requires_grad_(True)
+    kpoints = torch.tensor(kpoints_array)
+
+    s = SimpleDftb(
+        geometry,
+        kpoints=kpoints,
+        model=model,
+        compute_forces=compute_forces,
+        alpha=alpha,
+        beta=beta,
+        updated_skfs=updated_skfs,  # Pass filtered SKFs
+    )
     res = s.calculate()
-    # print("res", res)
     return res
 
 
-class SlakoNetCalculator(Calculator):
-    """ASE Calculator interface for SlakoNet"""
+class FilteredModelView(nn.Module):
+    """Lightweight wrapper that filters which SKF pairs are used"""
 
-    implemented_properties = ["energy", "forces", "stress"]
+    def __init__(self, full_model, elements_needed):
+        super().__init__()
+        self.full_model = full_model
+        self.elements_needed = set(elements_needed)
+
+        # Determine which pairs to use
+        self.active_pairs = set()
+        for pair_key in full_model.skf_optimizers.keys():
+            elem1, elem2 = pair_key.split("-")
+            if elem1 in self.elements_needed and elem2 in self.elements_needed:
+                self.active_pairs.add(pair_key)
+
+        print(
+            f"   Using {len(self.active_pairs)} pairs: {sorted(self.active_pairs)}"
+        )
+
+    def get_updated_skfs(self):
+        """Return only the SKFs for active elements"""
+        updated_skfs = {}
+        for pair_key in self.active_pairs:
+            if pair_key in self.full_model.skf_optimizers:
+                updated_skfs[pair_key] = self.full_model.skf_optimizers[
+                    pair_key
+                ].get_updated_skf()
+        return updated_skfs
+
+    def to(self, device):
+        # The full model is already on device, just return self
+        return self
+
+    def float(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def __getattr__(self, name):
+        # Delegate other attributes to full_model
+        if name in ["full_model", "elements_needed", "active_pairs"]:
+            return object.__getattribute__(self, name)
+        return getattr(self.full_model, name)
+
+
+class SlakoNetCalculator(Calculator):
+    """ASE Calculator interface for SlakoNet with dynamic element filtering"""
+
+    implemented_properties = [
+        "energy",
+        "forces",
+        "bandgap",
+        "eigenvalues",
+        "fermi_energy",
+    ]
+
+    # Class-level model cache for sharing across instances
+    _model_cache = {}
 
     def __init__(
         self,
         model=None,
+        model_path=None,
         kpoints_array=[1, 1, 1],
         device="cuda",
-        model_path=None,
+        alpha=0.1,
+        beta=0.1,
+        compute_forces=True,
+        elements_needed=None,
+        use_cached_model=True,
         **kwargs,
     ):
         """
@@ -1321,18 +1446,108 @@ class SlakoNetCalculator(Calculator):
 
         Args:
             model: Loaded SlakoNet model (MultiElementSkfParameterOptimizer)
+            model_path: Path to model file (if model not provided)
+            use_cached_model: If True, reuse loaded model across calculator instances
+            elements_needed: Set of elements to filter (optional, can auto-detect)
             **kwargs: Additional arguments passed to Calculator
         """
         Calculator.__init__(self, **kwargs)
-        self.model = model
+
+        # Load or reuse model
+        if model is None and model_path is not None:
+            if use_cached_model and model_path in self._model_cache:
+                print(f"♻️  Reusing cached model")
+                model = self._model_cache[model_path]
+            else:
+                from slakonet.optim import MultiElementSkfParameterOptimizer
+
+                print(f"🔄 Loading full model from {model_path}...")
+
+                # Load FULL model with caching
+                model = MultiElementSkfParameterOptimizer.load_with_cache(
+                    model_path, cache_dir=".model_cache"
+                )
+
+                # Move to device and set dtype once
+                model = model.to(device).float()
+                model.eval()
+
+                # Cache for reuse
+                if use_cached_model:
+                    self._model_cache[model_path] = model
+                    print(f"✅ Model cached for reuse")
+
+        elif model is None:
+            raise ValueError("Either model or model_path must be provided")
+
+        # Store the full model
+        self.full_model = model
+
+        # Store settings
+        self.model_path = model_path
         self.kpoints_array = kpoints_array
         self.device = device
-        self.model_path = model_path
+        self.compute_forces = compute_forces
+        self.alpha = alpha
+        self.beta = beta
+
+        # Initialize with elements if provided
+        self.elements_needed = None
+        self.active_pairs = None
+
+        if elements_needed:
+            self.set_elements(elements_needed)
+
+    def set_elements(self, elements_needed):
+        """
+        Set which elements to use for calculations.
+        This filters the model to only use relevant element pairs.
+
+        Args:
+            elements_needed: Set or list of element symbols (e.g., {'Si', 'Ge'})
+        """
+        if elements_needed is None:
+            self.elements_needed = None
+            self.active_pairs = None
+            return
+
+        elements_needed = set(elements_needed)
+
+        # Only update if elements changed
+        if self.elements_needed == elements_needed:
+            return
+
+        self.elements_needed = elements_needed
+
+        # Determine which pairs are needed
+        self.active_pairs = set()
+        for pair_key in self.full_model.skf_optimizers.keys():
+            elem1, elem2 = pair_key.split("-")
+            if elem1 in elements_needed and elem2 in elements_needed:
+                self.active_pairs.add(pair_key)
+
+        # Silent mode for high-throughput
+        # print(f"🎯 Using {len(self.active_pairs)} pairs for {sorted(elements_needed)}")
+
+    def _get_filtered_skfs(self):
+        """Get SKFs filtered by active element pairs"""
+        if self.active_pairs is None:
+            # No filtering, return all
+            return self.full_model.get_updated_skfs()
+
+        # Return only active pairs
+        updated_skfs = {}
+        for pair_key in self.active_pairs:
+            if pair_key in self.full_model.skf_optimizers:
+                updated_skfs[pair_key] = self.full_model.skf_optimizers[
+                    pair_key
+                ].get_updated_skf()
+        return updated_skfs
 
     def calculate(
         self,
         atoms=None,
-        properties=["energy", "forces", "results"],
+        properties=["energy", "forces", "bandgap", "eigenvalues", "results"],
         system_changes=all_changes,
     ):
         """
@@ -1344,28 +1559,304 @@ class SlakoNetCalculator(Calculator):
             system_changes: Changes since last calculation
         """
         Calculator.calculate(self, atoms, properties, system_changes)
+        # Auto-detect elements from structure if not set
+        if self.elements_needed is None:
+            elements_in_structure = set(atoms.get_chemical_symbols())
+            self.set_elements(elements_in_structure)
+        # Get filtered SKFs
+        filtered_skfs = self._get_filtered_skfs()
 
-        # Run SlakoNet calculation
-        result = run_calc(
-            ase_atoms=atoms,
-            model=self.model,
-            model_path=self.model_path,
-            device=self.device,
-            kpoints_array=self.kpoints_array,
+        # Run calculation with filtered model
+        result = self._run_calc_with_filtered_skfs(
+            atoms=atoms,
+            filtered_skfs=filtered_skfs,
         )
 
         # Extract results and convert to numpy arrays on CPU
         self.results["energy"] = result["energy"].detach().cpu().numpy().item()
-        self.results["result"] = (
-            result  # ["energy"].detach().cpu().numpy().item()
+        self.results["result"] = result
+        if "forces" in properties and result.get("forces") is not None:
+            forces = result["forces"].detach().cpu().numpy()
+            self.results["forces"] = forces.reshape(-1, 3)
+        if "stress" in properties and result.get("stress") is not None:
+            stress = result["stress"].detach().cpu().numpy()
+            self.results["stress"] = stress.reshape(-1, 3)
+            # self.results["stress"] = 160.21766208*stress.reshape(-1, 3)
+
+        if "fermi_energy" in result:
+            self.results["fermi_energy"] = (
+                result["fermi_energy"].detach().cpu().numpy().item()
+            )
+        if "bandgap" in result:
+            self.results["bandgap"] = (
+                result["bandgap"].detach().cpu().numpy().item()
+            )
+
+        if "eigenvalues" in result:
+            self.results["eigenvalues"] = (
+                result["eigenvalues"].detach().cpu().numpy()
+            )
+
+    def get_bandgap(self):
+        """Convenience method to get bandgap"""
+        if "bandgap" not in self.results:
+            raise RuntimeError("Calculation not performed yet")
+        return self.results["bandgap"]
+
+    def get_fermi_energy(self):
+        """Convenience method to get Fermi energy"""
+        if "fermi_energy" not in self.results:
+            raise RuntimeError("Calculation not performed yet")
+        return self.results["fermi_energy"]
+
+    def _run_calc_with_filtered_skfs(self, atoms, filtered_skfs):
+        """Run calculation using only filtered SKF pairs"""
+        from slakonet.atoms import Geometry
+        from slakonet.main import SimpleDftb
+
+        # Create a temporary filtered model wrapper
+        class FilteredModel:
+            def __init__(self, filtered_skfs):
+                self.filtered_skfs = filtered_skfs
+
+            def get_updated_skfs(self):
+                return self.filtered_skfs
+
+            def to(self, device):
+                return self
+
+            def float(self):
+                return self
+
+            def eval(self):
+                return self
+
+        # Create geometry
+        geometry = Geometry.from_ase_atoms([atoms])
+        geometry.positions.requires_grad_(True)
+        kpoints = torch.tensor(self.kpoints_array)
+
+        # Use filtered model
+        filtered_model = FilteredModel(filtered_skfs)
+
+        # Run SimpleDftb with filtered model
+        calc = SimpleDftb(
+            geometry,
+            kpoints=kpoints,
+            model=filtered_model,
+            compute_forces=self.compute_forces,
+            alpha=self.alpha,
+            beta=self.beta,
+            device=self.device,
         )
+
+        result = calc.calculate()
+        return result
+
+
+class SlakoNetCalculatorX(Calculator):
+    """ASE Calculator interface for SlakoNet with dynamic element filtering"""
+
+    implemented_properties = ["energy", "forces", "stress"]
+
+    # Class-level model cache for sharing across instances
+    _model_cache = {}
+
+    def __init__(
+        self,
+        model=None,
+        model_path=None,
+        kpoints_array=[1, 1, 1],
+        device="cuda",
+        alpha=0.1,
+        beta=0.1,
+        compute_forces=True,
+        elements_needed=None,
+        use_cached_model=True,  # NEW: Enable model reuse
+        **kwargs,
+    ):
+        Calculator.__init__(self, **kwargs)
+
+        # Load or reuse model
+        if model is None and model_path is not None:
+            if use_cached_model and model_path in self._model_cache:
+                print(f"♻️  Reusing cached model for {model_path}")
+                model = self._model_cache[model_path]
+            else:
+                from slakonet.optim import MultiElementSkfParameterOptimizer
+
+                print(f"🔄 Loading full model from {model_path}...")
+
+                # Load FULL model with caching
+                model = MultiElementSkfParameterOptimizer.load_with_cache(
+                    model_path, cache_dir=".model_cache"
+                )
+
+                # Cache for reuse
+                if use_cached_model:
+                    self._model_cache[model_path] = model
+
+        elif model is None:
+            raise ValueError("Either model or model_path must be provided")
+
+        # Prepare model once
+        self.full_model = model.to(device).float()
+        self.full_model.eval()
+
+        # Store settings
+        self.model_path = model_path
+        self.elements_needed = elements_needed
+        self.kpoints_array = kpoints_array
+        self.device = device
+        self.compute_forces = compute_forces
+        self.alpha = alpha
+        self.beta = beta
+
+        # Create filtered view if elements specified
+        if elements_needed:
+            print(f"🎯 Filtering model for elements: {elements_needed}")
+            self.active_model = self._create_filtered_model(elements_needed)
+        else:
+            self.active_model = self.full_model
+
+    def _create_filtered_model(self, elements_needed):
+        """Create a lightweight filtered view of the model"""
+        # This creates a wrapper that only uses specified element pairs
+        # without copying the entire model
+        return FilteredModelView(self.full_model, elements_needed)
+
+    def set_elements(self, elements_needed):
+        """Dynamically change which elements to use"""
+        if elements_needed:
+            print(f"🔄 Switching to elements: {elements_needed}")
+            self.active_model = self._create_filtered_model(elements_needed)
+            self.elements_needed = elements_needed
+        else:
+            self.active_model = self.full_model
+            self.elements_needed = None
+
+    def calculate(
+        self,
+        atoms=None,
+        properties=["energy", "forces", "bandgap", "eigenvalues", "results"],
+        system_changes=all_changes,
+    ):
+        Calculator.calculate(self, atoms, properties, system_changes)
+
+        # Auto-detect elements if not specified
+        if self.elements_needed is None:
+            elements_in_structure = set(atoms.get_chemical_symbols())
+            self.set_elements(elements_in_structure)
+
+        # Use the active (possibly filtered) model
+        result = run_calc(
+            ase_atoms=atoms,
+            model=self.active_model,
+            model_path=None,
+            device=self.device,
+            kpoints_array=self.kpoints_array,
+            compute_forces=self.compute_forces,
+            alpha=self.alpha,
+            beta=self.beta,
+            elements_needed=None,
+        )
+
+        # Extract results
+        self.results["energy"] = result["energy"].detach().cpu().numpy().item()
+        self.results["result"] = result
 
         if "forces" in properties:
             forces = result["forces"].detach().cpu().numpy()
-            # Reshape forces to (n_atoms, 3)
             self.results["forces"] = forces.reshape(-1, 3)
 
-        # Optional: Add other properties
+        if "fermi_energy" in result:
+            self.results["fermi_energy"] = (
+                result["fermi_energy"].detach().cpu().numpy().item()
+            )
+
+        if "bandgap" in result:
+            self.results["bandgap"] = (
+                result["bandgap"].detach().cpu().numpy().item()
+            )
+
+        if "eigenvalues" in result:
+            self.results["eigenvalues"] = (
+                result["eigenvalues"].detach().cpu().numpy()
+            )
+
+
+class SlakoNetCalculatorX(Calculator):
+    """ASE Calculator interface for SlakoNet"""
+
+    implemented_properties = ["energy", "forces", "stress"]
+
+    def __init__(
+        self,
+        model=None,
+        model_path=None,
+        kpoints_array=[1, 1, 1],
+        device="cuda",
+        alpha=0.1,
+        beta=0.1,
+        compute_forces=True,
+        elements_needed=None,
+        **kwargs,
+    ):
+        Calculator.__init__(self, **kwargs)
+
+        # Load model if needed
+        if model is None and model_path is not None:
+            from slakonet.optim import MultiElementSkfParameterOptimizer
+
+            print(f"🔄 Loading model from {model_path}...")
+            model = MultiElementSkfParameterOptimizer.load_ultra_compact_lazy(
+                model_path, elements_needed=elements_needed
+            )
+        elif model is None:
+            raise ValueError("Either model or model_path must be provided")
+
+        # ✅ PREPARE MODEL ONCE AT INITIALIZATION
+        self.model = model.to(device).float()
+        self.model.eval()
+
+        # Store other settings
+        self.model_path = model_path
+        self.elements_needed = elements_needed
+        self.kpoints_array = kpoints_array
+        self.device = device
+        self.compute_forces = compute_forces
+        self.alpha = alpha
+        self.beta = beta
+
+    def calculate(
+        self,
+        atoms=None,
+        properties=["energy", "forces", "bandgap", "eigenvalues", "results"],
+        system_changes=all_changes,
+    ):
+        Calculator.calculate(self, atoms, properties, system_changes)
+
+        # ✅ Use pre-prepared model (no loading/moving/converting here)
+        result = run_calc(
+            ase_atoms=atoms,
+            model=self.model,  # Pass the already-prepared model
+            model_path=None,  # Don't reload
+            device=self.device,
+            kpoints_array=self.kpoints_array,
+            compute_forces=self.compute_forces,
+            alpha=self.alpha,
+            beta=self.beta,
+            elements_needed=None,  # Already filtered at init
+        )
+
+        # Extract results
+        self.results["energy"] = result["energy"].detach().cpu().numpy().item()
+        self.results["result"] = result
+
+        if "forces" in properties:
+            forces = result["forces"].detach().cpu().numpy()
+            self.results["forces"] = forces.reshape(-1, 3)
+
         if "fermi_energy" in result:
             self.results["fermi_energy"] = (
                 result["fermi_energy"].detach().cpu().numpy().item()

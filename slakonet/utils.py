@@ -822,7 +822,7 @@ def choose_eigensolve_strategy(
         return "sparse_occupied"
 
 
-def eighb(h_k, s_k, scheme="chol"):
+def eighb_5434(h_k, s_k, scheme="chol"):
     """
     Memory-optimized eigensolve with automatic fallback strategies.
 
@@ -967,7 +967,7 @@ def eighb_memory_efficient(h_k, s_k, n_electrons=None):
         return eighb(h_k, s_k, scheme="chol")
 
 
-def eighb_4394(h_k, s_k, scheme="chol"):
+def eighb(h_k, s_k, scheme="chol"):
     """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
     eps = 1e-8
     device = h_k.device

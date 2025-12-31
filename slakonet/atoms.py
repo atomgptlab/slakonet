@@ -166,13 +166,25 @@ class Periodic:
         ):
             # Create 1D arrays
             x = torch.arange(
-                iran[0, 0], iran[1, 0] + 1, device=device, dtype=torch.float32
+                iran[0, 0].item(),
+                iran[1, 0].item() + 1,
+                device=device,
+                dtype=torch.float32,
+                # iran[0, 0], iran[1, 0] + 1, device=device, dtype=torch.float32
             )
             y = torch.arange(
-                iran[0, 1], iran[1, 1] + 1, device=device, dtype=torch.float32
+                iran[0, 1].item(),
+                iran[1, 1].item() + 1,
+                device=device,
+                dtype=torch.float32,
+                # iran[0, 1], iran[1, 1] + 1, device=device, dtype=torch.float32
             )
             z = torch.arange(
-                iran[0, 2], iran[1, 2] + 1, device=device, dtype=torch.float32
+                iran[0, 2].item(),
+                iran[1, 2].item() + 1,
+                device=device,
+                dtype=torch.float32,
+                # iran[0, 2], iran[1, 2] + 1, device=device, dtype=torch.float32
             )
 
             # Meshgrid is MUCH faster than nested repeats
