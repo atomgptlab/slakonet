@@ -271,38 +271,24 @@ class SimpleDftb:
                 if eigenvecs is not None:
                     eigenvecs = eigenvecs.to(torch.complex64)
 
-            # Fermi occupation
-            occ, _ = fermi(eigenvals, self.nelectron.to(self.device))
+            """
+            # ===== CRITICAL FIX: Normalize eigenvectors =====
+            if eigenvecs is not None:
+                # Compute norms: <c|S|c> for each eigenvector
+                if eigenvecs.is_complex():
+                    # norms[i] = sqrt(<c_i|S|c_i>)
+                    norms = torch.sqrt(
+                        torch.sum(eigenvecs.conj() * (s_k @ eigenvecs), dim=0).real
+                    )
+                else:
+                    norms = torch.sqrt(
+                        torch.sum(eigenvecs * (s_k @ eigenvecs), dim=0)
+                    )
 
-            eigenvalues_list.append(eigenvals)
-            eigenvecs_list.append(eigenvecs)
-            occupations_list.append(occ)
-
-        # Stack and convert to eV
-        eigenvalues = torch.stack(eigenvalues_list, dim=1) * self.H2E
-        eigenvectors = (
-            torch.stack(eigenvecs_list, dim=1)
-            if self.with_eigenvectors
-            else None
-        )
-        occupations = torch.stack(occupations_list, dim=1)
-
-        return eigenvalues, eigenvectors, occupations
-
-    def _solve_eigenvalue_problem_old(self, H, S):
-        """Solve H*c = E*S*c for all k-points."""
-        n_kpoints = self.max_nk.item()
-        eigenvalues_list = []
-        eigenvecs_list = []
-        occupations_list = []
-
-        for ik in range(n_kpoints):
-            h_k = H[..., ik]
-            s_k = S[..., ik]
-
-            # Solve generalized eigenvalue problem
-            eigenvals, eigenvecs = eighb(h_k, s_k, scheme="chol")
-
+                # Normalize: c_normalized = c / sqrt(<c|S|c>)
+                eigenvecs = eigenvecs / norms.unsqueeze(0)
+            # ===== End normalization =====
+            """
             # Fermi occupation
             occ, _ = fermi(eigenvals, self.nelectron.to(self.device))
 
@@ -593,6 +579,125 @@ class SimpleDftb:
         print("✅ Charge density calculation complete")
 
         return grid_cart, charge_density
+
+    def _compute_atomic_charges(self, eigenvectors, occupations, S):
+        """
+        Compute atomic charges using direct populations with internal normalization.
+
+        This method is self-contained and handles eigenvector normalization internally,
+        so it works even if eigenvectors from the solver are not normalized.
+
+        For DFTB's tight-binding basis, Löwdin transformation is unnecessary
+        and can introduce errors due to k-point averaging. Direct populations
+        from the properly normalized density matrix work well.
+
+        Parameters
+        ----------
+        eigenvectors : torch.Tensor [batch, n_k, n_bands, n_orbitals]
+            Wavefunction coefficients (may be unnormalized)
+        occupations : torch.Tensor [batch, n_k, n_bands]
+            Occupation numbers (0 to 1)
+        S : torch.Tensor [batch, n_orbitals, n_orbitals, n_k]
+            Overlap matrix at each k-point
+
+        Returns
+        -------
+        atomic_charges : torch.Tensor [batch, n_atoms]
+            Atomic charges (positive = electron deficiency)
+        """
+        nbatch, nkpoints, nbands, norbitals = eigenvectors.shape
+        device = eigenvectors.device
+        dtype = eigenvectors.dtype
+        atomic_nums = self.geometry.atomic_numbers[0]
+
+        # Build density matrix with per-k-point normalization
+        density_matrix = torch.zeros(
+            norbitals, norbitals, dtype=dtype, device=device
+        )
+
+        for ik in range(nkpoints):
+            # Get k-point weight
+            if len(self.k_weights.shape) == 2:
+                weight = self.k_weights[0, ik]
+            else:
+                weight = (
+                    self.k_weights[ik]
+                    if ik < len(self.k_weights)
+                    else torch.tensor(1.0 / nkpoints, device=device)
+                )
+
+            # ===== CRITICAL: Get overlap for THIS k-point =====
+            s_k = S[0, :, :, ik]
+            if s_k.dtype != dtype:
+                s_k = s_k.to(dtype)
+
+            for ib in range(nbands):
+                occ = occupations[0, ik, ib]
+                if occ < 1e-8:
+                    continue
+
+                psi = eigenvectors[0, ik, ib, :]  # [norbitals]
+
+                # ===== NORMALIZE eigenvector with THIS k-point's S =====
+                if psi.is_complex():
+                    norm_squared = (psi.conj() @ s_k @ psi).real
+                else:
+                    norm_squared = psi @ s_k @ psi
+
+                # Check for numerical issues
+                if norm_squared < 1e-10:
+                    continue  # Skip degenerate/zero eigenvector
+
+                norm = torch.sqrt(norm_squared)
+                psi_normalized = psi / norm
+                # ===== End normalization =====
+
+                # Build density matrix with normalized eigenvector
+                if psi_normalized.is_complex():
+                    density_matrix += (
+                        weight
+                        * occ
+                        * torch.outer(psi_normalized, psi_normalized.conj())
+                    )
+                else:
+                    density_matrix += (
+                        weight
+                        * occ
+                        * torch.outer(psi_normalized, psi_normalized)
+                    )
+
+        # Direct populations (no Löwdin transformation needed)
+        if density_matrix.is_complex():
+            orbital_populations = torch.real(torch.diag(density_matrix))
+        else:
+            orbital_populations = torch.diag(density_matrix)
+
+        # Map orbitals to atoms
+        orbital_to_atom = []
+        for iatom, Z in enumerate(atomic_nums):
+            Z_int = Z.item()
+            if Z_int == 0:
+                continue
+            shells = self.shell_dict.get(Z_int, [])
+            num_orbitals = sum(2 * shell + 1 for shell in shells)
+            orbital_to_atom.extend([iatom] * num_orbitals)
+
+        # Sum populations by atom
+        atomic_populations = torch.zeros(len(atomic_nums), device=device)
+        for orb_idx, atom_idx in enumerate(orbital_to_atom):
+            if orb_idx < len(orbital_populations):
+                atomic_populations[atom_idx] += orbital_populations[orb_idx]
+
+        # Compute charges: Q = Z - N
+        atomic_charges = torch.zeros(len(atomic_nums), device=device)
+        for iatom, Z in enumerate(atomic_nums):
+            Z_int = Z.item()
+            if Z_int == 0:
+                continue
+            nuclear_charge = self.electron_lookup[Z_int]
+            atomic_charges[iatom] = nuclear_charge - atomic_populations[iatom]
+
+        return atomic_charges.unsqueeze(0)
 
     def plot_charge_density_slice(
         self, plane="xy", slice_coord=0.5, grid_spacing=0.2
@@ -1258,9 +1363,20 @@ class SimpleDftb:
         if self.include_HS:
             self._results["hamiltonian"] = H
             self._results["overlap"] = S
+        print("self.with_eigenvectors", self.with_eigenvectors)
         if self.with_eigenvectors:
             self._results["eigenvectors"] = eigenvectors
-
+            """
+            atomic_charges_mulliken = self._compute_mulliken_charges_debug(
+            #atomic_charges_mulliken = self._compute_mulliken_charges(
+                eigenvectors, occupations, S
+            )
+            """
+            atomic_charges = self._compute_atomic_charges(
+                eigenvectors, occupations, S
+            )
+            charge_data = {"charges": atomic_charges}
+            self._results.update(charge_data)
         return self._results
 
     # Properties for easy access
@@ -1337,6 +1453,7 @@ def run_calc(
     beta=0.1,
     elements_needed=None,
     updated_skfs=None,  # NEW
+    with_eigenvectors=False,
 ):
     if model is None:
         if model_path is None:
@@ -1420,6 +1537,7 @@ class SlakoNetCalculator(Calculator):
     implemented_properties = [
         "energy",
         "forces",
+        "stress",
         "bandgap",
         "eigenvalues",
         "fermi_energy",
@@ -1439,6 +1557,7 @@ class SlakoNetCalculator(Calculator):
         compute_forces=True,
         elements_needed=None,
         use_cached_model=True,
+        with_eigenvectors=False,
         **kwargs,
     ):
         """
@@ -1490,6 +1609,7 @@ class SlakoNetCalculator(Calculator):
         self.compute_forces = compute_forces
         self.alpha = alpha
         self.beta = beta
+        self.with_eigenvectors = with_eigenvectors
 
         # Initialize with elements if provided
         self.elements_needed = None
@@ -1648,6 +1768,7 @@ class SlakoNetCalculator(Calculator):
             alpha=self.alpha,
             beta=self.beta,
             device=self.device,
+            with_eigenvectors=self.with_eigenvectors,
         )
 
         result = calc.calculate()
