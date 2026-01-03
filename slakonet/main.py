@@ -72,6 +72,7 @@ class SimpleDftb:
         alpha=0.1,
         beta=0.1,
         updated_skfs=None,
+        fermi_surface=False,
         # shell_dict=None,
         # h_feed=None,
         # s_feed=None,
@@ -127,6 +128,7 @@ class SimpleDftb:
         self._results = None
         self.alpha = alpha
         self.beta = beta
+        self.fermi_surface = fermi_surface
 
     def calculate_dos(
         self,
@@ -353,20 +355,42 @@ class SimpleDftb:
             mask_pair = mask_i & mask_j
 
             # Only non-zero distances
-            mask_nonzero = dist_mat.gt(1e-8)
-            mask = mask_pair & mask_nonzero
+            mask_nonzero = dist_mat.gt(0.2)
+            # mask_nonzero = dist_mat.gt(1e-8)
+            r_cutoff = skf.r_spline.cutoff  # *0.529
+            mask_cutoff = dist_mat < (r_cutoff / 0.529)
+            mask = mask_pair & mask_nonzero & mask_cutoff
+            # mask = mask_pair & mask_nonzero
 
             if not mask.any():
                 continue
 
-            d_masked = dist_mat[mask]
+            if mask.any():
+                d_masked = dist_mat[mask] * 0.529
+                print(f"\n{element_pair}:")
+                print(f"  Min distance: {d_masked.min():.3f} Å")
+                print(f"  Max distance: {d_masked.max():.3f} Å")
+                print(f"  Number of pairs: {len(d_masked)}")
+                print(f"  Cutoff: {r_cutoff:.3f} Å")
+
+            # After computing pair_energy:
+
+            # Before the computation:
+            for pair, skf in self.updated_skfs.items():
+                if skf.r_spline:
+                    print(f"\n{pair} SKF:")
+                    print(
+                        f"  Grid range: {skf.r_spline.grid.min():.3f} to {skf.r_spline.grid.max():.3f}"
+                    )
+                    print(f"  Cutoff: {skf.r_spline.cutoff:.3f}")
+                    print(f"  Exp coef: {skf.r_spline.exp_coef}")
+                    print(f"  Tail coef: {skf.r_spline.tail_coef}")
 
             # Get grid and coefficients
-            r_cutoff = skf.r_spline.cutoff  # *2
-            grid = skf.r_spline.grid.to(self.device)  # *2
-            exp_coef = skf.r_spline.exp_coef.to(self.device) * 27.211
-            spline_coef = skf.r_spline.spline_coef.to(self.device) * 27.211
-            tail_coef = skf.r_spline.tail_coef.to(self.device) * 27.211
+            grid = skf.r_spline.grid.to(self.device)  # *0.529  # *2
+            exp_coef = skf.r_spline.exp_coef.to(self.device)  # * 27.211
+            spline_coef = skf.r_spline.spline_coef.to(self.device)  # * 27.211
+            tail_coef = skf.r_spline.tail_coef.to(self.device)  # * 27.211
 
             # Distance-based region masks (mutually exclusive!)
             in_tail = (d_masked >= grid[0]) & (d_masked <= grid[1])
@@ -415,6 +439,11 @@ class SimpleDftb:
                     torch.exp(-exp_coef[0] * d_exp + exp_coef[1]) + exp_coef[2]
                 )
 
+            if pair_energy.abs().max() > 10:  # Flag if any single pair > 10 eV
+                print(f"  WARNING: Large repulsive energy detected!")
+                print(f"  Max pair energy: {pair_energy.max():.2f} eV")
+                print(f"  Min pair energy: {pair_energy.min():.2f} eV")
+            # d_masked = dist_mat[mask]*0.529
             # Accumulate (0.5 to avoid double counting)
             total_rep_energy += 0.5 * pair_energy.sum()
 
@@ -1036,6 +1065,286 @@ class SimpleDftb:
 
         return results
 
+    def get_fermi_surface(
+        self,
+        band_indices=None,
+        nk=50,
+        fermi_energy=None,
+        energy_tolerance=0.05,
+        plot=True,
+        save_path=None,
+    ):
+        """
+        Calculate and visualize Fermi surface for specified bands
+
+        Args:
+            band_indices: List of band indices to plot (None = auto-detect bands crossing E_F)
+            nk: Number of k-points per direction for mesh
+            fermi_energy: Fermi level in eV (None = use self._results["fermi_energy"])
+            energy_tolerance: Energy window around E_F to consider (eV)
+            plot: Whether to generate 3D visualization
+            save_path: Path to save the figure
+
+        Returns:
+            Dictionary containing Fermi surface data and metrics
+        """
+        import numpy as np
+        from scipy.interpolate import griddata
+
+        # Step 1: Get Fermi level from results
+        # if fermi_energy is None:
+        if self._results is None:
+            self.calculate()
+        print(f"Using Fermi level from results: eV")
+        fermi_energy = self._results["fermi_energy"]
+        print(f"Using Fermi level from results:  eV", fermi_energy)
+
+        # Step 2: Generate dense k-point mesh in first Brillouin zone
+        kx = np.linspace(-0.5, 0.5, nk)
+        ky = np.linspace(-0.5, 0.5, nk)
+        kz = np.linspace(-0.5, 0.5, nk)
+        kpoints = np.array(np.meshgrid(kx, ky, kz, indexing="ij"))
+        kpoints_flat = kpoints.reshape(3, -1).T
+        print(" kpoints", kpoints)
+        print("kpoints_flat", kpoints_flat)
+        # Step 3: Calculate band energies at all k-points
+        print(f"Calculating bands at {len(kpoints_flat)} k-points...")
+        all_bands = []
+
+        for i, kpt in enumerate(kpoints_flat):
+            if i % 10000 == 0:
+                print(f"Progress: {i}/{len(kpoints_flat)}")
+
+            eigenvals = self.solve_kpoint(kpt)
+            all_bands.append(eigenvals)
+
+        all_bands = np.array(all_bands)  # Shape: (n_kpts, n_bands)
+
+        # Step 4: Identify bands crossing Fermi level
+        if band_indices is None:
+            band_indices = []
+            for band_idx in range(all_bands.shape[1]):
+                band_energies = all_bands[:, band_idx]
+                if band_energies.min() < fermi_energy < band_energies.max():
+                    band_indices.append(band_idx)
+            print(
+                f"Found {len(band_indices)} bands crossing Fermi level: {band_indices}"
+            )
+
+        if len(band_indices) == 0:
+            print(
+                "Warning: No bands cross the Fermi level. Material may be an insulator."
+            )
+            return None
+
+        # Step 5: Extract Fermi surface data for each band
+        fermi_surfaces = {}
+
+        for band_idx in band_indices:
+            band_energies = all_bands[:, band_idx].reshape(nk, nk, nk)
+
+            # Classify as hole or electron pocket
+            center_energy = band_energies[nk // 2, nk // 2, nk // 2]
+            fs_type = "hole" if center_energy < fermi_energy else "electron"
+
+            fermi_surfaces[band_idx] = {
+                "energies": band_energies,
+                "type": fs_type,
+                "kpoints": kpoints,
+            }
+
+        # Step 6: Calculate Fermi surface metrics
+        metrics = self._calculate_fermi_metrics(
+            fermi_surfaces, fermi_energy, kpoints
+        )
+
+        # Step 7: Visualization
+        if plot:
+            self._plot_fermi_surfaces(
+                fermi_surfaces, fermi_energy, energy_tolerance, save_path
+            )
+
+        return {
+            "fermi_surfaces": fermi_surfaces,
+            "fermi_energy": fermi_energy,
+            "band_indices": band_indices,
+            "metrics": metrics,
+            "grid_shape": (nk, nk, nk),
+        }
+
+    def _calculate_fermi_metrics(self, fermi_surfaces, fermi_energy, kpoints):
+        """Calculate properties from Fermi surface"""
+        import numpy as np
+
+        metrics = {}
+
+        for band_idx, fs_data in fermi_surfaces.items():
+            energies = fs_data["energies"]
+
+            # Estimate Fermi surface area (number of points near E_F)
+            near_fermi = np.abs(energies - fermi_energy) < 0.05
+            surface_points = np.sum(near_fermi)
+
+            # Calculate approximate effective mass from band curvature
+            # Take central finite difference
+            nk = energies.shape[0]
+            center = nk // 2
+
+            if center > 1 and center < nk - 1:
+                # Second derivative in kx direction
+                d2E_dkx2 = (
+                    energies[center + 1, center, center]
+                    + energies[center - 1, center, center]
+                    - 2 * energies[center, center, center]
+                )
+
+                # Effective mass: m* = ℏ²/(d²E/dk²)
+                hbar_eV_s = 6.582119569e-16  # eV·s
+                dk = 1.0 / nk  # in reciprocal lattice units
+
+                if abs(d2E_dkx2) > 1e-6:
+                    m_star = hbar_eV_s**2 / (d2E_dkx2 / dk**2)
+                    m_star_ratio = m_star / 9.109e-31  # ratio to electron mass
+                else:
+                    m_star_ratio = None
+            else:
+                m_star_ratio = None
+
+            metrics[f"band_{band_idx}"] = {
+                "type": fs_data["type"],
+                "surface_points": int(surface_points),
+                "effective_mass_ratio": m_star_ratio,
+            }
+
+        return metrics
+
+    def _plot_fermi_surfaces(
+        self, fermi_surfaces, fermi_energy, energy_tolerance, save_path
+    ):
+        """Generate 3D visualization of Fermi surfaces"""
+        try:
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D
+            from skimage import measure
+        except ImportError:
+            print("Warning: matplotlib and scikit-image required for plotting")
+            return
+
+        n_bands = len(fermi_surfaces)
+        fig = plt.figure(figsize=(6 * n_bands, 6))
+
+        # Color schemes
+        hole_colors = [
+            "#FFD700",
+            "#FFA500",
+            "#FF8C00",
+        ]  # Gold/Orange for holes
+        electron_colors = [
+            "#000000",
+            "#FFA500",
+            "#FFD700",
+        ]  # Black/Orange for electrons
+
+        for idx, (band_idx, fs_data) in enumerate(fermi_surfaces.items()):
+            ax = fig.add_subplot(1, n_bands, idx + 1, projection="3d")
+
+            energies = fs_data["energies"]
+            kpoints = fs_data["kpoints"]
+            fs_type = fs_data["type"]
+
+            # Create isosurface at Fermi energy using marching cubes
+            try:
+                verts, faces, normals, values = measure.marching_cubes(
+                    energies,
+                    level=fermi_energy,
+                    spacing=(1.0 / energies.shape[0],) * 3,
+                )
+
+                # Transform to k-space coordinates (-0.5 to 0.5)
+                verts = verts - 0.5
+
+                # Plot the surface
+                colors = hole_colors if fs_type == "hole" else electron_colors
+
+                ax.plot_trisurf(
+                    verts[:, 0],
+                    verts[:, 1],
+                    verts[:, 2],
+                    triangles=faces,
+                    cmap="YlOrRd" if fs_type == "hole" else "binary",
+                    alpha=0.8,
+                    edgecolor="none",
+                    shade=True,
+                )
+
+                # Draw Brillouin zone boundary (cube)
+                self._draw_brillouin_zone(ax)
+
+                ax.set_xlabel("$k_x$ (2π/a)", fontsize=12)
+                ax.set_ylabel("$k_y$ (2π/a)", fontsize=12)
+                ax.set_zlabel("$k_z$ (2π/a)", fontsize=12)
+                ax.set_title(
+                    f"Band number: {band_idx+1}\nFermi surface type: {fs_type}",
+                    fontsize=14,
+                    color="blue",
+                )
+
+                # Set equal aspect ratio
+                ax.set_box_aspect([1, 1, 1])
+                ax.set_xlim([-0.5, 0.5])
+                ax.set_ylim([-0.5, 0.5])
+                ax.set_zlim([-0.5, 0.5])
+
+            except Exception as e:
+                print(
+                    f"Could not generate isosurface for band {band_idx}: {e}"
+                )
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"Saved Fermi surface plot to {save_path}")
+
+        plt.show()
+
+    def _draw_brillouin_zone(self, ax, color="gray", alpha=0.3):
+        """Draw first Brillouin zone boundary (cubic)"""
+        import numpy as np
+
+        # Define cube vertices
+        r = 0.5
+        vertices = [
+            [-r, -r, -r],
+            [r, -r, -r],
+            [r, r, -r],
+            [-r, r, -r],  # bottom
+            [-r, -r, r],
+            [r, -r, r],
+            [r, r, r],
+            [-r, r, r],  # top
+        ]
+
+        # Define edges
+        edges = [
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 0],  # bottom face
+            [4, 5],
+            [5, 6],
+            [6, 7],
+            [7, 4],  # top face
+            [0, 4],
+            [1, 5],
+            [2, 6],
+            [3, 7],  # vertical edges
+        ]
+
+        for edge in edges:
+            points = np.array([vertices[edge[0]], vertices[edge[1]]])
+            ax.plot3D(*points.T, color=color, alpha=alpha, linewidth=1)
+
     def _plot_band_offset(
         self,
         positions,
@@ -1216,7 +1525,7 @@ class SimpleDftb:
         )
 
         if self.repulsive:
-            potential_energy = self._compute_repulsive_energy() * self.H2E
+            potential_energy = self._compute_repulsive_energy()  # * self.H2E
             total_energy = self.alpha * electronic_energy + potential_energy
             print("potential_energy", potential_energy)
             print("electronic_energy", electronic_energy)
@@ -1359,11 +1668,16 @@ class SimpleDftb:
         else:
             dos_data = {}
         self._results.update(dos_data)
+
         # Store results
         if self.include_HS:
             self._results["hamiltonian"] = H
             self._results["overlap"] = S
-        print("self.with_eigenvectors", self.with_eigenvectors)
+        # print("self.with_eigenvectors", self.with_eigenvectors)
+        if self.fermi_surface:
+            print("get_fermi_surface", "HERE")
+            self.get_fermi_surface()
+
         if self.with_eigenvectors:
             self._results["eigenvectors"] = eigenvectors
             """
