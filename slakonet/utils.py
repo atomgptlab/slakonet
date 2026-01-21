@@ -975,7 +975,7 @@ def eighb(h_k, s_k, scheme="chol"):
     n = h_k.shape[-1]
 
     eye = torch.eye(n, device=device, dtype=dtype)
-    s_k_reg = s_k  # + eps * eye  # Optional regularization
+    s_k_reg = s_k + eps * eye  # Optional regularization
 
     if scheme == "chol":
         try:
