@@ -3277,6 +3277,41 @@ def default_model_old(dir_path=None, model_name="slakonet_v0"):
         return model
 
 
+def get_hamiltonian(jarvis_atoms=None, kpts=[1, 4, 4], model=None):
+
+    geometry = Geometry.from_ase_atoms([jarvis_atoms.ase_converter()])
+
+    geometry.positions.requires_grad_(False)
+
+    calc = SimpleDftb(
+        geometry,
+        kpoints=torch.tensor(kpts),
+        model=model,
+        compute_forces=False,
+        include_dos_data=False,
+    )
+    calc.calculate()
+
+    # Extract matrices
+    H = calc.hamiltonian[..., 0].squeeze()
+    S = calc.overlap[..., 0].squeeze()
+
+    # Convert to real (handle complex from k-points)
+    if torch.is_complex(H):
+        H = H.real
+    if torch.is_complex(S):
+        S = S.real
+
+    E_F = calc.fermi_energy.item()
+    gap = calc.bandgap.item()
+
+    # Print info
+
+    print(f"     E_F:        {E_F:.4f} eV")
+    print(f"     Band gap:   {gap:.4f} eV")
+    return H, S, E_F, gap
+
+
 # """
 if __name__ == "__main__":
     # Run multi-VASP training example

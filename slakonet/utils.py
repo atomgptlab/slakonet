@@ -6,6 +6,7 @@ from functools import reduce, partial
 from typing import Optional, Any, Tuple, List, Union
 from collections import namedtuple
 import torch
+from jarvis.core.atoms import Atoms
 
 # from tbmalt.common import bool_like
 Tensor = torch.Tensor
@@ -1417,3 +1418,120 @@ def generate_shell_dict_upto_Z65():
         else:  # lanthanides
             shell_dict[Z] = [0, 1, 2, 3]
     return shell_dict
+
+
+def rotate_atoms(atoms=[], index_1=0, index_2=2):
+    """Rotate structure."""
+    # x,y,z : 0,1,2
+    lat_mat = atoms.lattice_mat
+    coords = atoms.frac_coords
+    elements = atoms.elements
+    props = atoms.props
+    tmp = lat_mat.copy()
+    tmp[index_2] = lat_mat[index_1]
+    tmp[index_1] = lat_mat[index_2]
+    lat_mat = tmp
+    tmp = coords.copy()
+    tmp[:, index_2] = coords[:, index_1]
+    tmp[:, index_1] = coords[:, index_2]
+    coords = tmp
+    atoms = Atoms(
+        lattice_mat=lat_mat,
+        coords=coords,
+        elements=elements,
+        cartesian=False,
+        props=props,
+    )
+    return atoms
+
+
+def divide_atoms_left_right(combined=[], indx=0, lead_ratio=0.15):
+    # combined=sanitize_atoms(combined)
+    a = combined.lattice.abc[0]
+    coords = combined.frac_coords % 1
+    # print('coords2',coords)
+    lattice_mat = combined.lattice_mat
+    elements = np.array(combined.elements)
+    props = np.array(combined.props)
+    coords_left = coords[coords[:, indx] < lead_ratio]
+    elements_left = elements[coords[:, indx] < lead_ratio]
+    props_left = props[coords[:, indx] < lead_ratio]
+    # elements_left=['Xe' for i in range(len(elements_left))]
+    atoms_left = Atoms(
+        lattice_mat=lattice_mat,
+        elements=elements_left,
+        coords=coords_left,
+        cartesian=False,
+        # props=props_left
+    )
+
+    coords_right = coords[coords[:, indx] > 1 - lead_ratio]
+    elements_right = elements[coords[:, indx] > 1 - lead_ratio]
+    # elements_right=['Ar' for i in range(len(elements_left))]
+    props_right = props[coords[:, indx] > 1 - lead_ratio]
+    atoms_right = Atoms(
+        lattice_mat=lattice_mat,
+        elements=elements_right,
+        coords=coords_right,
+        cartesian=False,
+        # props=props_right
+    )
+
+    coords_middle = coords[
+        (coords[:, indx] <= 1 - lead_ratio) & (coords[:, indx] >= lead_ratio)
+    ]
+    elements_middle = elements[
+        (coords[:, indx] <= 1 - lead_ratio) & (coords[:, indx] >= lead_ratio)
+    ]
+    props_middle = props[
+        (coords[:, indx] <= 1 - lead_ratio) & (coords[:, indx] >= lead_ratio)
+    ]
+    atoms_middle = Atoms(
+        lattice_mat=lattice_mat,
+        elements=elements_middle,
+        coords=coords_middle,
+        cartesian=False,
+        # props=props_middle
+    )
+    # atoms_left = atoms_left.center(axis=indx, vacuum=1.0)
+    # atoms_right = atoms_right.center(axis=indx, vacuum=1.0)
+    # atoms_middle = atoms_middle.center(axis=indx, vacuum=1.0)
+    info = {}
+    info["atoms_left"] = atoms_left
+    info["atoms_right"] = atoms_right
+    info["atoms_middle"] = atoms_middle
+    info["combined"] = combined
+    print("Submit calc")
+    return info
+
+
+# Create perfect periodic carbon chain
+def create_carbon_chain(n_atoms=12, cc_spacing=1.6, vacuum=10.0):
+    """
+    Create perfect periodic carbon chain.
+
+    n_atoms: number of atoms in unit cell
+    cc_spacing: C-C distance in Angstroms
+    vacuum: vacuum in x and y directions
+    """
+    # Chain length (with one spacing for periodicity)
+    chain_length = n_atoms * cc_spacing
+
+    # Z-coordinates
+    z_coords = np.arange(n_atoms) * cc_spacing
+
+    # Build structure
+    lattice_mat = np.array(
+        [[vacuum, 0, 0], [0, vacuum, 0], [0, 0, chain_length]]
+    )
+
+    coords = np.column_stack([np.zeros(n_atoms), np.zeros(n_atoms), z_coords])
+
+    atoms = Atoms(
+        lattice_mat=lattice_mat,
+        coords=coords,
+        elements=["C"] * n_atoms,
+        cartesian=True,
+    )
+
+    return atoms
