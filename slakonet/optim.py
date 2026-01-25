@@ -3016,6 +3016,180 @@ def analyze_multi_vasp_performance(
 
 def default_model(dir_path=None, model_name="slakonet_v0"):
     """
+    Load or download the SlakoNet model with proper Figshare handling
+    """
+    if dir_path is None:
+        dir_path = str(os.path.join(os.path.dirname(__file__), model_name))
+    dir_path = os.path.abspath(dir_path)
+
+    # Check for cached .pt file first
+    cached_model_file = os.path.join(dir_path, f"{model_name}.pt")
+    if os.path.exists(cached_model_file):
+        print(f"Loading cached model from {cached_model_file}")
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+            cached_model_file
+        )
+        model.eval()
+        model = model.float()
+        return model
+
+    # Check if zip file already exists
+    zip_file = os.path.join(dir_path, f"{model_name}.zip")
+    if os.path.exists(zip_file):
+        print(f"Found existing zip file: {zip_file}")
+        with zipfile.ZipFile(zip_file, "r") as zf:
+            pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+            if not pt_files:
+                raise FileNotFoundError(f"No .pt file found in {zip_file}")
+
+            with zf.open(pt_files[0]) as model_file:
+                model_data = model_file.read()
+
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+
+            with open(cached_model_file, "wb") as cache_file:
+                cache_file.write(model_data)
+
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+            cached_model_file
+        )
+        model.eval()
+        model = model.float()
+        return model
+
+    # Download from Figshare - use ndownloader subdomain
+    url = "https://ndownloader.figshare.com/files/57945370"
+    # url="https://figshare.com/ndownloader/files/57945370"
+    print(f"Downloading {model_name} model from Figshare...")
+
+    # Create directory if needed
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+
+    # Download with progress bar
+    response = requests.get(url, stream=True)
+    total_size_in_bytes = int(response.headers.get("content-length", 0))
+    block_size = 1024  # 1 Kibibyte
+    progress_bar = tqdm(total=total_size_in_bytes, unit="iB", unit_scale=True)
+
+    with open(zip_file, "wb") as file:
+        for data in response.iter_content(block_size):
+            progress_bar.update(len(data))
+            file.write(data)
+    progress_bar.close()
+
+    print(f"Saved zip file: {zip_file}")
+
+    # Extract .pt file from zip
+    print("Extracting model file...")
+    with zipfile.ZipFile(zip_file, "r") as zf:
+        pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+        if not pt_files:
+            raise FileNotFoundError("No .pt file found in downloaded zip")
+
+        with zf.open(pt_files[0]) as model_file:
+            model_data = model_file.read()
+
+        with open(cached_model_file, "wb") as cache_file:
+            cache_file.write(model_data)
+
+    print(f"Extracted model to: {cached_model_file}")
+
+    # Load the model
+    model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+        cached_model_file
+    )
+    model.eval()
+    model = model.float()
+
+    return model
+
+
+def default_model_new(dir_path=None, model_name="slakonet_v0"):
+    """
+    More direct version - modify load function to accept BytesIO
+    """
+    if dir_path is None:
+        dir_path = str(os.path.join(os.path.dirname(__file__), model_name))
+    dir_path = os.path.abspath(dir_path)
+
+    # Check for cached .pt file first (extracted from previous run)
+    cached_model_file = os.path.join(dir_path, f"{model_name}.pt")
+    if os.path.exists(cached_model_file):
+        print(f"Loading cached model from {cached_model_file}")
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+            cached_model_file
+        )
+        model.eval()
+        model = model.float()
+        return model
+
+    # Check if zip file already exists
+    zip_file = os.path.join(dir_path, f"{model_name}.zip")
+    if os.path.exists(zip_file):
+        print(f"Found existing zip file: {zip_file}")
+        with zipfile.ZipFile(zip_file, "r") as zf:
+            pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+            if not pt_files:
+                raise FileNotFoundError(f"No .pt file found in {zip_file}")
+
+            with zf.open(pt_files[0]) as model_file:
+                model_data = model_file.read()
+
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+            with open(cached_model_file, "wb") as cache_file:
+                cache_file.write(model_data)
+
+            model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+                cached_model_file
+            )
+            model = model.float()
+            return model
+
+    # Download the file
+    url = "https://figshare.com/ndownloader/files/57945370"
+    print(f"Downloading {model_name} model...")
+
+    # Simple download - no streaming
+    response = requests.get(url)
+    print(f"Response status: {response.status_code}")
+    print(f"Downloaded {len(response.content)} bytes")
+
+    if len(response.content) == 0:
+        raise RuntimeError("Downloaded file is empty")
+
+    # Save and extract
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+
+    # Save zip file
+    with open(zip_file, "wb") as f:
+        f.write(response.content)
+
+    # Extract .pt file
+    with zipfile.ZipFile(zip_file, "r") as zf:
+        pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+        if not pt_files:
+            raise FileNotFoundError("No .pt file found in downloaded zip")
+
+        with zf.open(pt_files[0]) as model_file:
+            model_data = model_file.read()
+
+        with open(cached_model_file, "wb") as cache_file:
+            cache_file.write(model_data)
+
+    # Load the model
+    model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+        cached_model_file
+    )
+    model = model.float()
+    return model
+
+
+def default_model_old(dir_path=None, model_name="slakonet_v0"):
+    """
     More direct version - modify load function to accept BytesIO
     """
     if dir_path is None:
