@@ -1416,7 +1416,8 @@ def generate_shell_dict_upto_Z65():
         elif Z <= 57:  # Cs, Ba, La
             shell_dict[Z] = [0, 1, 2]
         else:  # lanthanides
-            shell_dict[Z] = [0, 1, 2, 3]
+            shell_dict[Z] = [0, 1, 2]
+            # shell_dict[Z] = [0, 1, 2, 3]
     return shell_dict
 
 
