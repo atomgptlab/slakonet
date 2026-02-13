@@ -17,6 +17,8 @@ from jarvis.io.vasp.inputs import Poscar
 import argparse
 import sys
 import time
+from jarvis.db.jsonutils import dumpjson
+import pprint
 
 plt.rcParams.update({"font.size": 14})
 H2E = 27.211
@@ -382,6 +384,7 @@ def plot_band_dos_atoms(
         jid=jid, model=model, atoms=atoms
     )
     properties["model"] = model
+    info = {}
 
     if filename is None:
         filename = "slakonet_out.png"
@@ -400,6 +403,13 @@ def plot_band_dos_atoms(
     formula = atoms.composition.reduced_formula
     bandgap = float(properties["bandgap"].detach().cpu().numpy())
     print(f"Bandgap: {bandgap:.3f} eV")
+    cbm = float(properties["cbm"].detach().cpu().numpy())
+    print(f"CBM: {cbm:.3f} eV")
+    vbm = float(properties["vbm"].detach().cpu().numpy())
+    print(f"VBM: {vbm:.3f} eV")
+    info["cbm"] = cbm
+    info["vbm"] = vbm
+    info["atoms"] = atoms.to_dict()
 
     # Geometry for PDOS
     geometry = properties["geometry"]
@@ -412,7 +422,8 @@ def plot_band_dos_atoms(
     # K-point labels
     labels = kpoints.labels
     xticks, xtick_labels = _format_kpath_ticks(labels)
-
+    info["xticks"] = xticks
+    info["xtick_labels"] = xtick_labels
     # --- Plotting (constrained layout to avoid tight_layout warnings) ---
     fig = plt.figure(figsize=(10, 5), layout="constrained")
     gs = fig.add_gridspec(nrows=1, ncols=3, width_ratios=[3, 1, 1.5])
@@ -425,7 +436,7 @@ def plot_band_dos_atoms(
     for i in range(eigenvalues.shape[-1]):
         y = eigenvalues[0, :, i].real  # Already referenced to Fermi
         ax1.plot(y, linewidth=0.8)
-
+    info["eigenvalues"] = eigenvalues[0, :, i].real.tolist()
     ax1.axhline(0, linestyle="--", alpha=0.7)
     ax1.set_xlabel("k-point")
     ax1.set_ylabel("Energy (eV)")
@@ -449,7 +460,9 @@ def plot_band_dos_atoms(
         .cpu()
         .numpy()  # Already referenced to Fermi
     )
+    info["dos_energies"] = dos_energies.tolist()
     dos_values = properties["dos_values_tensor"].detach().cpu().numpy()
+    info["dos_values"] = dos_values.tolist()
     ax2.plot(dos_values, dos_energies, linewidth=1.5)
     ax2.axhline(0, linestyle="--", alpha=0.7)
     ax2.set_xlabel("Total DOS")
@@ -457,7 +470,7 @@ def plot_band_dos_atoms(
     ax2.set_title("(b)")
     ax2.grid(True, alpha=0.3)
     ax2.tick_params(left=False, labelleft=False)
-
+    # info['atom_pdos']=atom_pdos
     # Atom-projected DOS: already referenced to Fermi
     for atom in unique_atoms:
         ax3.plot(
@@ -485,7 +498,8 @@ def plot_band_dos_atoms(
 
     print(f"Gap: {bandgap:.3f} eV (Fermi level at E = 0)")
     # print(f"Atom types: {unique_atoms}")
-
+    # pprint.pprint(info)
+    dumpjson(data=info, filename="results.json")
     return fig, properties, atom_pdos, energy_grid
 
 
