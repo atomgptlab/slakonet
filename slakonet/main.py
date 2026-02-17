@@ -2159,6 +2159,8 @@ class SimpleDftb:
             "forces": forces,
             "stress": stress,
             "bandgap": bandgap,
+            "cbm": cbm_val,
+            "vbm": vbm_val,
             "occupations": occupations,
             "geometry": self.geometry,
             "basis": self.basis,
