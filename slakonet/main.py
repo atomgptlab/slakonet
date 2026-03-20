@@ -176,48 +176,6 @@ class SimpleDftb:
 
         return shell_dict
 
-    def X_generate_shell_dict_from_skfs(self):
-        """Generate shell dict from the actual loaded SKFs, covering all elements."""
-        from jarvis.core.specie import Specie
-
-        # Start with the standard Z<=65 dict
-        shell_dict = generate_shell_dict_upto_Z65()
-
-        # Extend with any elements beyond Z=65 present in the model
-        for pair_key, skf in self.updated_skfs.items():
-            for symbol in pair_key.split("-"):
-                Z = Specie(symbol).Z
-                if Z not in shell_dict:
-                    skf_dict = skf.to_dict()
-                    # Extract shells from atomic_data occupations
-                    # e.g. Bi: [s, p, d] shells
-                    if "atomic_data" in skf_dict and skf_dict["atomic_data"]:
-                        occ = skf_dict["atomic_data"].get("occupations", [])
-                        # Infer shell angular momenta from number of occupation entries
-                        # Standard DFTB: s=1, p=3, d=5, f=7 orbitals
-                        shells = self._infer_shells_from_occupations(
-                            occ, symbol
-                        )
-                        shell_dict[Z] = shells
-        return shell_dict
-
-    def _infer_shells_from_occupations(self, occupations, symbol):
-        """Infer angular momentum list from occupation count."""
-        # Typical DFTB shells by row:
-        # Row 5 elements (Bi Z=83, Te Z=52): s, p, d
-        from jarvis.core.specie import Specie
-
-        Z = Specie(symbol).Z
-        # Default mappings for heavy elements
-        heavy_element_shells = {
-            # Row 5: In, Sn, Sb, Te (Z=49-52), I (Z=53), ...
-            # Row 6: Tl (Z=81), Pb (Z=82), Bi (Z=83)
-        }
-        # Most common: s+p+d for post-transition metals
-        if Z > 65:
-            return [0, 1, 2]  # s, p, d
-        return [0, 1]  # fallback s, p
-
     def calculate_dos(
         self,
         energy_range=(-10, 5),
