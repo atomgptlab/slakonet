@@ -27,9 +27,11 @@ class SlakoNetConfig(BaseSettings):
     early_stopping_patience: int = 20
 
     # Loss configuration
-    target_property: str = "forces"  # "energy", "forces", "bandgap", or "both"
+    target_property: str = (
+        "bandgap"  # "energy", "forces", "bandgap", or "both"
+    )
     # target_property: str = "bandgap"  # "energy", "forces", "bandgap", or "both"
-    force_weight: float = 0.1
+    force_weight: float = 0.0
     energy_weight: float = 1.0
     bandgap_weight: float = 1.0
 

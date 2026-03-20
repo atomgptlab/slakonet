@@ -94,10 +94,12 @@ class SimpleDftb:
         self.include_dos_data = include_dos_data
         self.include_HS = include_HS
         # Setup basis and feeds
-        self.shell_dict = generate_shell_dict_upto_Z65()
-        self.basis = Basis(self.geometry.atomic_numbers, self.shell_dict)
+        # self.shell_dict = generate_shell_dict_upto_Z65()
+
         # Use provided SKFs or get from model
         self.updated_skfs = self.model.get_updated_skfs()
+        self.shell_dict = self._generate_shell_dict_from_skfs()
+        self.basis = Basis(self.geometry.atomic_numbers, self.shell_dict)
         """
         if updated_skfs is not None:
             self.updated_skfs = updated_skfs
@@ -132,6 +134,89 @@ class SimpleDftb:
         self.alpha = alpha
         self.beta = beta
         self.fermi_surface = fermi_surface
+
+    def _generate_shell_dict_from_skfs(self):
+        """
+        Build shell_dict entirely from the loaded SKFs — no hardcoded Z<=65 fallback.
+        Shells are inferred from the occupation count in each SKF's atomic_data.
+        """
+        from jarvis.core.specie import Specie
+
+        shell_dict = {}
+
+        for pair_key, skf in self.updated_skfs.items():
+            elem1, elem2 = pair_key.split("-")
+
+            for symbol in [elem1, elem2]:
+                Z = Specie(symbol).Z
+
+                if Z in shell_dict:
+                    continue  # already resolved
+
+                skf_dict = skf.to_dict()
+                atomic_data = skf_dict.get("atomic_data", {})
+                occ = atomic_data.get("occupations", []) if atomic_data else []
+                n = len(occ)
+
+                shells = []
+                remaining = n
+                for l, size in [(0, 1), (1, 3), (2, 5), (3, 7)]:
+                    if remaining <= 0:
+                        break
+                    if remaining >= size:
+                        shells.append(l)
+                        remaining -= size
+
+                if not shells:
+                    # print(f"  WARNING: Could not infer shells for {symbol} (Z={Z}), occ={occ}. Defaulting to [0,1].")
+                    shells = [0, 1]
+
+                # print(f"  shell_dict[{Z}] ({symbol}): {n} occupations → shells {shells}")
+                shell_dict[Z] = shells
+
+        return shell_dict
+
+    def X_generate_shell_dict_from_skfs(self):
+        """Generate shell dict from the actual loaded SKFs, covering all elements."""
+        from jarvis.core.specie import Specie
+
+        # Start with the standard Z<=65 dict
+        shell_dict = generate_shell_dict_upto_Z65()
+
+        # Extend with any elements beyond Z=65 present in the model
+        for pair_key, skf in self.updated_skfs.items():
+            for symbol in pair_key.split("-"):
+                Z = Specie(symbol).Z
+                if Z not in shell_dict:
+                    skf_dict = skf.to_dict()
+                    # Extract shells from atomic_data occupations
+                    # e.g. Bi: [s, p, d] shells
+                    if "atomic_data" in skf_dict and skf_dict["atomic_data"]:
+                        occ = skf_dict["atomic_data"].get("occupations", [])
+                        # Infer shell angular momenta from number of occupation entries
+                        # Standard DFTB: s=1, p=3, d=5, f=7 orbitals
+                        shells = self._infer_shells_from_occupations(
+                            occ, symbol
+                        )
+                        shell_dict[Z] = shells
+        return shell_dict
+
+    def _infer_shells_from_occupations(self, occupations, symbol):
+        """Infer angular momentum list from occupation count."""
+        # Typical DFTB shells by row:
+        # Row 5 elements (Bi Z=83, Te Z=52): s, p, d
+        from jarvis.core.specie import Specie
+
+        Z = Specie(symbol).Z
+        # Default mappings for heavy elements
+        heavy_element_shells = {
+            # Row 5: In, Sn, Sb, Te (Z=49-52), I (Z=53), ...
+            # Row 6: Tl (Z=81), Pb (Z=82), Bi (Z=83)
+        }
+        # Most common: s+p+d for post-transition metals
+        if Z > 65:
+            return [0, 1, 2]  # s, p, d
+        return [0, 1]  # fallback s, p
 
     def calculate_dos(
         self,

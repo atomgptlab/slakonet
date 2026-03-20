@@ -483,7 +483,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
                     if param_type in ["h_params", "s_params"]:
                         pair_params[pair_key][param_type][param_name] = value
-        print(f"⏱️  Parameter grouping took: {time.time()-t4:.2f}s")
+        # print(f"⏱️  Parameter grouping took: {time.time()-t4:.2f}s")
 
         # 5. Create optimizers
         t5 = time.time()
@@ -957,7 +957,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         instance.atomic_num_to_symbol = dict(zip(zz, z))
 
         # OPTIMIZATION 1: Pre-group state_dict by pair_key
-        print("Grouping parameters by pair...")
+        # print("Grouping parameters by pair...")
         t_group_start = time.time()
 
         pair_params = {}
@@ -978,10 +978,10 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                     if param_type in ["h_params", "s_params"]:
                         pair_params[pair_key][param_type][param_name] = value
 
-        print(f"Parameter grouping took: {time.time() - t_group_start:.2f}s")
+        # print(f"Parameter grouping took: {time.time() - t_group_start:.2f}s")
 
         # OPTIMIZATION 2: Batch create optimizers
-        print(f"Creating {len(metadata['available_pairs'])} SKF optimizers...")
+        # print(f"Creating {len(metadata['available_pairs'])} SKF optimizers...")
         t_create_start = time.time()
 
         instance.skf_optimizers = nn.ModuleDict()
@@ -1035,12 +1035,12 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
             instance.skf_optimizers[pair_key] = optimizer
 
-        print(f"Optimizer creation took: {time.time() - t_create_start:.2f}s")
+        # print(f"Optimizer creation took: {time.time() - t_create_start:.2f}s")
 
         # Load state dict
         t_state_start = time.time()
         instance.load_state_dict(state_dict)
-        print(f"State dict loading took: {time.time() - t_state_start:.2f}s")
+        # print(f"State dict loading took: {time.time() - t_state_start:.2f}s")
 
         t2 = time.time()
 
@@ -2513,7 +2513,7 @@ def train_multi_vasp_skf_parameters(
     weight_by_system_size=True,
     early_stopping_patience=20,
     target_property="both",  # "energy", "forces", "bandgap", or "both"
-    force_weight=0.1,
+    force_weight=0.0,
     energy_weight=1.0,
     bandgap_weight=1.0,
     device="cuda",
@@ -2620,7 +2620,7 @@ def train_multi_vasp_skf_parameters(
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     for epoch in range(num_epochs):
-        print("EPOCHHHH", epoch)
+        print("EPOCH", epoch)
         t1 = time.time()
         optimizer.zero_grad()
 
