@@ -23,6 +23,7 @@ class SlakoNetConfig(BaseSettings):
     plot_frequency: int = 5
     weight_by_system_size: bool = True
     early_stopping_patience: int = 20
+    pairwise_cutoff_length: float = 7
 
 
 H2E = 27.211
@@ -64,4 +65,5 @@ if __name__ == "__main__":
         save_directory=config.save_directory,
         weight_by_system_size=config.weight_by_system_size,
         early_stopping_patience=config.early_stopping_patience,
+        pairwise_cutoff_length=config.pairwise_cutoff_length
     )

@@ -14,18 +14,34 @@ Accurate and efficient prediction of electronic band structures is essential for
 - **Comprehensive properties**: Predicts band structures, DOS, band gaps, and orbital projections
 
 ## Installation
-
-
+Install via pip:
 ```bash
 pip install slakonet
 ```
 
-or
+Or create a conda environment and install SlaKoNet in editable mode. To do so, first, install miniforge https://github.com/conda-forge/miniforge. For example: 
 
-```bash
+```
+wget "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+```
+
+Based on your system requirements, you'll get a file something like 'Miniforge3-XYZ'.
+
+```
+bash Miniforge3-$(uname)-$(uname -m).sh
+```
+
+Now, make a conda environment:
+
+```
+conda create --name slakonet python=3.10 -y
+conda activate slakonet
+```
+
+```
 git clone https://github.com/atomgptlab/slakonet.git
 cd slakonet
-pip install -e .
+pip install uv; uv pip install -e .
 ```
 
 ## Quick Start
@@ -43,7 +59,7 @@ python slakonet/train_slakonet.py --config_name slakonet/examples/config_example
 ### Example of Inference
 
 ```bash
-python slakonet/predict_slakonet.py  --file_path slakonet/examples/POSCAR-JVASP-107.vasp
+python slakonet/predict_slakonet.py  --file_path slakonet/examples/POSCAR-JVASP-107.vasp --pairwise_cutoff_length=2
 ```
 
 ![SlakoNet output](https://github.com/atomgptlab/slakonet/blob/main/slakonet/examples/slakonet_bands_dos.png)

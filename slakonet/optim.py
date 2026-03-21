@@ -972,6 +972,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         get_bulk_mod=False,
         device=None,
         with_eigenvectors=False,
+        pairwise_cutoff_length=7,
     ):
         """Compute DFTB properties for multi-element systems using ALL available optimizers"""
         if device is None:
@@ -1001,6 +1002,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 nelectron=nelectron,
                 device=device,
                 with_eigenvectors=with_eigenvectors,
+                pairwise_cutoff_length=pairwise_cutoff_length,
             )
         else:
             calc = SimpleDftb(
@@ -1012,6 +1014,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 nelectron=nelectron,
                 device=device,
                 with_eigenvectors=with_eigenvectors,
+                pairwise_cutoff_length=pairwise_cutoff_length,
             )
 
         # Compute properties
@@ -1597,6 +1600,7 @@ def train_multi_vasp_skf_parameters(
     save_directory="multi_vasp_optimization_all",
     weight_by_system_size=True,
     early_stopping_patience=20,
+    pairwise_cutoff_length=7,
 ):
     """
     Enhanced training function for multiple VASP datasets
@@ -1612,6 +1616,7 @@ def train_multi_vasp_skf_parameters(
         save_directory: Directory to save results
         weight_by_system_size: Weight loss by number of atoms
         early_stopping_patience: Stop if no improvement for this many epochs
+        pairwise_cutoff_length: Maximim length for pairwise interactions measured in ANGSTROMS
     """
 
     os.makedirs(save_directory, exist_ok=True)
@@ -1696,7 +1701,8 @@ def train_multi_vasp_skf_parameters(
                         geometry=dataset["geometry"],
                         shell_dict=shell_dict,
                         klines=klines,
-                        # dataset["geometry"], shell_dict, kpoints
+                        # dataset["geometry"], shell_dict, kpoints,
+                        pairwise_cutoff_length=pairwise_cutoff_length,
                     )
                 )
 
@@ -1880,6 +1886,7 @@ def multi_vasp_training(
     num_epochs=2,
     batch_size=None,
     save_directory="slakonet_universal",
+    pairwise_cutoff_length=7,
 ):
     """Example demonstrating training on multiple VASP calculations"""
 
@@ -1901,6 +1908,7 @@ def multi_vasp_training(
         save_directory=save_directory,
         weight_by_system_size=True,
         early_stopping_patience=20,
+        pairwise_cutoff_length=pairwise_cutoff_length,
     )
 
     print("\n✅ Multi-VASP training completed successfully!")
@@ -1911,7 +1919,7 @@ def multi_vasp_training(
 
 # Additional utility functions
 def analyze_multi_vasp_performance(
-    data_loader, trained_optimizer, save_directory
+    data_loader, trained_optimizer, save_directory, pairwise_cutoff_length=7
 ):
     """Analyze performance across different systems"""
 
@@ -1930,7 +1938,8 @@ def analyze_multi_vasp_performance(
             # Compute properties
             properties, success = (
                 trained_optimizer.compute_multi_element_properties(
-                    dataset["geometry"], shell_dict, kpoints
+                    dataset["geometry"], shell_dict, kpoints,
+                    pairwise_cutoff_length=pairwise_cutoff_length,
                 )
             )
 
