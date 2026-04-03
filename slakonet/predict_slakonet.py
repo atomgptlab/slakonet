@@ -31,6 +31,13 @@ parser.add_argument(
     help="Provide model path ",
 )
 parser.add_argument(
+    "--pairwise_cutoff_length",
+    type=float,
+    required=True,
+    help="Maximum length for pairwise interactions measured in Angstroms",
+)
+
+parser.add_argument(
     "--file_format", default="poscar", help="poscar/cif/xyz/pdb file format."
 )
 parser.add_argument(
@@ -69,7 +76,7 @@ def load_trained_model(model_path, method="compact"):
     return model
 
 
-def get_properties(jid="", model=None, atoms=None, dataset=None):
+def get_properties(jid="", model=None, atoms=None, dataset=None, pairwise_cutoff_length=None):
     if atoms is None:
         atoms, opt_gap, mbj_gap = get_atoms(jid=jid, dataset=dataset)
     if model is None:
@@ -88,6 +95,7 @@ def get_properties(jid="", model=None, atoms=None, dataset=None):
             get_fermi=True,
             with_eigenvectors=True,
             device=device,
+            pairwise_cutoff_length=pairwise_cutoff_length,
         )
     if not success:
         raise RuntimeError("Failed to compute properties")
@@ -375,13 +383,17 @@ def plot_band_dos_atoms(
     model_path="slakonet_v0",
     energy_range=(-10, 10),
     filename=None,
+    pairwise_cutoff_length=None,
 ):
     if not model:
         model = load_trained_model(model_path)
         model = model.float()
     # print("MODEL PATHHHHH", model_path)
     properties, atoms, kpoints = get_properties(
-        jid=jid, model=model, atoms=atoms
+        jid=jid,
+        model=model,
+        atoms=atoms,
+        pairwise_cutoff_length=pairwise_cutoff_length
     )
     properties["model"] = model
     info = {}
@@ -516,6 +528,7 @@ if __name__ == "__main__":
     file_path = args.file_path
     file_format = args.file_format
     output_filename = args.output_filename
+    pairwise_cutoff_length = args.pairwise_cutoff_length
     energy_range = np.array(args.energy_range.split(" "), dtype="float")
     jid = args.jid
 
@@ -542,6 +555,7 @@ if __name__ == "__main__":
         jid=jid,
         energy_range=energy_range,
         filename=output_filename,
+        pairwise_cutoff_length = args.pairwise_cutoff_length,
     )
     t2 = time.time()
     print("Time(s)", t2 - t1)
