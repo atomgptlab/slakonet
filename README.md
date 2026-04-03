@@ -59,7 +59,7 @@ python slakonet/train_slakonet.py --config_name slakonet/examples/config_example
 ### Example of Inference
 
 ```bash
-python slakonet/predict_slakonet.py  --file_path slakonet/examples/POSCAR-JVASP-107.vasp --pairwise_cutoff_length=2
+python slakonet/predict_slakonet.py  --file_path slakonet/examples/POSCAR-JVASP-107.vasp 
 ```
 
 ![SlakoNet output](https://github.com/atomgptlab/slakonet/blob/main/slakonet/examples/slakonet_bands_dos.png)

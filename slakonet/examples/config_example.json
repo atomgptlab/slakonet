@@ -8,6 +8,6 @@
   "plot_frequency": 3,
   "weight_by_system_size": true,
   "early_stopping_patience": 20,
-  "pairwise_cutoff_length": 6
+  "cutoff": 10
 }
 

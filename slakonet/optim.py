@@ -1507,6 +1507,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         get_bulk_mod=False,
         device=None,
         with_eigenvectors=False,
+        cutoff=10.0,
     ):
         """Compute DFTB properties for multi-element systems using ALL available optimizers"""
         if device is None:
@@ -1538,6 +1539,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 device=device,
                 compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
+                cutoff=cutoff,
             )
         else:
             calc = SimpleDftb(
@@ -1551,6 +1553,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 model=self,
                 compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
+                cutoff=cutoff,
             )
 
         # Compute properties
@@ -2517,6 +2520,7 @@ def train_multi_vasp_skf_parameters(
     energy_weight=1.0,
     bandgap_weight=1.0,
     device="cuda",
+    cutoff=10.0,
 ):
     """
     Enhanced training function for multiple VASP datasets with flexible loss targets
@@ -2656,6 +2660,7 @@ def train_multi_vasp_skf_parameters(
                     kpoints=kpoints,
                     get_forces=True,
                     device=device,
+                    cutoff=cutoff,
                 )
             )
             print(f"    Properties computed, success={success}")

@@ -34,6 +34,7 @@ class SlakoNetConfig(BaseSettings):
     force_weight: float = 0.0
     energy_weight: float = 1.0
     bandgap_weight: float = 1.0
+    cutoff: float = 10.0
 
 
 H2E = 27.211
@@ -104,6 +105,7 @@ if __name__ == "__main__":
         force_weight=config.force_weight,
         energy_weight=config.energy_weight,
         bandgap_weight=config.bandgap_weight,
+        cutoff=config.cutoff,
     )
 
     print("\n✅ Training completed successfully!")
