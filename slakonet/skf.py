@@ -352,6 +352,114 @@ class Skf:
             **init_kwargs,
         )
 
+    def to_skf(self, path: str):
+
+        def t2a(t):
+            """Converts a torch tensor to numpy array."""
+            return t.detach().cpu().numpy()
+
+        def a2s(a, f):
+            """Converts a numpy array into a formatted string."""
+            # Slow but easy way to convert array to string
+            if a.ndim == 1:
+                return "".join(f"{j:{f}}" for j in a)
+            else:
+                return "\n".join([a2s(j, f) for j in a])
+
+        # Used for working out array lengths later on
+        max_l = max(max(self.hamiltonian)[0], 2)
+
+        # Build the first line defining the integral data's grid.
+        # Format: {grid step size} {number of grid points}
+        grid_n = len(self.grid)
+        grid_step = self.grid.diff()[0]
+        output = f"{grid_step:<12.8f}{grid_n:>5}"
+
+        # Parse the atomic data into a string.
+        # Format: {on site terms} {SPE} {hubbard u values} {occupancies}
+        if self.atomic:
+            # Care must be taken when parsing atomic data ase some elements of
+            # these arrays may have been culled at read time.
+            homo = np.zeros((max_l + 1) * 3)  # Parse in standard atomic data
+            for n, i in enumerate(
+                [self.occupations, self.hubbard_us, self.on_sites]
+            ):
+                homo[(start := (max_l + 1) * n) : start + len(i)] = t2a(i)
+            # Add dummy SPE value and reverse the array's order
+            homo = np.flip(np.insert(homo, (max_l + 1) * 2, 0.0))
+            # Finally append the homo data to the output string
+            output += "\n" + a2s(homo, ">21.12E")
+
+        # Generate the repulsive polynomial line.
+        # Format {mass} {coefficients} {cutoff} {ZEROS}
+        coef = np.zeros(7) if self.r_poly is None else t2a(self.r_poly.coef)
+        r = np.zeros(1) if self.r_poly is None else t2a(self.r_poly.cutoff)
+        mass = t2a(self.mass) if self.atomic else np.zeros(1)
+        r_poly_data = np.hstack((mass, coef, r, np.zeros(10)))
+
+        output += "\n" + a2s(r_poly_data, ">21.12E")
+
+        # Build HS data
+        ls = range(max_l, -1, -1)
+        lps = [i for i in product(ls, ls) if i[0] <= i[1]]
+        hs_data = np.hstack(
+            [  # Concatenate H & S matrices.
+                np.hstack(  # Collate each integral, adding dummy data as needed.
+                    [
+                        t2a(
+                            torch.atleast_2d(
+                                i.get(l, torch.zeros(l[0], grid_n))
+                            )
+                        ).T
+                        for l in lps
+                    ]
+                )
+                for i in [self.hamiltonian, self.overlap]
+            ]
+        )
+        output += "\n" + a2s(hs_data, ">21.12E")
+
+        # Append the repulsive spline data, is present.
+        if (rs_data := self.r_spline) is not None:
+            grid = rs_data.grid
+            # Header
+            output += "\nSpline"
+            # Grid data: {number of grid points} {cutoff}
+            output += f"\n{len(grid):<5} {rs_data.cutoff:>12.8f}"
+            # Exponential: {coefficients}
+            output += "\n" + a2s(rs_data.exp_coef, ">21.12E")
+            # Primary spline: {from} {to} {coefficients}
+            s_data = t2a(
+                torch.cat(
+                    (
+                        grid[:-1].view(-1, 1),
+                        grid[1:].view(-1, 1),
+                        rs_data.spline_coef,
+                    ),
+                    -1,
+                )
+            )
+            output += "\n" + a2s(s_data, ">21.12E")
+            # Spline tail: {from} {to} {coefficients}
+            print("grid[-1:]", grid[-1:])
+            print("rs_data.cutoff", rs_data.cutoff)
+            print("rs_data.tail_coef", rs_data.tail_coef)
+            tail = t2a(
+                torch.cat(
+                    (
+                        grid[-1:],
+                        torch.tensor([rs_data.cutoff]).reshape(1),
+                        rs_data.tail_coef,
+                    )
+                )
+                # torch.cat((grid[-1:], rs_data.cutoff, rs_data.tail_coef))
+                # torch.cat((grid[-1:], rs_data.cutoff[None], rs_data.tail_coef))
+            )
+            output += "\n" + a2s(tail, ">21.12E")
+
+        # Write the results to the target file
+        open(path, "w").write(output)
+
     def __str__(self) -> str:
         """Returns a string representing the `Skf` object."""
         cls_name = self.__class__.__name__
@@ -423,10 +531,21 @@ def _esr(text: str) -> str:
 
 
 if __name__ == "__main__":
+    # from neuraltb.skf import Skf
     skf_path = "tests/Si-Si.skf"
+    skf_path = "tests/Si-C.skf"
     sk = Skf.from_skf(skf_path)
     print(sk)
     dd = sk.to_dict()
-    print(sk.to_dict())
+    # print(sk.to_dict())
     sk = Skf.from_dict(dd)
+    print(sk)
+    from slakonet.optim import default_model
+
+    model = default_model()
+    sk = model.get_updated_skfs()["Si-Si"]
+    print("sk keys", (sk.keys()))
+    sk.to_skf("pp.skf")
+
+    sk = Skf.from_skf("pp.skf")
     print(sk)

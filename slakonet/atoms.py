@@ -16,6 +16,7 @@ from slakonet.units import length_units
 from slakonet.elements import chemical_symbols
 from slakonet.elements import atomic_numbers as data_numbers
 
+# torch.set_default_dtype(torch.float32)
 Tensor = torch.Tensor
 
 
@@ -140,6 +141,77 @@ class Periodic:
 
         return latvec, cutoff
 
+    def get_cell_translations(self, **kwargs):
+        """Get cell translation vectors - OPTIMIZED."""
+        pos_ext = kwargs.get("positive_extention", 1)
+        neg_ext = kwargs.get("negative_extention", 1)
+
+        device = self.invlatvec.device
+        _tmp = torch.floor(
+            self.cutoff.to(device) * torch.norm(self.invlatvec, dim=-1).T
+        ).T
+
+        ranges = torch.stack([-(neg_ext + _tmp), pos_ext + _tmp])
+        ranges[torch.stack([self.mask_zero, self.mask_zero])] = 0
+
+        leng = ranges[1, :].long() - ranges[0, :].long() + 1
+        ncell = leng[..., 0] * leng[..., 1] * leng[..., 2]
+
+        # VECTORIZED cell vector generation using meshgrid
+        cellvec_list = []
+        rcellvec_list = []
+
+        for ibatch, (ile, iran, ilv) in enumerate(
+            zip(leng, ranges.transpose(1, 0), self.latvec)
+        ):
+            # Create 1D arrays
+            x = torch.arange(
+                iran[0, 0].item(),
+                iran[1, 0].item() + 1,
+                device=device,
+                dtype=torch.float32,
+                # iran[0, 0], iran[1, 0] + 1, device=device, dtype=torch.float32
+            )
+            y = torch.arange(
+                iran[0, 1].item(),
+                iran[1, 1].item() + 1,
+                device=device,
+                dtype=torch.float32,
+                # iran[0, 1], iran[1, 1] + 1, device=device, dtype=torch.float32
+            )
+            z = torch.arange(
+                iran[0, 2].item(),
+                iran[1, 2].item() + 1,
+                device=device,
+                dtype=torch.float32,
+                # iran[0, 2], iran[1, 2] + 1, device=device, dtype=torch.float32
+            )
+
+            # Meshgrid is MUCH faster than nested repeats
+            zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
+
+            # Stack and flatten - shape: [3, n_cells]
+            cellvec_batch = torch.stack(
+                [xx.flatten(), yy.flatten(), zz.flatten()]
+            )
+            cellvec_list.append(cellvec_batch)
+
+            # Compute real-space cell vectors
+            # ilv is [3, 3], cellvec_batch is [3, n_cells]
+            # Result should be [3, n_cells]
+            rcellvec_batch = torch.matmul(ilv.T, cellvec_batch)
+            rcellvec_list.append(rcellvec_batch)
+
+        # Pack expects list of [3, n_cells], outputs [n_batch, 3, n_cells]
+        cellvec = pack(cellvec_list, value=1e3)
+        rcellvec = pack(rcellvec_list, value=1e3)
+
+        # Transpose to match original format: [n_batch, n_cells, 3]
+        cellvec = cellvec.transpose(1, 2)
+        rcellvec = rcellvec.transpose(1, 2)
+
+        return cellvec, rcellvec, ncell
+
     def _positions_check(self):
         """Check positions type (fraction or not) and unit."""
         is_frac = self.geometry.frac_list
@@ -162,25 +234,28 @@ class Periodic:
         )
         self.positions[self.mask_pe] = position_pe
 
-    def get_cell_translations(self, **kwargs):
+    def get_cell_translations_old(self, **kwargs):
         """Get cell translation vectors."""
         pos_ext = kwargs.get("positive_extention", 1)
         neg_ext = kwargs.get("negative_extention", 1)
-
+        # print("self.cutoff",self.cutoff,self.cutoff.device)
+        # print("self.invlatvec,",self.invlatvec.device)
         _tmp = torch.floor(
-            self.cutoff * torch.norm(self.invlatvec, dim=-1).T
+            self.cutoff.to(self.invlatvec.device)
+            * torch.norm(self.invlatvec, dim=-1).T
         ).T
+        # print(" _tmp", _tmp,_tmp.device)
+        device = _tmp.device
         ranges = torch.stack([-(neg_ext + _tmp), pos_ext + _tmp])
-
         # 1D/ 2D cell translation
         ranges[torch.stack([self.mask_zero, self.mask_zero])] = 0
-
         # Length of the first, second and third column in ranges
         leng = ranges[1, :].long() - ranges[0, :].long() + 1
-
         # Number of cells
         ncell = leng[..., 0] * leng[..., 1] * leng[..., 2]
-
+        # print("ncell", ncell,ncell.device)
+        # print(" leng", leng,leng.device)
+        # print("ranges", ranges,ranges.device)
         # Cell translation vectors in relative coordinates
         # Large values are padded at the end of short cell vectors to exceed cutoff distance
         cellvec = pack(
@@ -188,14 +263,16 @@ class Periodic:
                 torch.stack(
                     [
                         torch.linspace(
-                            iran[0, 0], iran[1, 0], ile[0]
+                            iran[0, 0], iran[1, 0], ile[0], device=device
                         ).repeat_interleave(ile[2] * ile[1]),
-                        torch.linspace(iran[0, 1], iran[1, 1], ile[1])
+                        torch.linspace(
+                            iran[0, 1], iran[1, 1], ile[1], device=device
+                        )
                         .repeat(ile[0])
                         .repeat_interleave(ile[2]),
-                        torch.linspace(iran[0, 2], iran[1, 2], ile[2]).repeat(
-                            ile[0] * ile[1]
-                        ),
+                        torch.linspace(
+                            iran[0, 2], iran[1, 2], ile[2], device=device
+                        ).repeat(ile[0] * ile[1]),
                     ]
                 )
                 for ile, iran in zip(leng, ranges.transpose(1, 0))
@@ -215,17 +292,52 @@ class Periodic:
         return cellvec, rcellvec, ncell
 
     def _periodic_distance(self):
+        """Get distances between central cell and neighbour cells - fully vectorized."""
+        mask_central_cell = (self.rcellvec != 0).sum(-1) == 0
+
+        positions = self.rcellvec.unsqueeze(2) + self.positions.unsqueeze(1)
+        size_system = self.atomic_numbers.ne(0).sum(-1)
+
+        positions_vec = -positions.unsqueeze(-3) + self.positions.unsqueeze(
+            1
+        ).unsqueeze(-2)
+
+        eps = 1e-12
+
+        # Fully vectorized distance calculation
+        # positions: [n_batch, n_cells, n_atoms, 3]
+        # Compute: sqrt(sum((pos_cell - pos_central)^2))
+        distance = torch.sqrt(
+            eps + (positions_vec**2).sum(-1)
+        )  # [n_batch, n_cells, n_atoms, n_atoms]
+
+        # If there's padding, mask it
+        if not self.atomic_numbers.ne(0).all():
+            mask = self.atomic_numbers.ne(0)  # [n_batch, n_atoms]
+            distance_mask = ~(
+                mask.unsqueeze(1).unsqueeze(-1)
+                & mask.unsqueeze(1).unsqueeze(-2)
+            )
+            distance = distance.masked_fill(distance_mask, 1e3)
+
+        return mask_central_cell, positions, positions_vec, distance
+
+    def _periodic_distance_old(self):
         """Get distances between central cell and neighbour cells."""
         mask_central_cell = (self.rcellvec != 0).sum(-1) == 0
+        # print("self.positions.",self.positions.device)
+        # print("self.rcellvec",self.rcellvec.device)
         positions = self.rcellvec.unsqueeze(2) + self.positions.unsqueeze(1)
         size_system = self.atomic_numbers.ne(0).sum(-1)
         positions_vec = -positions.unsqueeze(-3) + self.positions.unsqueeze(
             1
         ).unsqueeze(-2)
+        eps = 1e-12
         distance = pack(
             [
                 torch.sqrt(
-                    (
+                    eps
+                    + (
                         (
                             ipos[:, :inat].repeat(1, inat, 1)
                             - torch.repeat_interleave(icp[:inat], inat, 0)
@@ -238,8 +350,9 @@ class Periodic:
                 )
             ],
             value=1e3,
-        )
+        )  # .to(self.rcellvec.device)
 
+        # print('distance',distance,distance.device)
         return mask_central_cell, positions, positions_vec, distance
 
     @property
@@ -252,6 +365,35 @@ class Periodic:
                 tuple(mask.sum(-1)),
             )
         )
+
+    def to(self, device: torch.device) -> "Geometry":
+        """Returns a copy of the `Geometry` instance on the specified device
+
+        This method creates and returns a new copy of the `Geometry` instance
+        on the specified device "``device``".
+
+        Arguments:
+            device: Device to which all associated tensors should be moved.
+
+        Returns:
+            geometry: A copy of the `Geometry` instance placed on the
+                specified device.
+
+        Notes:
+            If the `Geometry` instance is already on the desired device then
+            `self` will be returned.
+        """
+        # Developers Notes: It is imperative that this function gets updated
+        # whenever new attributes are added to the `Geometry` class. Otherwise
+        # this will return an incomplete `Geometry` object.
+        if self.atomic_numbers.device == device:
+            return self
+        else:
+            return self.__class__(
+                self.atomic_numbers.to(device=device),
+                self.positions.to(device=device),
+                self.latvec.to(device=device),
+            )
 
     def supercell(self, idx: Tensor):
 
@@ -307,6 +449,44 @@ class Periodic:
         )
 
     def _neighbourlist(self):
+        """Get distance matrix of neighbour list - OPTIMIZED."""
+        _mask = self.neighbour.any(-1).any(-1)  # [n_batch, n_cells]
+
+        # Check if we can fully vectorize (single batch or uniform mask)
+        if _mask.shape[0] == 1:
+            # Single batch - fully vectorized, no loop needed
+            neighbour_pos = self.positions_pe[0][_mask[0]].unsqueeze(0)
+            neighbour_vec = self.positions_vec[0][_mask[0]].unsqueeze(0)
+            neighbour_dis = self.periodic_distances[0][_mask[0]].unsqueeze(0)
+        else:
+            # Multiple batches - use list comprehension (still faster than old approach)
+            neighbour_pos = pack(
+                [
+                    self.positions_pe[i][_mask[i]]
+                    for i in range(_mask.shape[0])
+                ],
+                value=1e3,
+            )
+
+            neighbour_vec = pack(
+                [
+                    self.positions_vec[i][_mask[i]]
+                    for i in range(_mask.shape[0])
+                ],
+                value=1e3,
+            )
+
+            neighbour_dis = pack(
+                [
+                    self.periodic_distances[i][_mask[i]]
+                    for i in range(_mask.shape[0])
+                ],
+                value=1e3,
+            )
+
+        return neighbour_pos, neighbour_vec, neighbour_dis
+
+    def _neighbourlist_old(self):
         """Get distance matrix of neighbour list according to periodic boundary condition."""
         _mask = self.neighbour.any(-1).any(-1)
         neighbour_pos = pack(
@@ -336,21 +516,26 @@ class Periodic:
     def _inverse_lattice(self):
         """Get inverse lattice vectors."""
         # build a mask for zero vectors in 1D/ 2D lattice vectors
+        # print("self.latvec",self.latvec,self.latvec.device)
         mask_zero = self.latvec.eq(0).all(-1)
         _latvec = self.latvec + torch.diag_embed(
-            mask_zero.type(self.latvec.dtype)
+            mask_zero.type(self.latvec.dtype)  # .to(self.latvec.device)
         )
-
-        # inverse lattice vectors
+        # print("mask_zero",mask_zero,mask_zero.device)
+        # print("_latvec",_latvec,_latvec.device)
         _invlat = torch.transpose(
             torch.linalg.solve(
                 _latvec,
-                torch.eye(_latvec.shape[-1]).repeat(_latvec.shape[0], 1, 1),
+                torch.eye(_latvec.shape[-1], device=mask_zero.device).repeat(
+                    _latvec.shape[0], 1, 1
+                ),
             ),
             -1,
             -2,
         )
+        # print("_invlat1",_invlat,_invlat.device)
         _invlat[mask_zero] = 0
+        # print("_invlat2",_invlat,_invlat.device)
 
         return _invlat, mask_zero
 
@@ -391,7 +576,135 @@ class Periodic:
 
             return self._super_sampling(_kpoints)
 
+    def _super_samplingX(self, _kpoints):
+        """Super sampling."""
+        # Get device from geometry
+        device = (
+            self.geometry.cell.device
+            if hasattr(self.geometry, "cell")
+            and self.geometry.cell is not None
+            else _kpoints.device
+        )
+
+        _n_kpoints = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
+        _n_kpoints = _n_kpoints.to(device)  # Ensure on correct device
+
+        _kpoints_inv = 0.5 / _kpoints
+        _kpoints_inv2 = 1.0 / _kpoints
+        _nkxyz = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
+        n_ind = tuple(_nkxyz)
+        _nkx, _nkyz = _kpoints[..., 0], _kpoints[..., 1] * _kpoints[..., 2]
+        _nky, _nkxz = _kpoints[..., 1], _kpoints[..., 0] * _kpoints[..., 2]
+        _nkz, _nkxy = _kpoints[..., 2], _kpoints[..., 0] * _kpoints[..., 1]
+
+        # create baseline of kpoints, if n_kpoint in x direction is N,
+        # the value will be [0.5 / N] * n_kpoint_x * n_kpoint_y * n_kpoint_z
+        _x_base = torch.repeat_interleave(_kpoints_inv[..., 0], _nkxyz)
+        _y_base = torch.repeat_interleave(_kpoints_inv[..., 1], _nkxyz)
+        _z_base = torch.repeat_interleave(_kpoints_inv[..., 2], _nkxyz)
+
+        # create K-mesh increase in each direction range from 0~1
+        _x_incr = torch.cat(
+            [
+                torch.repeat_interleave(
+                    torch.arange(ii, device=device) * iv, yz
+                )
+                for ii, yz, iv in zip(_nkx, _nkyz, _kpoints_inv2[..., 0])
+            ]
+        )
+        _y_incr = torch.cat(
+            [
+                torch.repeat_interleave(
+                    torch.arange(iy, device=device) * iv, iz
+                ).repeat(ix)
+                for ix, iy, iz, xz, iv in zip(
+                    _nkx, _nky, _nkz, _nkxz, _kpoints_inv2[..., 1]
+                )
+            ]
+        )
+        _z_incr = torch.cat(
+            [
+                (torch.arange(iz, device=device) * iv).repeat(xy)
+                for iz, xy, iv in zip(_nkz, _nkxy, _kpoints_inv2[..., 2])
+            ]
+        )
+
+        all_kpoints = torch.stack(
+            [
+                pack(torch.split((_x_base + _x_incr).unsqueeze(1), n_ind)),
+                pack(torch.split((_y_base + _y_incr).unsqueeze(1), n_ind)),
+                pack(torch.split((_z_base + _z_incr).unsqueeze(1), n_ind)),
+            ]
+        )
+
+        k_weights = pack(
+            torch.split(
+                torch.ones(_n_kpoints.sum(), device=device), tuple(_n_kpoints)
+            )
+        )
+        k_weights = k_weights / _n_kpoints.unsqueeze(-1)
+
+        return all_kpoints.squeeze(-1).permute(1, 2, 0), _n_kpoints, k_weights
+
     def _super_sampling(self, _kpoints):
+        """Super sampling - OPTIMIZED with meshgrid."""
+        # Get device from the first non-None tensor we can find
+        device = (
+            self.invlatvec.device
+            if hasattr(self, "invlatvec")
+            else _kpoints.device
+        )
+
+        _n_kpoints = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
+        _kpoints_inv = 0.5 / _kpoints.to(device)
+        _kpoints_inv2 = 1.0 / _kpoints.to(device)
+
+        # Vectorized k-point generation using meshgrid
+        all_kpoints_list = []
+
+        for ibatch in range(_kpoints.shape[0]):
+            nx, ny, nz = _kpoints[ibatch].long()
+
+            # Create base grid using meshgrid (MUCH faster than repeat/cat)
+            kx = (
+                torch.arange(nx, device=device, dtype=_kpoints.dtype)
+                * _kpoints_inv2[ibatch, 0]
+                + _kpoints_inv[ibatch, 0]
+            )
+            ky = (
+                torch.arange(ny, device=device, dtype=_kpoints.dtype)
+                * _kpoints_inv2[ibatch, 1]
+                + _kpoints_inv[ibatch, 1]
+            )
+            kz = (
+                torch.arange(nz, device=device, dtype=_kpoints.dtype)
+                * _kpoints_inv2[ibatch, 2]
+                + _kpoints_inv[ibatch, 2]
+            )
+
+            # meshgrid creates the full 3D grid
+            kzz, kyy, kxx = torch.meshgrid(kz, ky, kx, indexing="ij")
+
+            # Stack into [n_kpoints, 3]
+            kpoints_batch = torch.stack(
+                [kxx.flatten(), kyy.flatten(), kzz.flatten()], dim=1
+            )
+            all_kpoints_list.append(kpoints_batch)
+
+        # Pack into [n_batch, n_kpoints, 3]
+        all_kpoints = pack(all_kpoints_list)
+
+        # Weights: [n_batch, n_kpoints]
+        k_weights = pack(
+            [
+                torch.ones(nk, device=device, dtype=_kpoints.dtype) / nk
+                for nk in _n_kpoints
+            ]
+        )
+
+        return all_kpoints, _n_kpoints, k_weights
+
+    def _super_sampling_old(self, _kpoints):
         """Super sampling."""
         _n_kpoints = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
         _kpoints_inv = 0.5 / _kpoints
@@ -411,13 +724,19 @@ class Periodic:
         # create K-mesh increase in each direction range from 0~1
         _x_incr = torch.cat(
             [
-                torch.repeat_interleave(torch.arange(ii) * iv, yz)
+                torch.repeat_interleave(
+                    torch.arange(ii, device=yz.device) * iv, yz
+                )
+                # torch.repeat_interleave(torch.arange(ii) * iv, yz)
                 for ii, yz, iv in zip(_nkx, _nkyz, _kpoints_inv2[..., 0])
             ]
         )
         _y_incr = torch.cat(
             [
-                torch.repeat_interleave(torch.arange(iy) * iv, iz).repeat(ix)
+                torch.repeat_interleave(
+                    torch.arange(iy, device=iz.device) * iv, iz
+                ).repeat(ix)
+                # torch.repeat_interleave(torch.arange(iy) * iv, iz).repeat(ix)
                 for ix, iy, iz, xz, iv in zip(
                     _nkx, _nky, _nkz, _nkxz, _kpoints_inv2[..., 1]
                 )
@@ -425,7 +744,8 @@ class Periodic:
         )
         _z_incr = torch.cat(
             [
-                (torch.arange(iz) * iv).repeat(xy)
+                (torch.arange(iz, device=iv.device) * iv).repeat(xy)
+                # (torch.arange(iz) * iv).repeat(xy)
                 for iz, xy, iv in zip(_nkz, _nkxy, _kpoints_inv2[..., 2])
             ]
         )
@@ -441,6 +761,7 @@ class Periodic:
         k_weights = pack(
             torch.split(torch.ones(_n_kpoints.sum()), tuple(_n_kpoints))
         )
+        # print("_n_kpoints.device", _n_kpoints.device)
         k_weights = k_weights / _n_kpoints.unsqueeze(-1)
 
         return all_kpoints.squeeze(-1).permute(1, 2, 0), _n_kpoints, k_weights
@@ -529,6 +850,25 @@ class Periodic:
     def cellvec_neighbour(self):
         """Return cell vector which distances between all atoms in return cell
         and center cell are smaller than cutoff."""
+        _mask = self.neighbour.any(-1).any(-1)  # [n_batch, n_cells]
+
+        # cellvec is now already [n_batch, n_cells, 3] after our optimization
+        # No need to permute before indexing
+        _neighbour_vec = pack(
+            [
+                self.cellvec[ibatch][_mask[ibatch]]
+                for ibatch in range(self.cutoff.size(0))
+            ]
+        )
+
+        # Output should be [n_batch, 3, n_neighbor_cells]
+        # _neighbour_vec is [n_batch, n_neighbor_cells, 3]
+        return _neighbour_vec.permute(0, 2, 1)
+
+    @property
+    def cellvec_neighbour_old(self):
+        """Return cell vector which distances between all atoms in return cell
+        and center cell are smaller than cutoff."""
         _mask = self.neighbour.any(-1).any(-1)
         _cellvec = self.cellvec.permute(0, -1, -2)
         _neighbour_vec = pack(
@@ -543,9 +883,17 @@ class Periodic:
     @property
     def phase(self):
         """Select kpoint for each interactions."""
-        kpoint = 2.0 * np.pi * self.kpoints
-
+        # kpoint = 2.0 * np.pi * self.kpoints
+        device = self.cellvec_neighbour.device
         # shape: [n_batch, n_cell, 3]
+        kpoint = (
+            2.0
+            * np.pi
+            * torch.as_tensor(
+                self.kpoints, dtype=self.cellvec_neighbour.dtype, device=device
+            )
+        )
+
         cell_vec = self.cellvec_neighbour
 
         return pack(
@@ -734,7 +1082,7 @@ class Geometry:
             torch.diagonal(dist, dim1=-2, dim2=-1).zero_()
             return dist
         else:
-            return torch.sqrt((self.updated_dist_vec**2).sum(-1))
+            return torch.sqrt(1e-12 + (self.updated_dist_vec**2).sum(-1))
 
     @property
     def distance_vectors(self) -> Tensor:
@@ -837,7 +1185,7 @@ class Geometry:
 
         positions = self.positions / length_units["angstrom"]
         cells = self.cell / length_units["angstrom"]
-        cell_xyz = torch.sqrt((cells**2).sum(-2)).unsqueeze(-2)
+        cell_xyz = torch.sqrt(1e-12 + (cells**2).sum(-2)).unsqueeze(-2)
         positions = positions / cell_xyz if direct else positions
 
         def write_single(number, position, cell):

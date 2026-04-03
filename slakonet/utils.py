@@ -6,6 +6,7 @@ from functools import reduce, partial
 from typing import Optional, Any, Tuple, List, Union
 from collections import namedtuple
 import torch
+from jarvis.core.atoms import Atoms
 
 # from tbmalt.common import bool_like
 Tensor = torch.Tensor
@@ -582,7 +583,505 @@ def _eig_sort_out(
     return w, v
 
 
-def eighb(
+def eighb_cpu(h_k, s_k, scheme="chol"):
+    """
+    Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with memory optimization.
+
+    Args:
+        h_k: Hamiltonian matrix [batch, n, n] or [n, n]
+        s_k: Overlap matrix [batch, n, n] or [n, n]
+        scheme: 'chol' for Cholesky (faster), 'eigh' for direct solve
+
+    Returns:
+        eigenvals: Eigenvalues [batch, n] or [n]
+        eigenvecs: Eigenvectors [batch, n, n] or [n, n]
+    """
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    # ========================================
+    # Strategy 1: Large systems → CPU
+    # ========================================
+    if n > 10000:
+        print(f"⚠️  Large system (n={n}), using CPU eigensolve")
+        torch.cuda.empty_cache()
+
+        h_k_cpu = h_k.cpu()
+        s_k_cpu = s_k.cpu()
+
+        try:
+            eigenvals, eigenvecs = torch.linalg.eigh(
+                torch.linalg.solve(s_k_cpu, h_k_cpu)
+            )
+            return eigenvals.to(device), eigenvecs.to(device)
+        except Exception as e:
+            print(f"❌ CPU eigensolve failed: {e}")
+            # Try with regularization
+            eps = 1e-8
+            eye = torch.eye(n, device="cpu", dtype=dtype)
+            s_k_reg = s_k_cpu + eps * eye
+            eigenvals, eigenvecs = torch.linalg.eigh(
+                torch.linalg.solve(s_k_reg, h_k_cpu)
+            )
+            return eigenvals.to(device), eigenvecs.to(device)
+
+    # ========================================
+    # Strategy 2: Cholesky decomposition (faster but less stable)
+    # ========================================
+    if scheme == "chol":
+        try:
+            # S = L·L^T (Cholesky decomposition)
+            L = torch.linalg.cholesky(s_k)
+
+            # Transform: L^-1 · H · L^-T
+            L_inv = torch.linalg.inv(L)
+            h_transformed = L_inv @ h_k @ L_inv.transpose(-2, -1)
+
+            # Standard eigenvalue problem
+            eigenvals, eigenvecs_transformed = torch.linalg.eigh(h_transformed)
+
+            # Back-transform eigenvectors: ψ = L^-T · ψ'
+            eigenvecs = L_inv.transpose(-2, -1) @ eigenvecs_transformed
+
+            return eigenvals, eigenvecs
+
+        except RuntimeError as e:
+            if (
+                "cholesky" in str(e).lower()
+                or "out of memory" in str(e).lower()
+            ):
+                print(f"⚠️  Cholesky failed: {e}, falling back to eigh")
+                # Fall through to eigh method
+            else:
+                raise
+
+    # ========================================
+    # Strategy 3: Direct solve (more stable)
+    # ========================================
+    try:
+        # Solve H·ψ = E·S·ψ as (S^-1·H)·ψ = E·ψ
+        eigenvals, eigenvecs = torch.linalg.eigh(torch.linalg.solve(s_k, h_k))
+        return eigenvals, eigenvecs
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            # ========================================
+            # Strategy 4: OOM → CPU fallback
+            # ========================================
+            print(f"⚠️  GPU OOM (n={n}), falling back to CPU")
+            torch.cuda.empty_cache()
+
+            h_k_cpu = h_k.cpu()
+            s_k_cpu = s_k.cpu()
+
+            try:
+                eigenvals, eigenvecs = torch.linalg.eigh(
+                    torch.linalg.solve(s_k_cpu, h_k_cpu)
+                )
+                return eigenvals.to(device), eigenvecs.to(device)
+
+            except Exception as e2:
+                print(f"❌ CPU fallback also failed: {e2}")
+                # Last resort: regularization
+                print("⚠️  Attempting regularization...")
+                eps = 1e-8
+                eye = torch.eye(n, device="cpu", dtype=dtype)
+                s_k_reg = s_k_cpu + eps * eye
+                eigenvals, eigenvecs = torch.linalg.eigh(
+                    torch.linalg.solve(s_k_reg, h_k_cpu)
+                )
+                return eigenvals.to(device), eigenvecs.to(device)
+
+        elif (
+            "singular" in str(e).lower()
+            or "not positive definite" in str(e).lower()
+        ):
+            # ========================================
+            # Strategy 5: Singular matrix → regularization
+            # ========================================
+            print(f"⚠️  Singular matrix detected, adding regularization")
+            eps = 1e-8
+            eye = torch.eye(n, device=device, dtype=dtype)
+            s_k_reg = s_k + eps * eye
+
+            eigenvals, eigenvecs = torch.linalg.eigh(
+                torch.linalg.solve(s_k_reg, h_k)
+            )
+            return eigenvals, eigenvecs
+
+        else:
+            # Unknown error, re-raise
+            raise
+
+
+def eighb_occupied_only(h_k, s_k, n_occupied, scheme="lobpcg"):
+    """
+    Solve for only occupied states (memory-efficient for very large systems).
+
+    Args:
+        h_k: Hamiltonian [n, n]
+        s_k: Overlap [n, n]
+        n_occupied: Number of occupied states to compute
+        scheme: 'lobpcg' (iterative, memory-efficient)
+
+    Returns:
+        eigenvals: [n_occupied] lowest eigenvalues
+        eigenvecs: [n, n_occupied] corresponding eigenvectors
+    """
+    import scipy.sparse.linalg as spla
+
+    n = h_k.shape[-1]
+    device = h_k.device
+
+    # Convert to numpy (scipy requires numpy)
+    h_np = h_k.cpu().numpy()
+    s_np = s_k.cpu().numpy()
+
+    # Use sparse eigensolvers (much more memory efficient)
+    try:
+        # Solve for n_occupied+10 states (with buffer)
+        k = min(n_occupied + 10, n - 2)
+
+        eigenvals, eigenvecs = spla.eigsh(
+            h_np, k=k, M=s_np, which="SA"  # SA = smallest algebraic
+        )
+
+        # Take only the n_occupied lowest
+        eigenvals = eigenvals[:n_occupied]
+        eigenvecs = eigenvecs[:, :n_occupied]
+
+        # Convert back to torch
+        eigenvals = torch.tensor(eigenvals, device=device, dtype=h_k.dtype)
+        eigenvecs = torch.tensor(eigenvecs, device=device, dtype=h_k.dtype)
+
+        return eigenvals, eigenvecs
+
+    except Exception as e:
+        print(f"❌ Sparse eigensolve failed: {e}")
+        print("⚠️  Falling back to full eigensolve")
+        return eighb(h_k, s_k, scheme="chol")
+
+
+def estimate_eigensolve_memory(n_orbitals, dtype=torch.complex128):
+    """
+    Estimate memory required for eigenvalue problem.
+
+    Args:
+        n_orbitals: Number of orbitals
+        dtype: Data type
+
+    Returns:
+        memory_gb: Estimated memory in GB
+    """
+    bytes_per_element = 16 if dtype in [torch.complex128, torch.cfloat] else 8
+
+    # H matrix
+    h_memory = n_orbitals**2 * bytes_per_element
+
+    # S matrix
+    s_memory = n_orbitals**2 * bytes_per_element
+
+    # Workspace for eigensolve (conservative estimate)
+    workspace = 3 * n_orbitals**2 * bytes_per_element
+
+    # Eigenvectors
+    eigenvec_memory = n_orbitals**2 * bytes_per_element
+
+    total_bytes = h_memory + s_memory + workspace + eigenvec_memory
+    total_gb = total_bytes / (1024**3)
+
+    return total_gb
+
+
+def choose_eigensolve_strategy(
+    n_orbitals, n_electrons, available_memory_gb=40
+):
+    """
+    Automatically choose best eigensolve strategy.
+
+    Args:
+        n_orbitals: Number of orbitals
+        n_electrons: Number of electrons (for occupied-only option)
+        available_memory_gb: Available GPU memory
+
+    Returns:
+        strategy: 'gpu_full', 'cpu_full', or 'sparse_occupied'
+    """
+    estimated_memory = estimate_eigensolve_memory(n_orbitals)
+    n_occupied = n_electrons // 2  # Assuming closed shell
+
+    print(
+        f"Eigensolve: n={n_orbitals}, estimated memory={estimated_memory:.1f}GB"
+    )
+
+    if estimated_memory < available_memory_gb * 0.6:
+        return "gpu_full"
+    elif estimated_memory < available_memory_gb * 1.5:
+        return "cpu_full"
+    else:
+        return "sparse_occupied"
+
+
+def eighb_5434(h_k, s_k, scheme="chol"):
+    """
+    Memory-optimized eigensolve with automatic fallback strategies.
+
+    Strategies (in order):
+    1. GPU Cholesky (fastest)
+    2. GPU direct solve
+    3. GPU with memory cleanup
+    4. Give up and raise error (CPU is too slow for large systems)
+    """
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    # ========================================
+    # Strategy 1: GPU Cholesky (fastest)
+    # ========================================
+    if scheme == "chol":
+        try:
+            L = torch.linalg.cholesky(s_k)
+            L_inv = torch.linalg.inv(L)
+            h_transformed = L_inv @ h_k @ L_inv.transpose(-2, -1)
+            eigenvals, eigenvecs_transformed = torch.linalg.eigh(h_transformed)
+            eigenvecs = L_inv.transpose(-2, -1) @ eigenvecs_transformed
+            return eigenvals, eigenvecs
+
+        except RuntimeError as e:
+            error_msg = str(e).lower()
+            if "out of memory" in error_msg:
+                print(f"⚠️  Cholesky OOM (n={n}), trying memory cleanup...")
+                torch.cuda.empty_cache()
+            elif (
+                "cholesky" in error_msg or "not positive definite" in error_msg
+            ):
+                print(
+                    f"⚠️  Cholesky failed (not positive definite), switching to direct solve"
+                )
+            else:
+                raise
+
+    # ========================================
+    # Strategy 2: GPU direct solve
+    # ========================================
+    try:
+        eigenvals, eigenvecs = torch.linalg.eigh(torch.linalg.solve(s_k, h_k))
+        return eigenvals, eigenvecs
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(f"⚠️  GPU OOM on direct solve (n={n})")
+            torch.cuda.empty_cache()
+        else:
+            raise
+
+    # ========================================
+    # Strategy 3: Aggressive memory cleanup + retry
+    # ========================================
+    print(f"⚠️  Attempting aggressive memory cleanup for n={n}...")
+
+    # Move to CPU temporarily to free GPU memory
+    h_k_cpu_temp = h_k.cpu()
+    s_k_cpu_temp = s_k.cpu()
+    del h_k, s_k
+    torch.cuda.empty_cache()
+
+    # Try again on GPU with cleaned memory
+    try:
+        h_k = h_k_cpu_temp.to(device)
+        s_k = s_k_cpu_temp.to(device)
+        del h_k_cpu_temp, s_k_cpu_temp
+
+        eigenvals, eigenvecs = torch.linalg.eigh(torch.linalg.solve(s_k, h_k))
+        return eigenvals, eigenvecs
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(f"❌ GPU memory insufficient even after cleanup")
+            print(f"   Required: ~{(n*n*16)/(1024**3):.1f} GB for matrices")
+            print(f"   System too large for available GPU memory")
+            print(f"   Consider using fewer atoms or CPU eigensolve")
+            torch.cuda.empty_cache()
+            raise MemoryError(
+                f"Cannot solve eigenvalue problem for n={n} on GPU"
+            )
+        else:
+            raise
+
+
+def eighb_memory_efficient(h_k, s_k, n_electrons=None):
+    """
+    Ultra memory-efficient: compute only occupied states using iterative solver.
+    Use this for systems where full eigensolve fails.
+
+    Args:
+        h_k: Hamiltonian [n, n]
+        s_k: Overlap [n, n]
+        n_electrons: Number of electrons (if None, compute all)
+
+    Returns:
+        eigenvals: Eigenvalues (all or occupied only)
+        eigenvecs: Eigenvectors (all or occupied only)
+    """
+    n = h_k.shape[-1]
+    device = h_k.device
+
+    if n_electrons is None or n_electrons >= n:
+        # Need all eigenvalues, use standard method
+        return eighb(h_k, s_k, scheme="chol")
+
+    # Compute only occupied states (much more memory efficient)
+    print(
+        f"⚠️  Using memory-efficient solver: computing {n_electrons//2} of {n} states"
+    )
+
+    try:
+        import scipy.sparse.linalg as spla
+
+        # Move to CPU for scipy
+        h_np = h_k.cpu().numpy()
+        s_np = s_k.cpu().numpy()
+
+        # Number of states to compute (occupied + small buffer)
+        n_states = min(n_electrons // 2 + 20, n - 2)
+
+        # Use sparse eigenvalue solver (memory efficient)
+        eigenvals, eigenvecs = spla.eigsh(
+            h_np,
+            k=n_states,
+            M=s_np,
+            which="SA",  # Smallest algebraic
+            maxiter=1000,
+        )
+
+        # Convert back to torch on original device
+        eigenvals = torch.tensor(eigenvals, device=device, dtype=h_k.dtype)
+        eigenvecs = torch.tensor(eigenvecs, device=device, dtype=h_k.dtype)
+
+        return eigenvals, eigenvecs
+
+    except Exception as e:
+        print(f"❌ Memory-efficient solver failed: {e}")
+        print(f"   Falling back to standard solver...")
+        return eighb(h_k, s_k, scheme="chol")
+
+
+def eighb(h_k, s_k, scheme="chol"):
+    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
+    eps = 1e-8
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    eye = torch.eye(n, device=device, dtype=dtype)
+    s_k_reg = s_k + eps * eye  # Optional regularization
+
+    if scheme == "chol":
+        try:
+            L = torch.linalg.cholesky(s_k_reg)
+            L_inv = torch.linalg.inv(L)
+            H_tilde = L_inv @ h_k @ L_inv.mH
+            eigenvals, eigenvecs_tilde = torch.linalg.eigh(H_tilde)
+            eigenvecs = L_inv.mH @ eigenvecs_tilde
+        except RuntimeError as e:
+            print(f"Cholesky failed: {e}, falling back to eig")
+            eigenvals, eigenvecs = torch.linalg.eig(
+                torch.linalg.solve(s_k_reg, h_k)
+            )
+            eigenvals = eigenvals.real
+    else:
+        # Direct method (more stable)
+        eigenvals, eigenvecs = torch.linalg.eig(
+            torch.linalg.solve(s_k_reg, h_k)
+        )
+        eigenvals = eigenvals.real
+
+    return eigenvals, eigenvecs
+
+
+def eighb_fastest(h_k, s_k, scheme="chol"):
+    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability - OPTIMIZED."""
+
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    try:
+        # Solve generalized eigenvalue problem: H @ v = λ * S @ v
+        # Transform to standard problem: S^(-1) @ H @ v = λ * v
+        # Use solve instead of explicit inverse (more stable)
+
+        # Method 1: Direct solve (most stable for well-conditioned S)
+        eigenvals, eigenvecs = torch.linalg.eig(torch.linalg.solve(s_k, h_k))
+        eigenvals = eigenvals.real
+        eigenvecs = eigenvecs.real
+
+    except RuntimeError as e:
+        # If that fails, add regularization
+        print(f"eig failed: {e}, adding regularization")
+        eps = 1e-7
+        eye = torch.eye(n, device=device, dtype=dtype)
+        s_k_reg = s_k + eps * eye
+
+        eigenvals, eigenvecs = torch.linalg.eig(
+            torch.linalg.solve(s_k_reg, h_k)
+        )
+        eigenvals = eigenvals.real
+        eigenvecs = eigenvecs.real
+
+    return eigenvals, eigenvecs
+
+
+def eighb_old(h_k, s_k, scheme="chol"):
+    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
+
+    # Add regularization to prevent singular matrices
+    eps = 1e-8
+    device = h_k.device
+    dtype = h_k.dtype
+    n = h_k.shape[-1]
+
+    # Regularize overlap matrix
+    eye = torch.eye(n, device=device, dtype=dtype)
+
+    s_k_reg = s_k  # + eps * eye
+
+    if scheme == "chol":
+        try:
+            # Cholesky decomposition: S = L·L†
+            L = torch.linalg.cholesky(s_k_reg)
+
+            # Solve L·L†·C = H·C·E  →  L⁻¹·H·L⁻†·(L†·C) = (L†·C)·E
+            L_inv = torch.linalg.inv(L)
+            H_tilde = L_inv @ h_k @ L_inv.mH  # .mH is Hermitian transpose
+
+            # Standard eigenvalue problem
+            eigenvals, eigenvecs_tilde = torch.linalg.eigh(H_tilde)
+
+            # Transform back: C = L⁻†·C_tilde
+            eigenvecs = L_inv.mH @ eigenvecs_tilde
+
+        except RuntimeError as e:
+            print(f"Cholesky failed: {e}, falling back to eig")
+            # Fall back to direct method
+            eigenvals, eigenvecs = torch.linalg.eig(
+                torch.linalg.solve(s_k_reg, h_k)
+            )
+            eigenvals = eigenvals.real
+
+    else:
+        # Direct method: solve S⁻¹·H
+        eigenvals, eigenvecs = torch.linalg.eig(
+            torch.linalg.solve(s_k_reg, h_k)
+        )
+        eigenvals = eigenvals.real
+
+    return eigenvals, eigenvecs
+
+
+def eighbX(
     a: Tensor,
     b: Tensor = None,
     scheme: Literal["chol", "lowd"] = "chol",
@@ -869,3 +1368,171 @@ def tetrahedral_root(x: Union[Tensor, Real]) -> Union[Tensor, Real]:
     """
     a = (9 * x**2 - (1 / 27)) ** 0.5
     return (3 * x + a) ** (1 / 3) + (3 * x - a) ** (1 / 3) - 1
+
+
+def create_feeds(updated_skfs, shell_dict, integral_type):
+    """Create feed for H or S integrals."""
+    from slakonet.interpolation import PolyInterpU
+    from slakonet.skfeed import (
+        SkfFeed,
+        SkfParamFeed,
+        _get_hs_dict,
+        _get_onsite_dict,
+    )
+
+    interpolator = PolyInterpU
+    hs_dict = {}
+    onsite_hs_dict = {}
+
+    for pair_key, skf in updated_skfs.items():
+        hs_dict = _get_hs_dict(hs_dict, interpolator, skf, integral_type)
+        elements = skf.to_dict()["atom_pair"]
+        if len(elements) >= 2 and elements[0] == elements[1]:
+            onsite_hs_dict = _get_onsite_dict(
+                onsite_hs_dict, skf, shell_dict, integral_type
+            )
+
+    return SkfFeed(hs_dict, onsite_hs_dict, shell_dict)
+
+
+def generate_shell_dict_upto_Z65():
+    """Generate shell_dict for atomic numbers 1-65."""
+    shell_dict = {}
+    for Z in range(1, 100):
+        if Z <= 2:  # H, He
+            shell_dict[Z] = [0]
+        elif Z <= 10:  # Li to Ne
+            shell_dict[Z] = [0, 1]
+        elif Z <= 20:  # Na to Ca
+            shell_dict[Z] = [0, 1]
+        elif Z <= 30:  # Sc to Zn
+            shell_dict[Z] = [0, 1, 2]
+        elif Z <= 36:  # Ga to Kr
+            shell_dict[Z] = [0, 1]
+        elif Z <= 48:  # transition metals
+            shell_dict[Z] = [0, 1, 2]
+        elif Z <= 54:  # In to Xe
+            shell_dict[Z] = [0, 1]
+        elif Z <= 57:  # Cs, Ba, La
+            shell_dict[Z] = [0, 1, 2]
+        else:  # lanthanides
+            shell_dict[Z] = [0, 1, 2]
+            # shell_dict[Z] = [0, 1, 2, 3]
+    return shell_dict
+
+
+def rotate_atoms(atoms=[], index_1=0, index_2=2):
+    """Rotate structure."""
+    # x,y,z : 0,1,2
+    lat_mat = atoms.lattice_mat
+    coords = atoms.frac_coords
+    elements = atoms.elements
+    props = atoms.props
+    tmp = lat_mat.copy()
+    tmp[index_2] = lat_mat[index_1]
+    tmp[index_1] = lat_mat[index_2]
+    lat_mat = tmp
+    tmp = coords.copy()
+    tmp[:, index_2] = coords[:, index_1]
+    tmp[:, index_1] = coords[:, index_2]
+    coords = tmp
+    atoms = Atoms(
+        lattice_mat=lat_mat,
+        coords=coords,
+        elements=elements,
+        cartesian=False,
+        props=props,
+    )
+    return atoms
+
+
+def divide_atoms_left_right(combined=[], indx=0, lead_ratio=0.15):
+    # combined=sanitize_atoms(combined)
+    a = combined.lattice.abc[0]
+    coords = combined.frac_coords % 1
+    # print('coords2',coords)
+    lattice_mat = combined.lattice_mat
+    elements = np.array(combined.elements)
+    props = np.array(combined.props)
+    coords_left = coords[coords[:, indx] < lead_ratio]
+    elements_left = elements[coords[:, indx] < lead_ratio]
+    props_left = props[coords[:, indx] < lead_ratio]
+    # elements_left=['Xe' for i in range(len(elements_left))]
+    atoms_left = Atoms(
+        lattice_mat=lattice_mat,
+        elements=elements_left,
+        coords=coords_left,
+        cartesian=False,
+        # props=props_left
+    )
+
+    coords_right = coords[coords[:, indx] > 1 - lead_ratio]
+    elements_right = elements[coords[:, indx] > 1 - lead_ratio]
+    # elements_right=['Ar' for i in range(len(elements_left))]
+    props_right = props[coords[:, indx] > 1 - lead_ratio]
+    atoms_right = Atoms(
+        lattice_mat=lattice_mat,
+        elements=elements_right,
+        coords=coords_right,
+        cartesian=False,
+        # props=props_right
+    )
+
+    coords_middle = coords[
+        (coords[:, indx] <= 1 - lead_ratio) & (coords[:, indx] >= lead_ratio)
+    ]
+    elements_middle = elements[
+        (coords[:, indx] <= 1 - lead_ratio) & (coords[:, indx] >= lead_ratio)
+    ]
+    props_middle = props[
+        (coords[:, indx] <= 1 - lead_ratio) & (coords[:, indx] >= lead_ratio)
+    ]
+    atoms_middle = Atoms(
+        lattice_mat=lattice_mat,
+        elements=elements_middle,
+        coords=coords_middle,
+        cartesian=False,
+        # props=props_middle
+    )
+    # atoms_left = atoms_left.center(axis=indx, vacuum=1.0)
+    # atoms_right = atoms_right.center(axis=indx, vacuum=1.0)
+    # atoms_middle = atoms_middle.center(axis=indx, vacuum=1.0)
+    info = {}
+    info["atoms_left"] = atoms_left
+    info["atoms_right"] = atoms_right
+    info["atoms_middle"] = atoms_middle
+    info["combined"] = combined
+    print("Submit calc")
+    return info
+
+
+# Create perfect periodic carbon chain
+def create_carbon_chain(n_atoms=12, cc_spacing=1.6, vacuum=10.0):
+    """
+    Create perfect periodic carbon chain.
+
+    n_atoms: number of atoms in unit cell
+    cc_spacing: C-C distance in Angstroms
+    vacuum: vacuum in x and y directions
+    """
+    # Chain length (with one spacing for periodicity)
+    chain_length = n_atoms * cc_spacing
+
+    # Z-coordinates
+    z_coords = np.arange(n_atoms) * cc_spacing
+
+    # Build structure
+    lattice_mat = np.array(
+        [[vacuum, 0, 0], [0, vacuum, 0], [0, 0, chain_length]]
+    )
+
+    coords = np.column_stack([np.zeros(n_atoms), np.zeros(n_atoms), z_coords])
+
+    atoms = Atoms(
+        lattice_mat=lattice_mat,
+        coords=coords,
+        elements=["C"] * n_atoms,
+        cartesian=True,
+    )
+
+    return atoms

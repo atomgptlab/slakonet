@@ -70,7 +70,8 @@ def fermi(eigenvalue: Tensor, nelectron: Tensor, kT=0.0, spin=None):
         occ[singly_occupied_mask] = 1.0
 
         # Calculate number of occupied states
-        nocc = torch.div(nelectron.float(), 2.0).ceil()
+        nocc = torch.div(nelectron, 2.0).ceil()
+        # nocc = torch.div(nelectron.float(), 2.0).ceil()
 
         return occ, nocc
 
@@ -95,9 +96,332 @@ def fermi(eigenvalue: Tensor, nelectron: Tensor, kT=0.0, spin=None):
         occ[occupied_mask] = 1.0
 
         # Calculate number of occupied states
-        nocc = torch.div(nelectron.float(), 2.0).ceil()
+        nocc = torch.div(nelectron, 2.0).ceil()
+        # nocc = torch.div(nelectron.float(), 2.0).ceil()
 
         return occ, nocc
+
+
+def hs_matrix_timing(
+    geometry: Geometry,
+    basis: Basis,
+    sk_feed: SkFeed,
+    train_onsite=None,
+    ml_onsite=None,
+    scale_dict=None,
+    orbital_resolved=False,
+    cutoff=10.0,
+    multi_varible=None,
+    use_sparse=True,  # Disabled by default for now
+) -> Tensor:
+    """Build Hamiltonian or overlap matrix.
+
+    Note: Sparse implementation is experimental. Set use_sparse=False (default)
+    to use the stable dense version.
+    """
+    import time
+
+    t_total = time.time()
+    timings = {}
+
+    # Setup
+    is_periodic = geometry.is_periodic
+    shape_orbs = basis.orbital_matrix_shape
+    g_var = None
+    device = geometry.positions.device
+
+    # Force dense for now (sparse has indexing issues)
+    use_sparse = False
+
+    # Initialize matrix - DENSE ONLY
+    if not is_periodic:
+        mat = torch.zeros(
+            shape_orbs,
+            device=device,
+            dtype=geometry.dtype,
+        )
+    else:
+        n_kpoints = geometry.n_kpoints
+        phase = geometry.phase
+        real_dtype = torch.get_default_dtype()
+
+        if isinstance(n_kpoints, Tensor):
+            n_kpoints = torch.max(n_kpoints)
+
+        dtype = torch.complex128 if phase is not None else real_dtype
+        mat = torch.zeros(
+            *shape_orbs,
+            n_kpoints,
+            device=device,
+            dtype=dtype,
+        )
+
+    # Matrix initialization
+    if not is_periodic:
+        l_mat_f = basis.azimuthal_matrix(mask_diag=True, mask_on_site=True)
+        l_mat_s = basis.azimuthal_matrix("shell", mask_on_site=True)
+    else:
+        l_mat_f = basis.azimuthal_matrix(mask_diag=False, mask_on_site=False)
+        l_mat_s = basis.azimuthal_matrix("shell", mask_on_site=False)
+
+    i_mat_s = basis.index_matrix("shell")
+    i_mat_f = basis.index_matrix("full")
+    an_mat_a = basis.atomic_number_matrix("atomic")
+
+    dist_mat_a = geometry.distances
+    vec_mat_a = -normalize(geometry.distance_vectors, 2, -1)
+
+    # Build mask for l-like distances matrix
+    _, mask_dist_l, mask_dist_s = basis.mask(geometry, cutoff)
+
+    # Define l_pairs
+    l_pairs = [
+        torch.tensor([i, j], device=device)
+        for i in range(4)
+        for j in range(4)
+        if i <= j
+    ]
+
+    # Start profiled loop
+    t0 = time.time()
+    for l_pair in l_pairs:
+
+        # Profile index masking
+        t_mask = time.time()
+
+        # Mask identifying indices
+        if l_pair[0] == l_pair[1]:
+            index_mask_s = torch.nonzero(
+                (l_mat_s == l_pair).all(dim=-1)
+                * (i_mat_s[..., 0] <= i_mat_s[..., 1])
+                * mask_dist_s
+            ).T
+        else:
+            index_mask_s = torch.nonzero(
+                (l_mat_s == l_pair).all(dim=-1) * mask_dist_s
+            ).T
+
+        timings["masking"] = timings.get("masking", 0) + (time.time() - t_mask)
+
+        if len(index_mask_s[0]) == 0:
+            continue
+
+        # Gather from i_mat_s to get the atom index mask
+        index_mask_a = index_mask_s.clone()
+        index_mask_a[-2:] = i_mat_s[tuple(index_mask_s)].T
+
+        # Gather the atomic numbers, distances, and unit vectors
+        atom_pairs_l = an_mat_a[tuple(index_mask_a)]
+
+        if not is_periodic:
+            g_dist = dist_mat_a[tuple(index_mask_a)]
+            g_vecs = vec_mat_a[tuple(index_mask_a)]
+        else:
+            g_dist = dist_mat_a[tuple(index_mask_a)].T
+            g_dist[g_dist.eq(0)] = 99999
+            g_vecs = vec_mat_a.permute(0, 2, 3, 4, 1)[
+                tuple(index_mask_a)
+            ].permute(2, 0, 1)
+            atom_pairs_l = atom_pairs_l.repeat(g_dist.shape[0], 1, 1)
+
+            if multi_varible is not None:
+                g_var = multi_varible.repeat(
+                    g_dist.shape[0], 1, 1, 1, 1
+                ).permute(1, 2, 3, 0, -1)
+                g_var = g_var[tuple(index_mask_a)].transpose(0, 1)
+            else:
+                g_var = None
+
+            if scale_dict is not None:
+                scale = scale_dict[tuple(l_pair.tolist())][
+                    tuple(index_mask_a)
+                ].T
+
+        # Mask the distances
+        mask_dist = g_dist.lt(cutoff) * g_dist.gt(0)
+        if not mask_dist.any():
+            continue
+
+        g_dist = g_dist[mask_dist]
+        g_vecs = g_vecs[mask_dist]
+        atom_pairs_l = atom_pairs_l[mask_dist]
+
+        if multi_varible is not None and is_periodic:
+            g_var = g_var[mask_dist]
+
+        if scale_dict is not None:
+            scale = scale[mask_dist].unsqueeze(-1)
+
+        # gather multi_varible
+        if not is_periodic and multi_varible is not None:
+            g_var = _gether_var(multi_varible, index_mask_a)
+
+        # Profile SK integral gathering
+        t_sk = time.time()
+        integrals = _gather_off_site(
+            atom_pairs_l,
+            l_pair,
+            g_dist,
+            sk_feed,
+            shell_dict=basis.shell_dict,
+            g_var=g_var,
+        )
+        timings["sk_integrals"] = timings.get("sk_integrals", 0) + (
+            time.time() - t_sk
+        )
+
+        if scale_dict is not None:
+            integrals = integrals * scale
+
+        # Profile SK rotation
+        t_rot = time.time()
+        if (l_pair == torch.tensor([0, 0], device=device)).all():
+            sk_data = integrals.unsqueeze(-2)
+        else:
+            sk_data = sub_block_rot(l_pair, g_vecs, integrals)
+        timings["rotation"] = timings.get("rotation", 0) + (
+            time.time() - t_rot
+        )
+
+        # Generate SK data in various K-points
+        if is_periodic:
+            t_phase = time.time()
+
+            mask_img_dist = torch.nonzero(mask_dist)
+            mask_batch = index_mask_a[0][mask_img_dist[..., 1]]
+            mask_atm1 = index_mask_a[1][mask_img_dist[..., 1]]
+            mask_atm2 = index_mask_a[2][mask_img_dist[..., 1]]
+
+            mask_img_dist = (
+                mask_batch,
+                mask_img_dist[..., 0],
+                mask_atm1,
+                mask_atm2,
+            )
+            sk_data = _pe_sk_data2(sk_data, phase, mask_img_dist)
+
+            timings["phase"] = timings.get("phase", 0) + (
+                time.time() - t_phase
+            )
+
+        # the indices to bridge the gap between blocks and flatten data
+        if l_pair.ne(0).all():
+            # size of block, row/col
+            nr, nc = l_pair * 2 + 1
+
+            # Get total orbital index
+            idx_mask_u, nl = index_mask_s[:2].unique(
+                dim=-1, return_counts=True
+            )
+            n_tot = torch.arange(int(nr * len(index_mask_s[-1]))) + 1
+
+            # Get flatted indices
+            r = pack(torch.split(n_tot, tuple(nl * nr))).reshape(
+                len(nl), -1, nr
+            )
+            r = r.transpose(-1, -2).flatten()
+            r = r[r.ne(0)] - 1
+
+            # Perform the reordering
+            if not is_periodic:
+                sk_data = sk_data.reshape(-1, nc)[r]
+            else:
+                sk_data = sk_data.reshape(-1, nc, sk_data.shape[-1])[r]
+
+        if not is_periodic:
+            sk_data = sk_data.flatten()
+        elif l_pair[0] == 0 or l_pair[1] == 0:
+            sk_data = sk_data.flatten(0, 2)
+        else:
+            sk_data = sk_data.flatten(0, 1)
+
+        # Profile matrix assignment
+        t_assign = time.time()
+
+        # Create the full sized index mask and assign the results
+        if l_pair[0] == l_pair[1]:
+            a_mask = torch.nonzero(
+                (l_mat_f == l_pair).all(-1)
+                * (i_mat_f[..., 0] <= i_mat_f[..., 1])
+                * mask_dist_l
+            ).T
+
+            # This mask is used to reproduce the lower triangle integrals
+            a_mask1 = torch.nonzero(
+                (l_mat_f == l_pair).all(-1)
+                * mask_dist_l
+                * (i_mat_f[..., 0] < i_mat_f[..., 1])
+            ).T
+        else:
+            a_mask = torch.nonzero((l_mat_f == l_pair).all(-1) * mask_dist_l).T
+
+        sk_data = sk_data.to(dtype=mat.dtype)
+        mat[tuple(a_mask)] = sk_data
+
+        if not is_periodic:
+            mat.transpose(-1, -2)[tuple(a_mask)] = sk_data
+        else:
+            if l_pair[0] == l_pair[1]:
+                mat.transpose(-2, -3)[tuple(a_mask1)] = torch.conj(
+                    mat[tuple(a_mask1)]
+                )
+            else:
+                mat.transpose(-2, -3)[tuple(a_mask)] = torch.conj(sk_data)
+
+        timings["assignment"] = timings.get("assignment", 0) + (
+            time.time() - t_assign
+        )
+
+    timings["total_loop"] = time.time() - t0
+
+    # Set the onsite terms (diagonal)
+    t_onsite = time.time()
+    if not train_onsite or train_onsite == "global" or ml_onsite is None:
+        _onsite = _gather_on_site(geometry, basis, sk_feed)
+    elif train_onsite == "local":
+        if not orbital_resolved:
+            _onsite = ml_onsite
+            _onsite = torch.repeat_interleave(
+                _onsite, basis.orbs_per_shell[basis.orbs_per_shell.ne(0)]
+            )
+            c = torch.unique_consecutive(
+                (basis.on_atoms != -1).nonzero().T[0], return_counts=True
+            )[1]
+            _onsite = pack(torch.split(_onsite, tuple(c))).view(
+                basis.orbital_matrix_shape[:-1]
+            )
+        else:
+            _onsite = (
+                sk_feed.on_site_dict["ml_onsite"]
+                if ml_onsite is None
+                else ml_onsite
+            )
+
+    if not is_periodic:
+        mat.diagonal(0, -2, -1)[:] = mat.diagonal(0, -2, -1)[:] + _onsite
+    else:
+        _onsite = _onsite.repeat(n_kpoints, 1, 1).permute(1, 0, 2)
+        mat.diagonal(0, -2, -3)[:] = mat.diagonal(0, -2, -3)[:] + _onsite
+
+    timings["onsite"] = time.time() - t_onsite
+    timings["total"] = time.time() - t_total
+
+    # Print breakdown
+    print(f"\n📊 hs_matrix timing breakdown:")
+    for key, val in sorted(timings.items(), key=lambda x: -x[1]):
+        pct = val / timings["total"] * 100
+        print(f"  {key:20s}: {val:6.3f}s ({pct:4.1f}%)")
+    print()
+
+    return mat
+
+
+# Helper function: convert sparse to dense if needed for eigensolvers
+def sparse_to_dense_if_needed(mat):
+    """Convert sparse matrix to dense for eigensolver."""
+    if mat.is_sparse:
+        return mat.to_dense()
+    return mat
 
 
 def hs_matrix(
@@ -158,28 +482,31 @@ def hs_matrix(
     # cutoff = kwargs.get("cutoff", 10.0)
     shape_orbs = basis.orbital_matrix_shape
     g_var = None
-
+    device = geometry.positions.device
     if not is_periodic:
         mat = torch.zeros(
             shape_orbs,  # <- Results matrix
-            device=geometry.positions.device,
+            device=device,
             dtype=geometry.dtype,
             # dtype=torch.float32,
         )
     else:
         # n_kpoints = kwargs.get("n_kpoints")
         n_kpoints = geometry.n_kpoints
+        # print("phase",geometry.phase,geometry.phase.device)
         phase = geometry.phase
         real_dtype = torch.get_default_dtype()
+        # print(" real_dtype", real_dtype)
         assert n_kpoints is not None, "Please set n_kpoints if PBC is True"
         # assert phase is not None, "Please set phase if PBC is True"
         if isinstance(n_kpoints, Tensor):
             n_kpoints = torch.max(n_kpoints)
+        # dtype = torch.complex64 if phase is not None else real_dtype
         dtype = torch.complex128 if phase is not None else real_dtype
         mat = torch.zeros(
             *shape_orbs,
             n_kpoints,
-            device=geometry.positions.device,
+            device=device,
             dtype=dtype,
             # dtype=torch.complex128 if phase is not None else torch.float32,
         )
@@ -202,14 +529,18 @@ def hs_matrix(
     an_mat_a = basis.atomic_number_matrix("atomic")
 
     dist_mat_a = geometry.distances
+    # print("dist_mat_a",dist_mat_a,dist_mat_a.shape,dist_mat_a.device)
     vec_mat_a = -normalize(geometry.distance_vectors, 2, -1)  # Unit vectors
 
     # Build mask for l-like distances matrix to select atomic pairs
     _, mask_dist_l, mask_dist_s = basis.mask(geometry, cutoff)
-
+    device = l_mat_s.device
     # Loop over each azimuthal-pair interaction (max ℓ=3 (f))
     l_pairs = [
-        torch.tensor([i, j]) for i in range(4) for j in range(4) if i <= j
+        torch.tensor([i, j], device=device)
+        for i in range(4)
+        for j in range(4)
+        if i <= j
     ]
     for l_pair in l_pairs:
 
@@ -306,7 +637,7 @@ def hs_matrix(
             integrals = integrals * scale
 
         # Make a call to the relevant Slater-Koster function to get the sk-block
-        if (l_pair == torch.tensor([0, 0])).all():
+        if (l_pair == torch.tensor([0, 0], device=device)).all():
             sk_data = integrals.unsqueeze(-2)
         else:
             sk_data = sub_block_rot(l_pair, g_vecs, integrals)
@@ -569,7 +900,7 @@ def add_kpoint(
     # assert geometry.positions.dtype is torch.float32, "dtype should be float32"
     is_periodic = geometry.is_periodic
     train_onsite = kwargs.get("train_onsite", True)
-    cutoff = kwargs.get("cutoff", 10.0)
+    cutoff = kwargs.get("cutoff", 5.0)
     shape_orbs = basis.orbital_matrix_shape
 
     n_kpoints = geometry.n_kpoints
@@ -578,6 +909,7 @@ def add_kpoint(
     # assert phase is not None, "Please set phase if PBC is True"
     if isinstance(n_kpoints, Tensor):
         n_kpoints = torch.max(n_kpoints)
+    # dtype = torch.complex64 if phase is not None else real_dtype
     dtype = torch.complex128 if phase is not None else real_dtype
     matc = torch.zeros(
         *shape_orbs,
@@ -812,7 +1144,7 @@ def _gather_on_site(
     an = geometry.atomic_numbers
     a_shape = basis.atomic_matrix_shape[:-1]
     o_shape = basis.orbital_matrix_shape[:-1]
-
+    device = basis.orbs_per_shell.device
     # Get the onsite values for all non-padding elements & pass on the indices
     # of the atoms just in case they are needed by the SkFeed
     mask = an.nonzero(as_tuple=True)
@@ -824,7 +1156,7 @@ def _gather_on_site(
 
     os_flat = torch.cat(sk_feed.on_site(atomic_numbers=an[mask]))
     # os_flat = torch.cat(sk_feed.on_site(atomic_numbers=an[mask], **kwargs))
-
+    os_flat = os_flat.to(device)
     if not sk_feed.orbital_resolve:
         os_flat = torch.repeat_interleave(
             os_flat, basis.orbs_per_shell[basis.orbs_per_shell.ne(0)]
@@ -838,6 +1170,145 @@ def _gather_on_site(
 
 
 def _gather_off_site(
+    atom_pairs: Tensor,
+    shell_pairs: Tensor,
+    distances: Tensor,
+    sk_feed: SkFeed,
+    shell_dict: dict = None,
+    g_var: Tensor = None,
+    **kwargs,
+) -> Tensor:
+    """Retrieves integrals from a target feed in a batch-wise manner - OPTIMIZED."""
+
+    n_shell = kwargs.get("n_shell", False)
+
+    if distances.ndim > 2:
+        raise ValueError(
+            'Argument "distances" must be a 1d or 2d torch.tensor.'
+        )
+
+    # Identify all unique [atom|atom|shell|shell] sets
+    as_pairs = torch.cat(
+        (atom_pairs, shell_pairs.repeat(atom_pairs.shape[0], 1)), -1
+    )
+    as_pairs_u = as_pairs.unique(dim=0)
+
+    # ===== OPTIMIZATION: Batch all SK evaluations =====
+    # Instead of looping and calling sk_feed.off_site individually,
+    # collect all data first, then make ONE batched call
+
+    all_masks = []
+    all_atom_pairs = []
+    all_shell_pairs = []
+    all_distances = []
+
+    # First pass: collect all data
+    for as_pair in as_pairs_u:
+        mask = torch.where((as_pairs == as_pair).all(1))[0]
+
+        if n_shell:
+            shell_pair = [
+                shell_dict[as_pair[0].tolist()][as_pair[2]],
+                shell_dict[as_pair[1].tolist()][as_pair[3]],
+            ]
+        else:
+            shell_pair = as_pair[..., -2:]
+
+        all_masks.append(mask)
+        all_atom_pairs.append(as_pair[..., :-2])
+        all_shell_pairs.append(shell_pair if n_shell else as_pair[..., -2:])
+        all_distances.append(distances[mask])
+
+    # Concatenate all distances for batched evaluation
+    all_distances_cat = torch.cat(all_distances)
+
+    # Stack atom pairs and shell pairs for batch processing
+    all_atom_pairs_stacked = torch.stack(
+        [ap for ap in all_atom_pairs]
+    )  # [n_unique, 2]
+
+    # Create expanded versions for batched call
+    # Repeat each atom/shell pair for its corresponding distances
+    repeats = [len(d) for d in all_distances]
+    atom_pairs_expanded = torch.repeat_interleave(
+        all_atom_pairs_stacked, torch.tensor(repeats), dim=0
+    )
+
+    # For shell pairs, handle both tensor and list cases
+    if isinstance(all_shell_pairs[0], list):
+        # Convert to tensor if it's a list
+        shell_pairs_expanded = []
+        for sp, rep in zip(all_shell_pairs, repeats):
+            shell_pairs_expanded.extend([sp] * rep)
+    else:
+        shell_pairs_stacked = torch.stack([sp for sp in all_shell_pairs])
+        shell_pairs_expanded = torch.repeat_interleave(
+            shell_pairs_stacked, torch.tensor(repeats), dim=0
+        )
+
+    # ===== SINGLE BATCHED SK FEED CALL =====
+    # This replaces the loop with ONE forward pass through the neural network
+    if isinstance(shell_pairs_expanded, list):
+        # If we have a list, need to handle differently
+        # For now, fall back to loop (rare case)
+        integrals = None
+        for mask, atom_pair, shell_pair, dists in zip(
+            all_masks, all_atom_pairs, all_shell_pairs, all_distances
+        ):
+            off_sites = sk_feed.off_site(
+                atom_pair=atom_pair,
+                shell_pair=shell_pair,
+                distances=dists,
+            )
+
+            if integrals is None:
+                integrals = torch.zeros(
+                    (len(as_pairs), off_sites.shape[-1]),
+                    dtype=distances.dtype,
+                    device=distances.device,
+                )
+
+            try:
+                integrals[mask] = off_sites
+            except RuntimeError as e:
+                if str(e).startswith("shape mismatch"):
+                    raise type(e)(
+                        f"{e!s}. This could be due to shells with mismatching "
+                        "angular momenta being provided."
+                    )
+    else:
+        # Batched evaluation (much faster!)
+        all_off_sites = sk_feed.off_site_batched(
+            atom_pairs=atom_pairs_expanded,
+            shell_pairs=shell_pairs_expanded,
+            distances=all_distances_cat,
+        )
+
+        # Initialize output tensor
+        integrals = torch.zeros(
+            (len(as_pairs), all_off_sites.shape[-1]),
+            dtype=distances.dtype,
+            device=distances.device,
+        )
+
+        # Scatter results back to original positions
+        start_idx = 0
+        for mask, dists in zip(all_masks, all_distances):
+            end_idx = start_idx + len(dists)
+            try:
+                integrals[mask] = all_off_sites[start_idx:end_idx]
+            except RuntimeError as e:
+                if str(e).startswith("shape mismatch"):
+                    raise type(e)(
+                        f"{e!s}. This could be due to shells with mismatching "
+                        "angular momenta being provided."
+                    )
+            start_idx = end_idx
+
+    return integrals
+
+
+def _gather_off_site_old(
     atom_pairs: Tensor,
     shell_pairs: Tensor,
     distances: Tensor,
@@ -987,7 +1458,7 @@ def _pe_sk_data2(
     else:
         # Only Gamma point
         sk_data = sk_data.unsqueeze(0)
-
+    device = sk_data.device
     # .  .  .  .  .  .  .  . n-batch .  .  .  .  . atom 1 .  .  .  . atom 2 .
     mask = torch.stack(
         [mask_img_dist[0], mask_img_dist[-2], mask_img_dist[-1]]
@@ -1008,7 +1479,7 @@ def _pe_sk_data2(
     ).permute(0, -1, 1, 2)
 
     sk_data = (
-        torch.zeros(shape, dtype=sk_data.dtype)
+        torch.zeros(shape, dtype=sk_data.dtype, device=device)
         .scatter_add_(1, origin_idx, sk_data)
         .permute(1, 2, 3, 0)
     )
@@ -1200,7 +1671,7 @@ def _rot_yz_p(unit_vector: Tensor) -> Tensor:
     """
     x, y, z = unit_vector.T
     zeros = torch.zeros_like(x)
-    alpha = torch.sqrt(1.0 - z * z)
+    alpha = torch.sqrt(1.0 - z * z + 1e-12)
     rot = stack(
         [
             stack([x / alpha, zeros, -y / alpha], -1),
@@ -1231,7 +1702,7 @@ def _rot_xy_p(unit_vector: Tensor) -> Tensor:
     """
     x, y, z = unit_vector.T
     zeros = torch.zeros_like(x)
-    alpha = torch.sqrt(1.0 - y * y)
+    alpha = torch.sqrt(1e-12 + 1.0 - y * y)
     rot = stack(
         [
             stack([alpha, -y * z / alpha, -x * y / alpha], -1),
@@ -1263,7 +1734,7 @@ def _rot_yz_d(unit_vector: Tensor) -> Tensor:
     x, y, z = unit_vector.T
     zeros = torch.zeros_like(x)
     a = 1.0 - z * z
-    b = torch.sqrt(a)
+    b = torch.sqrt(1e-12 + a)
     xz, xy, yz = unit_vector.T * unit_vector.roll(1, -1).T
     xyz = x * yz
     x2 = x * x
@@ -1328,7 +1799,7 @@ def _rot_xy_d(unit_vector: Tensor) -> Tensor:
     """
     x, y, z = unit_vector.T
     a = 1.0 - y * y
-    b = torch.sqrt(a)
+    b = torch.sqrt(1e-12 + a)
     xz, xy, yz = unit_vector.T * unit_vector.roll(1, -1).T
     xyz = x * yz
     z2 = z * z
@@ -1398,7 +1869,7 @@ def _rot_yz_f(unit_vector: Tensor) -> Tensor:
     xyz = x * yz
     zeros = torch.zeros_like(x)
     a = 1.0 - z * z
-    b = torch.sqrt(a)
+    b = torch.sqrt(1e-12 + a)
     c = b**3
     x2 = x * x
     rot = stack(
@@ -1516,7 +1987,7 @@ def _rot_xy_f(unit_vector: Tensor) -> Tensor:
     xz, xy, yz = unit_vector.T * unit_vector.roll(1, -1).T
     xyz = x * yz
     a = 1.0 - y * y
-    b = torch.sqrt(a)
+    b = torch.sqrt(1e-12 + a)
     c = b**3
     z2 = z * z
     rot = stack(

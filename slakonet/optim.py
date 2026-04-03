@@ -59,6 +59,11 @@ os.environ["PYTHONHASHSEED"] = str(random_seed)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(":4096:8")
 torch.use_deterministic_algorithms(True)
 
+torch.autograd.set_detect_anomaly(True)
+
+# Optional: Make it raise errors immediately
+torch.set_anomaly_enabled(True)
+
 
 def get_atoms(jid="", dataset=None, id_tag="jid"):
     if dataset is None:
@@ -154,6 +159,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         available_skf_pairs=None,
         universal_params_file=None,
         elements_in_system=["Si", "C"],
+        optimize_repulsive_only=False,
     ):
         super().__init__()
 
@@ -161,6 +167,8 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         self.element_pairs = set()
         self.skf_optimizers = nn.ModuleDict()
         self.elements_in_system = set(elements_in_system)
+        self.optimize_repulsive_only = optimize_repulsive_only
+
         # self.elements_in_system = set()
 
         # Atomic number to symbol mapping
@@ -207,6 +215,18 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             print(f"Element pairs to optimize: {sorted(self.element_pairs)}")
 
             self._initialize_skf_optimizers()
+
+    def __getitem__(self, key):
+        """Allow model['Ag-Ag'] syntax"""
+        return self.skf_optimizers[key]
+
+    def __setitem__(self, key, value):
+        """Allow model['Ag-Ag'] = value syntax"""
+        self.skf_optimizers[key] = value
+
+    def __contains__(self, key):
+        """Allow 'Ag-Ag' in model syntax"""
+        return key in self.skf_optimizers
 
     def save_model(self, save_path, method="state_dict"):
         """
@@ -303,6 +323,64 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         print(f"✅ Universal parameters saved to: {save_file}")
 
     @classmethod
+    def load_with_cache(
+        cls, model_path, cache_dir=".model_cache", force_reload=False
+    ):
+        """
+        Load model with filesystem cache for faster subsequent loads.
+
+        Args:
+            model_path: Path to the .pt model file
+            cache_dir: Directory to store cached models
+            force_reload: If True, bypass cache and reload from .pt file
+
+        Returns:
+            Loaded MultiElementSkfParameterOptimizer instance
+        """
+        import pickle
+        import hashlib
+        from pathlib import Path
+        import time
+
+        model_path = Path(model_path)
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(exist_ok=True)
+
+        # Create cache key from model file hash
+        with open(model_path, "rb") as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+
+        cache_file = cache_dir / f"{model_path.stem}_{file_hash}.pkl"
+
+        # Try loading from cache
+        if not force_reload and cache_file.exists():
+            print(f"📦 Loading from cache: {cache_file.name}")
+            t0 = time.time()
+            try:
+                with open(cache_file, "rb") as f:
+                    model = pickle.load(f)
+                print(f"✅ Cache load time: {time.time()-t0:.2f}s")
+                return model
+            except Exception as e:
+                print(f"⚠️  Cache load failed: {e}")
+                print("   Falling back to normal loading...")
+
+        # Load normally and cache
+        print("🔄 Cache miss - loading model from .pt file...")
+        model = cls.load_ultra_compact(model_path)
+
+        # Save to cache
+        print("💾 Saving to cache...")
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"✅ Cached to: {cache_file}")
+        except Exception as e:
+            print(f"⚠️  Failed to cache model: {e}")
+
+        return model
+
+    @classmethod
     def load_model(cls, load_path, method="state_dict", skf_directory=None):
         """
         Load the model using different methods
@@ -324,6 +402,287 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             return cls._load_universal_params_method(load_path, skf_directory)
         else:
             raise ValueError(f"Unknown load method: {method}")
+
+    @classmethod
+    def load_ultra_compact_lazy(cls, load_path, elements_needed=None):
+        """Load model but only initialize SKF optimizers for needed element pairs."""
+        import time
+
+        t_total = time.time()
+
+        # 1. Load file
+        t1 = time.time()
+        load_file = Path(load_path).with_suffix(".pt")
+        compact_data = torch.load(
+            load_file, map_location="cuda", weights_only=False
+        )
+        print(f"⏱️  torch.load took: {time.time()-t1:.2f}s")
+
+        if not compact_data["metadata"].get("ultra_compact", False):
+            raise ValueError("This is not an ultra-compact model file")
+
+        metadata = compact_data["metadata"]
+        state_dict = compact_data["trained_parameters"]
+        skf_metadata = compact_data["skf_metadata"]
+        r_spline_data = compact_data.get("r_spline_data", {})
+
+        # 2. Create instance
+        t2 = time.time()
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+        print(f"⏱️  Instance setup took: {time.time()-t2:.2f}s")
+
+        # 3. Filter pairs
+        t3 = time.time()
+        if elements_needed:
+            elements_needed = set(elements_needed)
+            pairs_to_load = [
+                pair
+                for pair in metadata["available_pairs"]
+                if pair.split("-")[0] in elements_needed
+                and pair.split("-")[1] in elements_needed
+            ]
+            print(
+                f"🎯 Lazy loading: {len(pairs_to_load)}/{len(metadata['available_pairs'])} pairs for elements {elements_needed}"
+            )
+        else:
+            pairs_to_load = metadata["available_pairs"]
+            print(f"📦 Loading all {len(pairs_to_load)} pairs")
+        print(f"⏱️  Pair filtering took: {time.time()-t3:.2f}s")
+
+        # 4. Pre-group state_dict
+        t4 = time.time()
+        pair_params = {}
+        for key, value in state_dict.items():
+            if key.startswith("skf_optimizers."):
+                parts = key.split(".")
+                if len(parts) >= 4:
+                    pair_key = parts[1]
+                    if pair_key not in pairs_to_load:
+                        continue  # Skip pairs we don't need
+
+                    param_type = parts[2]
+                    param_name = ".".join(parts[3:])
+
+                    if pair_key not in pair_params:
+                        pair_params[pair_key] = {
+                            "h_params": {},
+                            "s_params": {},
+                        }
+
+                    if param_type in ["h_params", "s_params"]:
+                        pair_params[pair_key][param_type][param_name] = value
+        # print(f"⏱️  Parameter grouping took: {time.time()-t4:.2f}s")
+
+        # 5. Create optimizers
+        t5 = time.time()
+        instance.skf_optimizers = nn.ModuleDict()
+        from slakonet.skf import Skf
+
+        for pair_key in pairs_to_load:
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            skf_dict = skf_metadata[pair_key].copy()
+            h_params = pair_params.get(pair_key, {}).get("h_params", {})
+            s_params = pair_params.get(pair_key, {}).get("s_params", {})
+
+            skf_dict["hamiltonian"] = h_params
+            skf_dict["overlap"] = s_params
+            optimizer.skf_dict = skf_dict
+
+            optimizer.h_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in h_params.items()}
+            )
+            optimizer.s_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in s_params.items()}
+            )
+
+            optimizer.grid = skf_dict.get("grid", None)
+            optimizer.atomic_data = skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+            if pair_key in r_spline_data:
+                rspl_data = r_spline_data[pair_key]
+                optimizer.r_spline = Skf.RSpline(
+                    grid=rspl_data["grid"],
+                    cutoff=rspl_data["cutoff"],
+                    spline_coef=rspl_data["spline_coef"],
+                    exp_coef=rspl_data["exp_coef"],
+                    tail_coef=rspl_data["tail_coef"],
+                )
+            else:
+                optimizer.r_spline = None
+
+            instance.skf_optimizers[pair_key] = optimizer
+        print(f"⏱️  Optimizer creation took: {time.time()-t5:.2f}s")
+
+        # 6. Load state dict
+        t6 = time.time()
+        filtered_state = {
+            k: v
+            for k, v in state_dict.items()
+            if any(
+                k.startswith(f"skf_optimizers.{pair}")
+                for pair in pairs_to_load
+            )
+        }
+        instance.load_state_dict(filtered_state, strict=False)
+        print(f"⏱️  State dict loading took: {time.time()-t6:.2f}s")
+
+        print(f"✅ Total load time: {time.time()-t_total:.2f}s")
+        return instance
+
+    @classmethod
+    def load_ultra_compact_lazy_old(cls, load_path, elements_needed=None):
+        """
+        Load model but only initialize SKF optimizers for needed element pairs.
+
+        Args:
+            load_path: Path to model file
+            elements_needed: Set of element symbols (e.g., {'Si', 'Ge'})
+                            If None, loads all pairs
+        """
+        import time
+
+        t1 = time.time()
+        load_file = Path(load_path).with_suffix(".pt")
+        compact_data = torch.load(
+            load_file, map_location="cuda", weights_only=False
+        )
+
+        if not compact_data["metadata"].get("ultra_compact", False):
+            raise ValueError("This is not an ultra-compact model file")
+
+        metadata = compact_data["metadata"]
+        state_dict = compact_data["trained_parameters"]
+        skf_metadata = compact_data["skf_metadata"]
+        r_spline_data = compact_data.get("r_spline_data", {})
+
+        # Create new instance
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+
+        # Restore basic attributes
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        # Recreate atomic number mapping
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+
+        # Filter pairs if elements_needed is specified
+        if elements_needed:
+            elements_needed = set(elements_needed)
+            pairs_to_load = [
+                pair
+                for pair in metadata["available_pairs"]
+                if pair.split("-")[0] in elements_needed
+                and pair.split("-")[1] in elements_needed
+            ]
+            print(
+                f"🎯 Lazy loading: {len(pairs_to_load)}/{len(metadata['available_pairs'])} pairs for elements {elements_needed}"
+            )
+        else:
+            pairs_to_load = metadata["available_pairs"]
+            print(f"📦 Loading all {len(pairs_to_load)} pairs")
+
+        # Pre-group state_dict
+        pair_params = {}
+        for key, value in state_dict.items():
+            if key.startswith("skf_optimizers."):
+                parts = key.split(".")
+                if len(parts) >= 4:
+                    pair_key = parts[1]
+                    if pair_key not in pairs_to_load:
+                        continue  # Skip pairs we don't need
+
+                    param_type = parts[2]
+                    param_name = ".".join(parts[3:])
+
+                    if pair_key not in pair_params:
+                        pair_params[pair_key] = {
+                            "h_params": {},
+                            "s_params": {},
+                        }
+
+                    if param_type in ["h_params", "s_params"]:
+                        pair_params[pair_key][param_type][param_name] = value
+
+        # Create optimizers
+        instance.skf_optimizers = nn.ModuleDict()
+        from slakonet.skf import Skf
+
+        for pair_key in pairs_to_load:
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            skf_dict = skf_metadata[pair_key].copy()
+            h_params = pair_params.get(pair_key, {}).get("h_params", {})
+            s_params = pair_params.get(pair_key, {}).get("s_params", {})
+
+            skf_dict["hamiltonian"] = h_params
+            skf_dict["overlap"] = s_params
+            optimizer.skf_dict = skf_dict
+
+            optimizer.h_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in h_params.items()}
+            )
+            optimizer.s_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in s_params.items()}
+            )
+
+            optimizer.grid = skf_dict.get("grid", None)
+            optimizer.atomic_data = skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+            if pair_key in r_spline_data:
+                rspl_data = r_spline_data[pair_key]
+                optimizer.r_spline = Skf.RSpline(
+                    grid=rspl_data["grid"],
+                    cutoff=rspl_data["cutoff"],
+                    spline_coef=rspl_data["spline_coef"],
+                    exp_coef=rspl_data["exp_coef"],
+                    tail_coef=rspl_data["tail_coef"],
+                )
+            else:
+                optimizer.r_spline = None
+
+            instance.skf_optimizers[pair_key] = optimizer
+
+        # Only load state dict for the pairs we created
+        filtered_state = {
+            k: v
+            for k, v in state_dict.items()
+            if any(
+                k.startswith(f"skf_optimizers.{pair}")
+                for pair in pairs_to_load
+            )
+        }
+        instance.load_state_dict(filtered_state, strict=False)
+
+        t2 = time.time()
+        print(f"✅ Loaded in {t2-t1:.2f}s")
+        return instance
 
     @classmethod
     def _load_state_dict_method(cls, load_path):
@@ -509,8 +868,9 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 "class_name": "MultiElementSkfParameterOptimizer",
                 "ultra_compact": True,
             },
-            "trained_parameters": state_dict,  # Only store trained params once
-            "skf_metadata": {},  # Only store non-parameter data from skf_dict
+            "trained_parameters": state_dict,
+            "skf_metadata": {},
+            "r_spline_data": {},  # ADD THIS
         }
 
         # Store only non-parameter metadata from each SKF
@@ -522,6 +882,19 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             skf_dict.pop("overlap", None)
 
             compact_data["skf_metadata"][pair_key] = skf_dict
+
+            # ADD: Save r_spline if it exists
+            if (
+                hasattr(optimizer, "r_spline")
+                and optimizer.r_spline is not None
+            ):
+                compact_data["r_spline_data"][pair_key] = {
+                    "grid": optimizer.r_spline.grid,
+                    "cutoff": optimizer.r_spline.cutoff,
+                    "spline_coef": optimizer.r_spline.spline_coef,
+                    "exp_coef": optimizer.r_spline.exp_coef,
+                    "tail_coef": optimizer.r_spline.tail_coef,
+                }
 
         torch.save(compact_data, save_file)
 
@@ -538,16 +911,24 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
         print(f"✅ Compact model saved to: {save_file}")
         print(f"   Eliminated {total_eliminated} duplicate parameter copies")
-        print(f"   Estimated ~75% size reduction from eliminating redundancy")
+        if compact_data["r_spline_data"]:
+            print(
+                f"   Saved r_spline for {len(compact_data['r_spline_data'])} pairs"
+            )
 
     @classmethod
     def load_ultra_compact(cls, load_path):
         """
-        Load ultra-compact model and reconstruct skf_dict from trained parameters
+        Load ultra-compact model with optimized pair reconstruction
         """
         t1 = time.time()
         load_file = Path(load_path).with_suffix(".pt")
-        compact_data = torch.load(load_file)
+        compact_data = torch.load(
+            load_file,
+            map_location="cpu",
+            weights_only=False,
+            # load_file, map_location="cuda", weights_only=False
+        )
 
         if not compact_data["metadata"].get("ultra_compact", False):
             raise ValueError("This is not an ultra-compact model file")
@@ -555,6 +936,138 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         metadata = compact_data["metadata"]
         state_dict = compact_data["trained_parameters"]
         skf_metadata = compact_data["skf_metadata"]
+        r_spline_data = compact_data.get("r_spline_data", {})
+
+        # Create new instance
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+
+        # Restore basic attributes
+        instance.skf_directory = metadata["skf_directory"]
+        instance.elements_in_system = set(metadata["elements_in_system"])
+        instance.element_pairs = set(
+            tuple(pair) for pair in metadata["element_pairs"]
+        )
+
+        # Recreate atomic number mapping
+        from jarvis.core.specie import atomic_numbers_to_symbols
+
+        zz = [i for i in range(1, 100)]
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+
+        # OPTIMIZATION 1: Pre-group state_dict by pair_key
+        # print("Grouping parameters by pair...")
+        t_group_start = time.time()
+
+        pair_params = {}
+        for key, value in state_dict.items():
+            if key.startswith("skf_optimizers."):
+                parts = key.split(".")
+                if len(parts) >= 4:
+                    pair_key = parts[1]
+                    param_type = parts[2]  # 'h_params' or 's_params'
+                    param_name = ".".join(parts[3:])
+
+                    if pair_key not in pair_params:
+                        pair_params[pair_key] = {
+                            "h_params": {},
+                            "s_params": {},
+                        }
+
+                    if param_type in ["h_params", "s_params"]:
+                        pair_params[pair_key][param_type][param_name] = value
+
+        # print(f"Parameter grouping took: {time.time() - t_group_start:.2f}s")
+
+        # OPTIMIZATION 2: Batch create optimizers
+        # print(f"Creating {len(metadata['available_pairs'])} SKF optimizers...")
+        t_create_start = time.time()
+
+        instance.skf_optimizers = nn.ModuleDict()
+
+        # Pre-import to avoid repeated imports
+        from slakonet.skf import Skf
+
+        for pair_key in metadata["available_pairs"]:
+            # Create optimizer
+            optimizer = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+            nn.Module.__init__(optimizer)
+
+            # Get metadata
+            skf_dict = skf_metadata[pair_key].copy()
+
+            # Get pre-grouped parameters (much faster than searching state_dict each time)
+            h_params = pair_params.get(pair_key, {}).get("h_params", {})
+            s_params = pair_params.get(pair_key, {}).get("s_params", {})
+
+            # Reconstruct full skf_dict
+            skf_dict["hamiltonian"] = h_params
+            skf_dict["overlap"] = s_params
+            optimizer.skf_dict = skf_dict
+
+            # OPTIMIZATION 3: Direct parameter assignment without clone() if not needed
+            optimizer.h_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in h_params.items()}
+            )
+            optimizer.s_params = nn.ParameterDict(
+                {k: nn.Parameter(v) for k, v in s_params.items()}
+            )
+
+            # Set other attributes
+            optimizer.grid = skf_dict.get("grid", None)
+            optimizer.atomic_data = skf_dict.get("atomic_data", None)
+            optimizer.atom_pair = skf_dict.get("atom_pair", None)
+            optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+            # Restore r_spline if it exists
+            if pair_key in r_spline_data:
+                rspl_data = r_spline_data[pair_key]
+                optimizer.r_spline = Skf.RSpline(
+                    grid=rspl_data["grid"],
+                    cutoff=rspl_data["cutoff"],
+                    spline_coef=rspl_data["spline_coef"],
+                    exp_coef=rspl_data["exp_coef"],
+                    tail_coef=rspl_data["tail_coef"],
+                )
+            else:
+                optimizer.r_spline = None
+
+            instance.skf_optimizers[pair_key] = optimizer
+
+        # print(f"Optimizer creation took: {time.time() - t_create_start:.2f}s")
+
+        # Load state dict
+        t_state_start = time.time()
+        instance.load_state_dict(state_dict)
+        # print(f"State dict loading took: {time.time() - t_state_start:.2f}s")
+
+        t2 = time.time()
+
+        print(f"✅ Compact model loaded from: {load_file}")
+        if r_spline_data:
+            print(f"   Restored r_spline for {len(r_spline_data)} pairs")
+        print(f"Total time: {t2 - t1:.2f}s")
+        return instance
+
+    @classmethod
+    def load_ultra_compact_old(cls, load_path):
+        """
+        Load ultra-compact model and reconstruct skf_dict from trained parameters
+        """
+        t1 = time.time()
+        load_file = Path(load_path).with_suffix(".pt")
+        compact_data = torch.load(
+            load_file, map_location="cuda"
+        )  # ADD map_location
+
+        if not compact_data["metadata"].get("ultra_compact", False):
+            raise ValueError("This is not an ultra-compact model file")
+
+        metadata = compact_data["metadata"]
+        state_dict = compact_data["trained_parameters"]
+        skf_metadata = compact_data["skf_metadata"]
+        r_spline_data = compact_data.get("r_spline_data", {})  # ADD THIS
 
         # Create new instance
         instance = cls.__new__(cls)
@@ -621,6 +1134,21 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             optimizer.atom_pair = skf_dict.get("atom_pair", None)
             optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
 
+            # ADD: Restore r_spline if it exists
+            if pair_key in r_spline_data:
+                from slakonet.skf import Skf
+
+                rspl_data = r_spline_data[pair_key]
+                optimizer.r_spline = Skf.RSpline(
+                    grid=rspl_data["grid"],
+                    cutoff=rspl_data["cutoff"],
+                    spline_coef=rspl_data["spline_coef"],
+                    exp_coef=rspl_data["exp_coef"],
+                    tail_coef=rspl_data["tail_coef"],
+                )
+            else:
+                optimizer.r_spline = None
+
             instance.skf_optimizers[pair_key] = optimizer
 
         # Load the state dict (this should work since we reconstructed the structure)
@@ -628,6 +1156,8 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         t2 = time.time()
 
         print(f"✅ Compact model loaded from: {load_file}")
+        if r_spline_data:
+            print(f"   Restored r_spline for {len(r_spline_data)} pairs")
         print("Time taken:", round(t2 - t1, 3))
         return instance
 
@@ -947,7 +1477,10 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             try:
                 print(f"Loading SKF optimizer for {pair_key} from {skf_path}")
                 self.skf_optimizers[pair_key] = SkfParameterOptimizer(skf_path)
-                successful_pairs.append(pair_key)
+                successful_pairs.append(
+                    pair_key,
+                    optimize_repulsive_only=self.optimize_repulsive_only,
+                )
             except Exception as e:
                 print(f"Failed to load {pair_key}: {e}")
 
@@ -957,6 +1490,8 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         print(
             f"Successfully initialized {len(self.skf_optimizers)} SKF optimizers"
         )
+        if self.optimize_repulsive_only:
+            print("⚠️  REPULSIVE-ONLY MODE: H and S parameters are frozen")
         print(f"Available pairs: {successful_pairs}")
 
     def compute_multi_element_properties(
@@ -972,7 +1507,6 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         get_bulk_mod=False,
         device=None,
         with_eigenvectors=False,
-        pairwise_cutoff_length=7,
     ):
         """Compute DFTB properties for multi-element systems using ALL available optimizers"""
         if device is None:
@@ -995,35 +1529,42 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         if klines is not None:
             calc = SimpleDftb(
                 geometry,
-                shell_dict=shell_dict,
+                # shell_dict=shell_dict,
                 klines=klines,
-                h_feed=h_feed,
-                s_feed=s_feed,
-                nelectron=nelectron,
+                model=self,
+                # h_feed=h_feed,
+                # s_feed=s_feed,
+                # nelectron=nelectron,
                 device=device,
+                compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
-                pairwise_cutoff_length=pairwise_cutoff_length,
             )
         else:
             calc = SimpleDftb(
                 geometry,
-                shell_dict=shell_dict,
+                # shell_dict=shell_dict,
                 kpoints=kpoints,
-                h_feed=h_feed,
-                s_feed=s_feed,
-                nelectron=nelectron,
+                # h_feed=h_feed,
+                # s_feed=s_feed,
+                # nelectron=nelectron,
                 device=device,
+                model=self,
+                compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
-                pairwise_cutoff_length=pairwise_cutoff_length,
             )
 
         # Compute properties
-        eigenvalues = calc()
-        properties = calc.get_properties_dict(
-            include_bulk_modulus=get_bulk_mod,
-            include_dos_data=True,
-        )
-        # """
+        properties = calc.calculate()
+        eigenvalues = properties[
+            "eigenvalues"
+        ]  # calc.calculate(compute_forces=False)
+        # eigenvalues = calc()
+        # print("eigenvalues", eigenvalues)
+        # properties = calc.get_properties_dict(
+        #    include_bulk_modulus=get_bulk_mod,
+        #    include_dos_data=True,
+        # )
+        """
         if get_fermi:
             kT = 0.025
             H2E = 27.211
@@ -1085,8 +1626,8 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         if get_forces:
             forces = calc._compute_forces_finite_diff()
             properties["forces"] = forces
-        # """
         properties["eigenvalues"] = eigenvalues
+        """
         return properties, True
 
     def _create_comprehensive_feed(
@@ -1368,42 +1909,57 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         print("=" * 70)
 
 
-# Keep original SkfParameterOptimizer class
 class SkfParameterOptimizer(nn.Module):
     """Trainable SKF parameters for fitting to DFT data with constraints"""
 
-    def __init__(self, skf_path):
+    def __init__(self, skf_path, optimize_repulsive_only=False):
         super().__init__()
 
         # Load initial SKF parameters
         self.skf = Skf.from_skf(skf_path)
         self.skf_dict = self.skf.to_dict()
+        self.optimize_repulsive_only = (
+            optimize_repulsive_only  # SET THIS EARLY
+        )
 
         # Store original parameters for reference
         self.original_h_params = {}
         self.original_s_params = {}
 
-        # Make Hamiltonian and overlap parameters trainable
-        h_param_dict = {}
-        for key, value in self.skf_dict["hamiltonian"].items():
-            original_tensor = torch.tensor(value).type(
-                torch.get_default_dtype()
-            )
-            # original_tensor = torch.tensor(value, dtype=torch.float32)
-            self.original_h_params[key] = original_tensor.clone()
-            h_param_dict[key] = nn.Parameter(original_tensor)
+        if not optimize_repulsive_only:
+            # Make Hamiltonian and overlap parameters trainable (original behavior)
+            h_param_dict = {}
+            for key, value in self.skf_dict["hamiltonian"].items():
+                original_tensor = torch.tensor(value).type(
+                    torch.get_default_dtype()
+                )
+                self.original_h_params[key] = original_tensor.clone()
+                h_param_dict[key] = nn.Parameter(original_tensor)
 
-        s_param_dict = {}
-        for key, value in self.skf_dict["overlap"].items():
-            original_tensor = torch.tensor(value).type(
-                torch.get_default_dtype()
-            )
-            # original_tensor = torch.tensor(value, dtype=torch.float32)
-            self.original_s_params[key] = original_tensor.clone()
-            s_param_dict[key] = nn.Parameter(original_tensor)
+            s_param_dict = {}
+            for key, value in self.skf_dict["overlap"].items():
+                original_tensor = torch.tensor(value).type(
+                    torch.get_default_dtype()
+                )
+                self.original_s_params[key] = original_tensor.clone()
+                s_param_dict[key] = nn.Parameter(original_tensor)
 
-        self.h_params = nn.ParameterDict(h_param_dict)
-        self.s_params = nn.ParameterDict(s_param_dict)
+            self.h_params = nn.ParameterDict(h_param_dict)
+            self.s_params = nn.ParameterDict(s_param_dict)
+        else:
+            # Freeze H and S, only make repulsive parameters trainable
+            self.h_params = nn.ParameterDict()
+            self.s_params = nn.ParameterDict()
+
+            # Store as non-trainable
+            for key, value in self.skf_dict["hamiltonian"].items():
+                self.original_h_params[key] = torch.tensor(value).type(
+                    torch.get_default_dtype()
+                )
+            for key, value in self.skf_dict["overlap"].items():
+                self.original_s_params[key] = torch.tensor(value).type(
+                    torch.get_default_dtype()
+                )
 
         # Store other fixed parameters
         self.grid = self.skf_dict.get("grid", None)
@@ -1411,9 +1967,250 @@ class SkfParameterOptimizer(nn.Module):
         self.atom_pair = self.skf_dict.get("atom_pair", None)
         self.hs_cutoff = self.skf_dict.get("hs_cutoff", None)
 
+        # Initialize r_spline - make trainable if optimize_repulsive_only
+        self.r_spline = None
+        if "r_spline" in self.skf_dict and self.skf_dict["r_spline"]:
+            r_spline_data = self.skf_dict["r_spline"]
+
+            if optimize_repulsive_only:
+                # Create trainable repulsive parameters
+                self.r_exp_coef = nn.Parameter(
+                    torch.tensor(r_spline_data["exp_coef"]).type(
+                        torch.get_default_dtype()
+                    )
+                )
+                self.r_spline_coef = nn.Parameter(
+                    torch.tensor(r_spline_data["spline_coef"]).type(
+                        torch.get_default_dtype()
+                    )
+                )
+                self.r_tail_coef = nn.Parameter(
+                    torch.tensor(r_spline_data["tail_coef"]).type(
+                        torch.get_default_dtype()
+                    )
+                )
+
+                # Keep these fixed
+                self.register_buffer(
+                    "r_grid",
+                    torch.tensor(r_spline_data["grid"]).type(
+                        torch.get_default_dtype()
+                    ),
+                )
+                self.register_buffer(
+                    "r_cutoff",
+                    torch.tensor([r_spline_data["cutoff"]]).type(
+                        torch.get_default_dtype()
+                    ),
+                )
+
+                # Store original for constraints
+                self.original_exp_coef = self.r_exp_coef.data.clone()
+                self.original_spline_coef = self.r_spline_coef.data.clone()
+                self.original_tail_coef = self.r_tail_coef.data.clone()
+
+    def get_updated_r_spline(self):
+        """Get updated r_spline object with current trainable parameters"""
+        if not hasattr(self, "r_exp_coef"):
+            return None
+
+        from slakonet.skf import Skf
+
+        return Skf.RSpline(
+            grid=self.r_grid,
+            cutoff=self.r_cutoff.item(),
+            spline_coef=self.r_spline_coef,
+            exp_coef=self.r_exp_coef,
+            tail_coef=self.r_tail_coef,
+        )
+
+    def get_updated_skf(self):
+        """Create updated SKF with current parameters"""
+        updated_dict = self.skf_dict.copy()
+
+        # Check if this is repulsive-only mode
+        is_repulsive_only = getattr(self, "optimize_repulsive_only", False)
+
+        if not is_repulsive_only:
+            # Use trainable H and S parameters
+            updated_h = {key: param for key, param in self.h_params.items()}
+            updated_s = {key: param for key, param in self.s_params.items()}
+        else:
+            # Use frozen H and S (from original)
+            updated_h = self.original_h_params
+            updated_s = self.original_s_params
+
+        updated_dict["hamiltonian"] = updated_h
+        updated_dict["overlap"] = updated_s
+
+        # FIX: Handle r_spline with proper priority order
+        # Priority 1: If we have trainable r_spline parameters (repulsive-only mode)
+        if hasattr(self, "r_exp_coef"):
+            r_spline = self.get_updated_r_spline()
+            if r_spline is not None:
+                updated_dict["r_spline"] = {
+                    "grid": r_spline.grid,
+                    "cutoff": r_spline.cutoff,
+                    "spline_coef": r_spline.spline_coef,
+                    "exp_coef": r_spline.exp_coef,
+                    "tail_coef": r_spline.tail_coef,
+                }
+        # Priority 2: If we have a stored r_spline object (from loading)
+        elif hasattr(self, "r_spline") and self.r_spline is not None:
+            updated_dict["r_spline"] = {
+                "grid": self.r_spline.grid,
+                "cutoff": self.r_spline.cutoff,
+                "spline_coef": self.r_spline.spline_coef,
+                "exp_coef": self.r_spline.exp_coef,
+                "tail_coef": self.r_spline.tail_coef,
+            }
+        # Priority 3: Use what's in skf_dict (allows direct modification)
+        elif "r_spline" in self.skf_dict and self.skf_dict["r_spline"]:
+            # Make a deep copy to avoid reference issues
+            r_spline_data = self.skf_dict["r_spline"]
+            updated_dict["r_spline"] = {
+                "grid": (
+                    r_spline_data["grid"].clone()
+                    if isinstance(r_spline_data["grid"], torch.Tensor)
+                    else torch.tensor(r_spline_data["grid"])
+                ),
+                "cutoff": (
+                    r_spline_data["cutoff"].clone()
+                    if isinstance(r_spline_data["cutoff"], torch.Tensor)
+                    else torch.tensor(r_spline_data["cutoff"])
+                ),
+                "spline_coef": (
+                    r_spline_data["spline_coef"].clone()
+                    if isinstance(r_spline_data["spline_coef"], torch.Tensor)
+                    else torch.tensor(r_spline_data["spline_coef"])
+                ),
+                "exp_coef": (
+                    r_spline_data["exp_coef"].clone()
+                    if isinstance(r_spline_data["exp_coef"], torch.Tensor)
+                    else torch.tensor(r_spline_data["exp_coef"])
+                ),
+                "tail_coef": (
+                    r_spline_data["tail_coef"].clone()
+                    if isinstance(r_spline_data["tail_coef"], torch.Tensor)
+                    else torch.tensor(r_spline_data["tail_coef"])
+                ),
+            }
+
+        return Skf.from_dict(updated_dict)
+
+    def get_updated_skfX(self):
+        """Create updated SKF with current parameters"""
+        updated_dict = self.skf_dict.copy()
+
+        # Check if this is repulsive-only mode
+        is_repulsive_only = getattr(self, "optimize_repulsive_only", False)
+
+        if not is_repulsive_only:
+            updated_h = {key: param for key, param in self.h_params.items()}
+            updated_s = {key: param for key, param in self.s_params.items()}
+        else:
+            # Use frozen H and S
+            updated_h = self.original_h_params
+            updated_s = self.original_s_params
+
+        updated_dict["hamiltonian"] = updated_h
+        updated_dict["overlap"] = updated_s
+
+        # FIXED: Handle r_spline properly for both training and loaded models
+        # Priority 1: If we have trainable r_spline parameters
+        if hasattr(self, "r_exp_coef"):
+            r_spline = self.get_updated_r_spline()
+            if r_spline is not None:
+                updated_dict["r_spline"] = {
+                    "grid": r_spline.grid,
+                    "cutoff": r_spline.cutoff,
+                    "spline_coef": r_spline.spline_coef,
+                    "exp_coef": r_spline.exp_coef,
+                    "tail_coef": r_spline.tail_coef,
+                }
+        # Priority 2: If we have a stored r_spline object (from loading)
+        elif hasattr(self, "r_spline") and self.r_spline is not None:
+            updated_dict["r_spline"] = {
+                "grid": self.r_spline.grid,
+                "cutoff": self.r_spline.cutoff,
+                "spline_coef": self.r_spline.spline_coef,
+                "exp_coef": self.r_spline.exp_coef,
+                "tail_coef": self.r_spline.tail_coef,
+            }
+        # Priority 3: Use what's in skf_dict (original data)
+        elif "r_spline" in self.skf_dict and self.skf_dict["r_spline"]:
+            updated_dict["r_spline"] = self.skf_dict["r_spline"]
+
+        return Skf.from_dict(updated_dict)
+
+    def get_updated_skf_old(self):
+        """Create updated SKF with current parameters"""
+        updated_dict = self.skf_dict.copy()
+
+        # Check if this is repulsive-only mode
+        is_repulsive_only = getattr(self, "optimize_repulsive_only", False)
+
+        if not is_repulsive_only:
+            updated_h = {key: param for key, param in self.h_params.items()}
+            updated_s = {key: param for key, param in self.s_params.items()}
+        else:
+            # Use frozen H and S
+            updated_h = self.original_h_params
+            updated_s = self.original_s_params
+
+        updated_dict["hamiltonian"] = updated_h
+        updated_dict["overlap"] = updated_s
+
+        # Include updated r_spline
+        r_spline = self.get_updated_r_spline()
+        if r_spline is not None:
+            updated_dict["r_spline"] = {
+                "grid": r_spline.grid,
+                "cutoff": r_spline.cutoff,
+                "spline_coef": r_spline.spline_coef,
+                "exp_coef": r_spline.exp_coef,
+                "tail_coef": r_spline.tail_coef,
+            }
+
+        return Skf.from_dict(updated_dict)
+
+    def apply_repulsive_constraints(self, scale_factor=0.2):
+        """Apply constraints to repulsive parameters only"""
+        if not hasattr(self, "r_exp_coef"):
+            return
+
+        with torch.no_grad():
+            # Constrain exponential coefficients
+            self.r_exp_coef.data = torch.clamp(
+                self.r_exp_coef.data,
+                self.original_exp_coef * (1 - scale_factor),
+                self.original_exp_coef * (1 + scale_factor),
+            )
+
+            # Constrain spline coefficients
+            self.r_spline_coef.data = torch.clamp(
+                self.r_spline_coef.data,
+                self.original_spline_coef * (1 - scale_factor),
+                self.original_spline_coef * (1 + scale_factor),
+            )
+
+            # Constrain tail coefficients
+            self.r_tail_coef.data = torch.clamp(
+                self.r_tail_coef.data,
+                self.original_tail_coef * (1 - scale_factor),
+                self.original_tail_coef * (1 + scale_factor),
+            )
+
     def apply_constraints(self, c=[0.9, 0.7, 0.95, 0.9]):
-        """Apply physics-aware constraints"""
-        # Create original params lazily if they don't exist (for ultra-compact loaded models)
+        """Apply physics-aware constraints - BACKWARD COMPATIBLE"""
+        # Check if this is repulsive-only mode (backward compatible)
+        is_repulsive_only = getattr(self, "optimize_repulsive_only", False)
+
+        if is_repulsive_only:
+            self.apply_repulsive_constraints()
+            return
+
+        # Original constraint logic for H and S
         if not hasattr(self, "original_h_params"):
             self.original_h_params = {
                 k: v.clone().detach() for k, v in self.h_params.items()
@@ -1423,7 +2220,6 @@ class SkfParameterOptimizer(nn.Module):
                 k: v.clone().detach() for k, v in self.s_params.items()
             }
 
-        # These are quite arbitrary
         with torch.no_grad():
             for key, param in self.h_params.items():
                 original = self.original_h_params[key]
@@ -1455,26 +2251,17 @@ class SkfParameterOptimizer(nn.Module):
                         original * (1 + (1 - c[3])),
                     )
 
-    def get_updated_skf(self):
-        """Create updated SKF with current parameters"""
-        updated_dict = self.skf_dict.copy()
-        updated_h = {key: param for key, param in self.h_params.items()}
-        updated_s = {key: param for key, param in self.s_params.items()}
-        updated_dict["hamiltonian"] = updated_h
-        updated_dict["overlap"] = updated_s
-        return Skf.from_dict(updated_dict)
-
 
 class MultiVaspDataLoader:
     """Data loader for multiple VASP calculations"""
 
-    def __init__(self, vasprun_paths):
+    def __init__(self, vasprun_paths, load_forces=True):
         """
         Initialize with multiple vasprun.xml files
 
         Args:
             vasprun_paths: List of paths to vasprun.xml files or glob pattern
-            geometry_paths: Optional list of geometry files (if different from vasprun)
+            load_forces: Whether to extract forces from VASP calculations
         """
         # Handle glob patterns
         if isinstance(vasprun_paths, str):
@@ -1489,6 +2276,8 @@ class MultiVaspDataLoader:
         for i, path in enumerate(self.vasprun_paths):
             print(f"  {i+1:2d}. {path}")
 
+        self.load_forces = load_forces
+
         # Load and validate all data
         self.datasets = []
         self._load_all_datasets()
@@ -1497,7 +2286,7 @@ class MultiVaspDataLoader:
         """Load all VASP datasets and validate them"""
         successful_loads = 0
 
-        for i, (vasp_path) in enumerate((self.vasprun_paths)):
+        for i, vasp_path in enumerate(self.vasprun_paths):
             try:
                 dataset = self._load_single_dataset(vasp_path, i)
                 if dataset is not None:
@@ -1528,9 +2317,50 @@ class MultiVaspDataLoader:
         target_dos = torch.tensor(vasprun.total_dos[1])  # spin up
         dos_energies = torch.tensor(vasprun.total_dos[0])
 
+        # Extract forces if requested
+        target_forces = None
+        if self.load_forces:
+            try:
+                # Get forces from final ionic step
+                if (
+                    hasattr(vasprun, "ionic_steps")
+                    and len(vasprun.ionic_steps) > 0
+                ):
+                    forces_array = vasprun.all_forces[
+                        -1
+                    ]  # vasprun.ionic_steps[-1]['forces']
+                    target_forces = torch.tensor(
+                        forces_array, dtype=torch.float32
+                    )
+                    print(f"  ✓ Loaded forces: shape {target_forces.shape}")
+                elif hasattr(vasprun, "forces") and vasprun.forces is not None:
+                    target_forces = torch.tensor(
+                        vasprun.all_forces[-1], dtype=torch.float32
+                    )
+                    print(f"  ✓ Loaded forces: shape {target_forces.shape}")
+                else:
+                    print(f"  ⚠️  No forces found in {vasprun_path}")
+            except Exception as e:
+                print(f"  ⚠️  Could not extract forces: {e}")
+
         # Get elements for this system
         composition = structure.composition.to_dict()
         elements = set(composition.keys())
+
+        # Extract stress tensor if available
+        target_stress = None
+        try:
+            if (
+                hasattr(vasprun, "ionic_steps")
+                and len(vasprun.ionic_steps) > 0
+            ):
+                stress_array = vasprun.ionic_steps[-1].get("stress")
+                if stress_array is not None:
+                    target_stress = torch.tensor(
+                        stress_array, dtype=torch.float32
+                    )
+        except:
+            pass
 
         dataset = {
             "index": index,
@@ -1540,28 +2370,30 @@ class MultiVaspDataLoader:
             "target_bandgap": target_bandgap,
             "target_dos": target_dos,
             "dos_energies": dos_energies,
+            "target_forces": target_forces,  # NEW
+            "target_stress": target_stress,  # NEW
             "elements": elements,
             "composition": composition,
             "metadata": {
                 "natoms": structure.num_atoms,
                 "formula": structure.composition.reduced_formula,
                 "volume": structure.volume,
+                "has_forces": target_forces is not None,
+                "has_stress": target_stress is not None,
             },
         }
-        print("_load_single_dataset", dataset)
+
         print(
             f"  ✓ Dataset {index}: {dataset['metadata']['formula']} "
-            f"({dataset['metadata']['natoms']} atoms, {len(elements)} elements)"
+            f"({dataset['metadata']['natoms']} atoms, {len(elements)} elements, "
+            f"forces={'✓' if target_forces is not None else '✗'})"
         )
 
         return dataset
 
     def _structure_to_geometry(self, structure):
         """Convert structure to slakonet Geometry"""
-        # Extract atomic numbers
-        # print('structure)',structure)
         geometry = Geometry.from_ase_atoms([structure.ase_converter()])
-        # print('structure2',structure)
         return geometry
 
     def get_all_elements(self):
@@ -1571,9 +2403,23 @@ class MultiVaspDataLoader:
             all_elements.update(dataset["elements"])
         return sorted(all_elements)
 
-    def get_batch(self, batch_size=None, shuffle=True):
-        """Get a batch of datasets"""
+    def get_batch(self, batch_size=None, shuffle=True, require_forces=False):
+        """
+        Get a batch of datasets
+
+        Args:
+            batch_size: Number of datasets to return (None = all)
+            shuffle: Whether to shuffle the datasets
+            require_forces: If True, only return datasets with forces
+        """
         datasets = self.datasets.copy()
+
+        # Filter by forces if needed
+        if require_forces:
+            datasets = [d for d in datasets if d["target_forces"] is not None]
+            if not datasets:
+                raise ValueError("No datasets with forces available!")
+
         if shuffle:
             random.shuffle(datasets)
 
@@ -1581,6 +2427,73 @@ class MultiVaspDataLoader:
             return datasets
         else:
             return datasets[:batch_size]
+
+    def get_statistics(self):
+        """Get statistics about loaded datasets"""
+        stats = {
+            "total_datasets": len(self.datasets),
+            "with_forces": sum(
+                1 for d in self.datasets if d["target_forces"] is not None
+            ),
+            "with_stress": sum(
+                1 for d in self.datasets if d["target_stress"] is not None
+            ),
+            "total_atoms": sum(d["metadata"]["natoms"] for d in self.datasets),
+            "elements": self.get_all_elements(),
+        }
+
+        # Energy statistics
+        energies = [d["target_energy"] for d in self.datasets]
+        stats["energy_range"] = (min(energies), max(energies))
+        stats["energy_mean"] = sum(energies) / len(energies)
+
+        # Force statistics if available
+        if stats["with_forces"] > 0:
+            all_forces = []
+            for d in self.datasets:
+                if d["target_forces"] is not None:
+                    all_forces.extend(d["target_forces"].flatten().tolist())
+
+            stats["force_max"] = max(abs(f) for f in all_forces)
+            stats["force_mean"] = sum(abs(f) for f in all_forces) / len(
+                all_forces
+            )
+
+        return stats
+
+    def print_summary(self):
+        """Print detailed summary of loaded data"""
+        stats = self.get_statistics()
+
+        print(f"\n{'='*70}")
+        print("DATASET SUMMARY")
+        print(f"{'='*70}")
+        print(f"Total datasets: {stats['total_datasets']}")
+        print(f"Datasets with forces: {stats['with_forces']}")
+        print(f"Datasets with stress: {stats['with_stress']}")
+        print(f"Total atoms: {stats['total_atoms']}")
+        print(f"Elements: {', '.join(stats['elements'])}")
+        print(
+            f"\nEnergy range: {stats['energy_range'][0]:.3f} to {stats['energy_range'][1]:.3f} eV"
+        )
+        print(f"Energy mean: {stats['energy_mean']:.3f} eV")
+
+        if "force_max" in stats:
+            print(f"\nForce max: {stats['force_max']:.3f} eV/Å")
+            print(f"Force mean: {stats['force_mean']:.3f} eV/Å")
+
+        print(f"\nPer-dataset details:")
+        for d in self.datasets:
+            forces_str = (
+                f"forces={d['target_forces'].shape}"
+                if d["target_forces"] is not None
+                else "no forces"
+            )
+            print(
+                f"  {d['index']:2d}. {d['metadata']['formula']:10s} "
+                f"({d['metadata']['natoms']:3d} atoms, {forces_str})"
+            )
+        print(f"{'='*70}\n")
 
     def __len__(self):
         return len(self.datasets)
@@ -1592,7 +2505,6 @@ class MultiVaspDataLoader:
 def train_multi_vasp_skf_parameters(
     multi_element_optimizer,
     vasprun_paths,  # List of vasprun.xml files or glob pattern
-    # geometry_paths=None,
     num_epochs=100,
     learning_rate=0.00001,
     batch_size=None,  # None = use all datasets each epoch
@@ -1600,15 +2512,18 @@ def train_multi_vasp_skf_parameters(
     save_directory="multi_vasp_optimization_all",
     weight_by_system_size=True,
     early_stopping_patience=20,
-    pairwise_cutoff_length=7,
+    target_property="both",  # "energy", "forces", "bandgap", or "both"
+    force_weight=0.0,
+    energy_weight=1.0,
+    bandgap_weight=1.0,
+    device="cuda",
 ):
     """
-    Enhanced training function for multiple VASP datasets
+    Enhanced training function for multiple VASP datasets with flexible loss targets
 
     Args:
         multi_element_optimizer: The MultiElementSkfParameterOptimizer instance
         vasprun_paths: List of vasprun.xml paths or glob pattern like "tests/vasprun*.xml"
-        geometry_paths: Optional separate geometry files
         num_epochs: Number of training epochs
         learning_rate: Learning rate for optimization
         batch_size: Number of systems to use per epoch (None = use all)
@@ -1616,7 +2531,10 @@ def train_multi_vasp_skf_parameters(
         save_directory: Directory to save results
         weight_by_system_size: Weight loss by number of atoms
         early_stopping_patience: Stop if no improvement for this many epochs
-        pairwise_cutoff_length: Maximim length for pairwise interactions measured in ANGSTROMS
+        target_property: What to optimize - "energy", "forces", "bandgap", or "both"
+        force_weight: Weight for force loss
+        energy_weight: Weight for energy loss
+        bandgap_weight: Weight for bandgap loss
     """
 
     os.makedirs(save_directory, exist_ok=True)
@@ -1626,7 +2544,10 @@ def train_multi_vasp_skf_parameters(
     print("LOADING MULTIPLE VASP DATASETS")
     print("=" * 70)
 
-    data_loader = MultiVaspDataLoader(vasprun_paths)
+    # Determine if we need forces
+    load_forces = target_property in ["forces", "both"]
+    print("load_forces", load_forces)
+    data_loader = MultiVaspDataLoader(vasprun_paths, load_forces=load_forces)
 
     if len(data_loader) == 0:
         raise ValueError("No valid datasets found!")
@@ -1646,13 +2567,29 @@ def train_multi_vasp_skf_parameters(
             "Consider adding SKF files for these elements or filtering datasets"
         )
 
+    # Check if we can optimize what was requested
+    stats = data_loader.get_statistics()
+    # Force loss
+    """
+    #print('datasett',dataset)
+    if target_property in ['forces', 'both']:
+            if dataset["target_forces"] is not None and properties["forces"] is not None:
+                target_forces = dataset["target_forces"].to(device)
+                pred_forces = properties["forces"].to(device)
+                force_loss = torch.mean((pred_forces - target_forces) ** 2)
+                total_dataset_loss += force_weight * force_loss
+                epoch_force_losses.append(force_loss.item())
+            elif target_property == 'forces':
+                # This shouldn't happen due to earlier check, but just in case
+                raise ValueError(f"Dataset {dataset['index']} missing forces but target_property='forces'")
+    """
+
     # Print detailed summary
     multi_element_optimizer.print_multi_element_summary()
 
     # Setup training
     shell_dict = generate_shell_dict_upto_Z65()
     kpoints = torch.tensor([5, 5, 5])
-    # kpoints = torch.tensor([11, 11, 11])
 
     # Setup optimizer and scheduler
     optimizer = optim.AdamW(
@@ -1666,6 +2603,10 @@ def train_multi_vasp_skf_parameters(
     print(f"  Datasets: {len(data_loader)}")
     print(f"  Epochs: {num_epochs}")
     print(f"  Batch size: {batch_size or 'all'}")
+    print(f"  Target property: {target_property}")
+    print(
+        f"  Weights: energy={energy_weight}, bandgap={bandgap_weight}, force={force_weight}"
+    )
     print(
         f"  Total parameters: {sum(p.numel() for p in multi_element_optimizer.parameters())}"
     )
@@ -1676,8 +2617,10 @@ def train_multi_vasp_skf_parameters(
     loss_history = []
     dataset_losses = defaultdict(list)  # Track per-dataset performance
 
-    klines = get_klines_example()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     for epoch in range(num_epochs):
+        print("EPOCH", epoch)
         t1 = time.time()
         optimizer.zero_grad()
 
@@ -1685,82 +2628,100 @@ def train_multi_vasp_skf_parameters(
         multi_element_optimizer.apply_constraints()
 
         # Get batch of datasets
+        require_forces = target_property in ["forces", "both"]
+        print("require_forces HERE ", require_forces)
         batch_datasets = data_loader.get_batch(
-            batch_size=batch_size, shuffle=True
+            batch_size=batch_size, shuffle=True, require_forces=require_forces
         )
+
         epoch_losses = []
         total_weight = 0.0
 
+        # Track loss components
+        epoch_energy_losses = []
+        epoch_bandgap_losses = []
+        epoch_force_losses = []
+
         # Process each dataset in the batch
-        for dataset in batch_datasets:
-            try:
-                # Compute properties for this system
-                print("geometry=", dataset["geometry"])
-                properties, success = (
-                    multi_element_optimizer.compute_multi_element_properties(
-                        geometry=dataset["geometry"],
-                        shell_dict=shell_dict,
-                        klines=klines,
-                        # dataset["geometry"], shell_dict, kpoints,
-                        pairwise_cutoff_length=pairwise_cutoff_length,
-                    )
+        for i, dataset in enumerate(batch_datasets):
+            print(
+                f"\n  Processing dataset {i+1}/{len(batch_datasets)} (index={dataset['index']})"
+            )
+            print("datset", dataset, len(dataset))
+            # Compute properties for this system
+            properties, success = (
+                multi_element_optimizer.compute_multi_element_properties(
+                    geometry=dataset["geometry"],
+                    shell_dict=shell_dict,
+                    kpoints=kpoints,
+                    get_forces=True,
+                    device=device,
                 )
+            )
+            print(f"    Properties computed, success={success}")
+            # print('properties',properties)
 
-                if not success:
-                    print(
-                        f"⚠️  Failed to compute properties for dataset {dataset['index']}"
-                    )
-                    continue
+            # if not success:
+            #    print(
+            #        f"⚠️  Failed to compute properties for dataset {dataset['index']}"
+            #    )
+            #    continue
 
-                # Extract computed values
-                # print("properties",properties,"\n")
-                # print("dataset",dataset)
-                target_bandgap = dataset["target_bandgap"]
-                print("pred band_gap_eV", properties["band_gap_eV"])
-                print("target band_gap_eV", target_bandgap)
-                computed_dos = properties["dos_values_tensor"]
-                target_dos = dataset["target_dos"].to(computed_dos.device)
-                bandgap_weight = 1.0
-                dos_weight = 0.0
-                # Compute losses for this dataset
-                mse_loss = torch.mean((computed_dos - target_dos) ** 2)
-                mae_loss = torch.mean(torch.abs(computed_dos - target_dos))
-                bandgap_mae_loss = torch.mean(
-                    torch.abs(target_bandgap - properties["band_gap_eV"])
+            total_dataset_loss = 0.0
+
+            # Energy loss
+            if target_property in ["energy", "both"]:
+                target_energy = torch.tensor(
+                    [dataset["target_energy"]], device=device
                 )
+                pred_energy = properties["energy"].to(device)
+                energy_loss = torch.abs(pred_energy - target_energy)
+                total_dataset_loss += energy_weight * energy_loss
+                epoch_energy_losses.append(energy_loss.item())
 
-                # Peak matching
-                peak_mask = target_dos > target_dos.max() * 0.1
-                if peak_mask.sum() > 0:
-                    peak_loss = torch.mean(
-                        ((computed_dos - target_dos) * peak_mask.float()) ** 2
-                    )
-                else:
-                    peak_loss = torch.tensor(0.0, device=computed_dos.device)
+            # Bandgap loss
+            if target_property in ["bandgap", "both"]:
+                target_bandgap = torch.tensor(
+                    [dataset["target_bandgap"]], device=device
+                )
+                pred_bandgap = properties["bandgap"].to(device)
+                bandgap_loss = torch.abs(pred_bandgap - target_bandgap)
+                total_dataset_loss += bandgap_weight * bandgap_loss
+                epoch_bandgap_losses.append(bandgap_loss.item())
 
-                # Dataset-specific loss
-                dataset_loss = mse_loss + 0.5 * mae_loss + 2.0 * peak_loss
-                dataset_loss = bandgap_mae_loss
-                # Weight by system size if requested
-                if weight_by_system_size:
-                    weight = dataset["metadata"]["natoms"]
-                else:
-                    weight = 1.0
+            # Force loss
+            if target_property in ["forces", "both"]:
+                if (
+                    dataset["target_forces"] is not None
+                    and properties["forces"] is not None
+                ):
+                    target_forces = dataset["target_forces"].to(device)
+                    pred_forces = properties["forces"].to(device)
+                    # MSE on forces
+                    force_loss = torch.mean((pred_forces - target_forces) ** 2)
+                    total_dataset_loss += force_weight * force_loss
+                    epoch_force_losses.append(force_loss.item())
+                    print("epoch_force_losses", epoch_force_losses)
+            # Weight by system size if requested
+            if weight_by_system_size:
+                weight = dataset["metadata"]["natoms"]
+            else:
+                weight = 1.0
 
-                weighted_loss = dataset_loss * weight
+            if total_dataset_loss > 0:
+                weighted_loss = total_dataset_loss * weight
                 epoch_losses.append(weighted_loss)
                 total_weight += weight
 
                 # Track per-dataset performance
-                dataset_losses[dataset["index"]].append(dataset_loss.item())
+                dataset_losses[dataset["index"]].append(
+                    total_dataset_loss.item()
+                )
 
-            except Exception as e:
-                print(f"❌ Error processing dataset {dataset['index']}: {e}")
-                continue
+        # if not epoch_losses:
+        #    print(f"Epoch {epoch}: No valid computations, skipping...")
+        #    continue
 
-        if not epoch_losses:
-            print(f"Epoch {epoch}: No valid computations, skipping...")
-            continue
         t2 = time.time()
 
         # Combine losses across all datasets in batch
@@ -1774,19 +2735,60 @@ def train_multi_vasp_skf_parameters(
         total_h_reg = sum(
             sum(torch.sum(param**2) for param in opt.h_params.values())
             for opt in multi_element_optimizer.skf_optimizers.values()
+            if len(opt.h_params) > 0
         )
         total_s_reg = sum(
             sum(torch.sum(param**2) for param in opt.s_params.values())
             for opt in multi_element_optimizer.skf_optimizers.values()
+            if len(opt.s_params) > 0
         )
-        regularization = 1e-10 * (total_h_reg + total_s_reg)
+
+        # Add repulsive regularization if optimizing repulsive parameters
+        total_rep_reg = 0.0
+        for opt in multi_element_optimizer.skf_optimizers.values():
+            if hasattr(opt, "r_exp_coef"):
+                total_rep_reg += (opt.r_exp_coef**2).sum()
+                total_rep_reg += (opt.r_spline_coef**2).sum()
+                total_rep_reg += (opt.r_tail_coef**2).sum()
+
+        regularization = (
+            1e-10 * (total_h_reg + total_s_reg) + 1e-8 * total_rep_reg
+        )
 
         # Final loss
         total_loss = batch_loss + regularization
 
+        # if torch.isnan(total_loss):
+        #    print(f"Epoch {epoch}: NaN loss detected, skipping...")
+        #    continue
+        # Around line 2200, before total_loss.backward()
+
+        print(f"\n=== Epoch {epoch} Loss Debug ===")
+        print(f"epoch_losses: {epoch_losses}")
+        print(f"total_weight: {total_weight}")
+        print(f"batch_loss: {batch_loss}")
+        print(f"regularization: {regularization}")
+        print(f"total_loss: {total_loss}")
+
+        # Check for NaN/Inf in loss components
+        if torch.isnan(batch_loss):
+            print("❌ NaN in batch_loss!")
+            print(f"  epoch_losses: {epoch_losses}")
+            print(f"  total_weight: {total_weight}")
+
+        if torch.isnan(regularization):
+            print("❌ NaN in regularization!")
+
         if torch.isnan(total_loss):
-            print(f"Epoch {epoch}: NaN loss detected, skipping...")
+            print(f"❌ NaN in total_loss before backward!")
+            print(f"  Skipping this epoch...")
             continue
+
+        # Check for very small values that could cause issues
+        if batch_loss < 1e-10:
+            print(f"⚠️  Very small batch_loss: {batch_loss}")
+
+        print("=" * 40)
 
         # Backward pass
         total_loss.backward()
@@ -1797,16 +2799,29 @@ def train_multi_vasp_skf_parameters(
         scheduler.step(total_loss)
 
         # Track progress
-        loss_history.append(
-            {
-                "epoch": epoch,
-                "total_loss": total_loss.item(),
-                "batch_loss": batch_loss.item(),
-                "regularization": regularization.item(),
-                "datasets_used": len(batch_datasets),
-                "lr": optimizer.param_groups[0]["lr"],
-            }
-        )
+        loss_record = {
+            "epoch": epoch,
+            "total_loss": total_loss.item(),
+            "batch_loss": batch_loss.item(),
+            "regularization": regularization.item(),
+            "datasets_used": len(batch_datasets),
+            "lr": optimizer.param_groups[0]["lr"],
+        }
+
+        if epoch_energy_losses:
+            loss_record["energy_loss"] = sum(epoch_energy_losses) / len(
+                epoch_energy_losses
+            )
+        if epoch_bandgap_losses:
+            loss_record["bandgap_loss"] = sum(epoch_bandgap_losses) / len(
+                epoch_bandgap_losses
+            )
+        if epoch_force_losses:
+            loss_record["force_loss"] = sum(epoch_force_losses) / len(
+                epoch_force_losses
+            )
+
+        loss_history.append(loss_record)
 
         # Check for improvement
         if total_loss.item() < best_loss:
@@ -1816,27 +2831,25 @@ def train_multi_vasp_skf_parameters(
             # Save best model
             save_path = os.path.join(save_directory, "best_model")
             multi_element_optimizer.save_model(save_path, method="state_dict")
-            # multi_element_optimizer.save_model(
-            #    save_path, method="universal_params"
-            # )
+            multi_element_optimizer.save_ultra_compact(save_path)
         else:
             epochs_without_improvement += 1
 
         # Print progress
         if epoch % plot_frequency == 0:
-            avg_dataset_loss = (
-                sum(sum(losses[-5:]) for losses in dataset_losses.values())
-                / sum(len(losses[-5:]) for losses in dataset_losses.values())
-                if dataset_losses
-                else 0.0
-            )
             tot_time = round(t2 - t1, 3)
-            print(
-                f"Epoch {epoch:3d}: Loss={total_loss.item():.6f}, "
-                f"Batch={batch_loss.item():.6f}, AvgDataset={avg_dataset_loss:.6f}, "
-                f"LR={optimizer.param_groups[0]['lr']:.6f}, Used={len(batch_datasets)} datasets"
-                f" Time={tot_time} sec."
-            )
+            msg = f"Epoch {epoch:3d}: Loss={total_loss.item():.6f}"
+
+            if epoch_energy_losses:
+                msg += f", Energy={sum(epoch_energy_losses)/len(epoch_energy_losses):.6f}"
+            if epoch_bandgap_losses:
+                msg += f", Bandgap={sum(epoch_bandgap_losses)/len(epoch_bandgap_losses):.6f}"
+            if epoch_force_losses:
+                msg += f", Force={sum(epoch_force_losses)/len(epoch_force_losses):.6f}"
+
+            msg += f", LR={optimizer.param_groups[0]['lr']:.6f}"
+            msg += f", Time={tot_time}s"
+            print(msg)
 
         # Early stopping
         if epochs_without_improvement >= early_stopping_patience:
@@ -1848,7 +2861,7 @@ def train_multi_vasp_skf_parameters(
     # Final save
     final_save_path = os.path.join(save_directory, "final_model")
     multi_element_optimizer.save_model(final_save_path, method="state_dict")
-    multi_element_optimizer.save_model(final_save_path, method="compact")
+    multi_element_optimizer.save_ultra_compact(final_save_path)
 
     # Save training history
     history_file = os.path.join(save_directory, "training_history.json")
@@ -1886,7 +2899,6 @@ def multi_vasp_training(
     num_epochs=2,
     batch_size=None,
     save_directory="slakonet_universal",
-    pairwise_cutoff_length=7,
 ):
     """Example demonstrating training on multiple VASP calculations"""
 
@@ -1908,7 +2920,6 @@ def multi_vasp_training(
         save_directory=save_directory,
         weight_by_system_size=True,
         early_stopping_patience=20,
-        pairwise_cutoff_length=pairwise_cutoff_length,
     )
 
     print("\n✅ Multi-VASP training completed successfully!")
@@ -1919,7 +2930,7 @@ def multi_vasp_training(
 
 # Additional utility functions
 def analyze_multi_vasp_performance(
-    data_loader, trained_optimizer, save_directory, pairwise_cutoff_length=7
+    data_loader, trained_optimizer, save_directory
 ):
     """Analyze performance across different systems"""
 
@@ -1938,8 +2949,7 @@ def analyze_multi_vasp_performance(
             # Compute properties
             properties, success = (
                 trained_optimizer.compute_multi_element_properties(
-                    dataset["geometry"], shell_dict, kpoints,
-                    pairwise_cutoff_length=pairwise_cutoff_length,
+                    dataset["geometry"], shell_dict, kpoints
                 )
             )
 
@@ -2006,6 +3016,98 @@ def analyze_multi_vasp_performance(
 
 def default_model(dir_path=None, model_name="slakonet_v0"):
     """
+    Load or download the SlakoNet model with proper Figshare handling
+    """
+    if dir_path is None:
+        dir_path = str(os.path.join(os.path.dirname(__file__), model_name))
+    dir_path = os.path.abspath(dir_path)
+
+    # Check for cached .pt file first
+    cached_model_file = os.path.join(dir_path, f"{model_name}.pt")
+    if os.path.exists(cached_model_file):
+        print(f"Loading cached model from {cached_model_file}")
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+            cached_model_file
+        )
+        model.eval()
+        model = model.float()
+        return model
+
+    # Check if zip file already exists
+    zip_file = os.path.join(dir_path, f"{model_name}.zip")
+    if os.path.exists(zip_file):
+        print(f"Found existing zip file: {zip_file}")
+        with zipfile.ZipFile(zip_file, "r") as zf:
+            pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+            if not pt_files:
+                raise FileNotFoundError(f"No .pt file found in {zip_file}")
+
+            with zf.open(pt_files[0]) as model_file:
+                model_data = model_file.read()
+
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+
+            with open(cached_model_file, "wb") as cache_file:
+                cache_file.write(model_data)
+
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+            cached_model_file
+        )
+        model.eval()
+        model = model.float()
+        return model
+
+    # Download from Figshare - use ndownloader subdomain
+    url = "https://ndownloader.figshare.com/files/57945370"
+    # url="https://figshare.com/ndownloader/files/57945370"
+    print(f"Downloading {model_name} model from Figshare...")
+
+    # Create directory if needed
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+
+    # Download with progress bar
+    response = requests.get(url, stream=True)
+    total_size_in_bytes = int(response.headers.get("content-length", 0))
+    block_size = 1024  # 1 Kibibyte
+    progress_bar = tqdm(total=total_size_in_bytes, unit="iB", unit_scale=True)
+
+    with open(zip_file, "wb") as file:
+        for data in response.iter_content(block_size):
+            progress_bar.update(len(data))
+            file.write(data)
+    progress_bar.close()
+
+    print(f"Saved zip file: {zip_file}")
+
+    # Extract .pt file from zip
+    print("Extracting model file...")
+    with zipfile.ZipFile(zip_file, "r") as zf:
+        pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+        if not pt_files:
+            raise FileNotFoundError("No .pt file found in downloaded zip")
+
+        with zf.open(pt_files[0]) as model_file:
+            model_data = model_file.read()
+
+        with open(cached_model_file, "wb") as cache_file:
+            cache_file.write(model_data)
+
+    print(f"Extracted model to: {cached_model_file}")
+
+    # Load the model
+    model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+        cached_model_file
+    )
+    model.eval()
+    model = model.float()
+
+    return model
+
+
+def default_model_new(dir_path=None, model_name="slakonet_v0"):
+    """
     More direct version - modify load function to accept BytesIO
     """
     if dir_path is None:
@@ -2016,9 +3118,94 @@ def default_model(dir_path=None, model_name="slakonet_v0"):
     cached_model_file = os.path.join(dir_path, f"{model_name}.pt")
     if os.path.exists(cached_model_file):
         print(f"Loading cached model from {cached_model_file}")
-        return MultiElementSkfParameterOptimizer.load_ultra_compact(
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
             cached_model_file
         )
+        model.eval()
+        model = model.float()
+        return model
+
+    # Check if zip file already exists
+    zip_file = os.path.join(dir_path, f"{model_name}.zip")
+    if os.path.exists(zip_file):
+        print(f"Found existing zip file: {zip_file}")
+        with zipfile.ZipFile(zip_file, "r") as zf:
+            pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+            if not pt_files:
+                raise FileNotFoundError(f"No .pt file found in {zip_file}")
+
+            with zf.open(pt_files[0]) as model_file:
+                model_data = model_file.read()
+
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+            with open(cached_model_file, "wb") as cache_file:
+                cache_file.write(model_data)
+
+            model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+                cached_model_file
+            )
+            model = model.float()
+            return model
+
+    # Download the file
+    url = "https://figshare.com/ndownloader/files/57945370"
+    print(f"Downloading {model_name} model...")
+
+    # Simple download - no streaming
+    response = requests.get(url)
+    print(f"Response status: {response.status_code}")
+    print(f"Downloaded {len(response.content)} bytes")
+
+    if len(response.content) == 0:
+        raise RuntimeError("Downloaded file is empty")
+
+    # Save and extract
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+
+    # Save zip file
+    with open(zip_file, "wb") as f:
+        f.write(response.content)
+
+    # Extract .pt file
+    with zipfile.ZipFile(zip_file, "r") as zf:
+        pt_files = [f for f in zf.namelist() if f.endswith(".pt")]
+        if not pt_files:
+            raise FileNotFoundError("No .pt file found in downloaded zip")
+
+        with zf.open(pt_files[0]) as model_file:
+            model_data = model_file.read()
+
+        with open(cached_model_file, "wb") as cache_file:
+            cache_file.write(model_data)
+
+    # Load the model
+    model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+        cached_model_file
+    )
+    model = model.float()
+    return model
+
+
+def default_model_old(dir_path=None, model_name="slakonet_v0"):
+    """
+    More direct version - modify load function to accept BytesIO
+    """
+    if dir_path is None:
+        dir_path = str(os.path.join(os.path.dirname(__file__), model_name))
+    dir_path = os.path.abspath(dir_path)
+
+    # Check for cached .pt file first (extracted from previous run)
+    cached_model_file = os.path.join(dir_path, f"{model_name}.pt")
+    if os.path.exists(cached_model_file):
+        print(f"Loading cached model from {cached_model_file}")
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
+            cached_model_file
+        )
+        model.eval()
+        model = model.float()
+        return model
 
     # Check if zip file already exists
     zip_file = os.path.join(dir_path, f"{model_name}.zip")
@@ -2041,9 +3228,11 @@ def default_model(dir_path=None, model_name="slakonet_v0"):
                 cache_file.write(model_data)
 
             # Load the model
-            return MultiElementSkfParameterOptimizer.load_ultra_compact(
+            model = MultiElementSkfParameterOptimizer.load_ultra_compact(
                 cached_model_file
             )
+            model = model.float()
+            return model
 
     # If we get here, need to download
     url = "https://figshare.com/ndownloader/files/57945370"
@@ -2081,9 +3270,46 @@ def default_model(dir_path=None, model_name="slakonet_v0"):
             cache_file.write(model_data)
 
         # Load the model
-        return MultiElementSkfParameterOptimizer.load_ultra_compact(
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(
             cached_path
         )
+        model = model.float()
+        return model
+
+
+def get_hamiltonian(jarvis_atoms=None, kpts=[1, 4, 4], model=None):
+
+    geometry = Geometry.from_ase_atoms([jarvis_atoms.ase_converter()])
+
+    geometry.positions.requires_grad_(False)
+
+    calc = SimpleDftb(
+        geometry,
+        kpoints=torch.tensor(kpts),
+        model=model,
+        compute_forces=False,
+        include_dos_data=False,
+    )
+    calc.calculate()
+
+    # Extract matrices
+    H = calc.hamiltonian[..., 0].squeeze()
+    S = calc.overlap[..., 0].squeeze()
+
+    # Convert to real (handle complex from k-points)
+    if torch.is_complex(H):
+        H = H.real
+    if torch.is_complex(S):
+        S = S.real
+
+    E_F = calc.fermi_energy.item()
+    gap = calc.bandgap.item()
+
+    # Print info
+
+    print(f"     E_F:        {E_F:.4f} eV")
+    print(f"     Band gap:   {gap:.4f} eV")
+    return H, S, E_F, gap
 
 
 # """

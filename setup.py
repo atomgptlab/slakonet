@@ -8,7 +8,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="slakonet",
-    version="2025.9.1",
+    version="2026.2.2",
     author="Kamal Choudhary",
     author_email="kchoudh2@jhu.edu",
     description="slakonet",
@@ -17,13 +17,15 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/atomgptlab/slakonet",
     packages=setuptools.find_packages(),
-    scripts=[
-        "slakonet/predict_slakonet.py",
-        "slakonet/train_slakonet.py",
-    ],
+    entry_points={
+        "console_scripts": [
+            "predict_slakonet=slakonet.predict_slakonet:main",
+            "train_slakonet=slakonet.train_slakonet:main",
+        ]
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: MIT License",
+        "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.10",

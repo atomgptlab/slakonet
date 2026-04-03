@@ -282,6 +282,78 @@ class SkfFeed(_SkFeed):
         info["orbital_resolve"] = self.orbital_resolve
         return info
 
+    def off_site_batched(self, atom_pairs, shell_pairs, distances):
+        """Batched off-site integral evaluation (MUCH faster than loop).
+
+        Args:
+            atom_pairs: [N, 2] tensor of atom pairs
+            shell_pairs: [N, 2] tensor of shell pairs
+            distances: [N] tensor of distances
+
+        Returns:
+            integrals: [N, n_integrals] tensor
+        """
+        # Group by unique (atom_pair, shell_pair) combinations
+        # since each combination uses the same spline
+
+        if isinstance(atom_pairs, list):
+            # Handle list input (fall back to loop)
+            results = []
+            for ap, sp, d in zip(atom_pairs, shell_pairs, distances):
+                results.append(
+                    self.off_site(
+                        atom_pair=ap,
+                        shell_pair=sp,
+                        distances=d.unsqueeze(0) if d.dim() == 0 else d,
+                    )
+                )
+            return torch.cat(results, dim=0)
+
+        # Tensor input - can batch efficiently
+        # Convert to tuples for dictionary lookup
+        n_pairs = atom_pairs.shape[0]
+
+        # Find unique combinations
+        combined = torch.cat([atom_pairs, shell_pairs], dim=1)  # [N, 4]
+        unique_combos, inverse_indices = torch.unique(
+            combined, dim=0, return_inverse=True
+        )
+
+        # Process each unique combination
+        all_results = []
+        for i, combo in enumerate(unique_combos):
+            # Get mask for this combination
+            mask = inverse_indices == i
+            combo_distances = distances[mask]
+
+            # Lookup spline using tuple key
+            atom_pair_tuple = combo[:2].tolist()
+            shell_pair_tuple = combo[2:].tolist()
+            key = (*atom_pair_tuple, *shell_pair_tuple)
+
+            splines = self.off_site_dict[key]
+
+            # Evaluate spline for all distances with this combo
+            integrals = splines(combo_distances)
+
+            if isinstance(integrals, np.ndarray):
+                integrals = torch.from_numpy(integrals)
+
+            all_results.append((mask, integrals))
+
+        # Reconstruct output in original order
+        output = torch.zeros(
+            n_pairs,
+            all_results[0][1].shape[-1],
+            dtype=distances.dtype,
+            device=distances.device,
+        )
+
+        for mask, integrals in all_results:
+            output[mask] = integrals
+
+        return output
+
     def off_site(
         self,
         atom_pair: Tensor,

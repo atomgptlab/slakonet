@@ -17,10 +17,12 @@ from jarvis.io.vasp.inputs import Poscar
 import argparse
 import sys
 import time
+from jarvis.db.jsonutils import dumpjson
+import pprint
 
-plt.rcParams.update({"font.size": 18})
-
+plt.rcParams.update({"font.size": 14})
 H2E = 27.211
+
 parser = argparse.ArgumentParser(description="SlakoNet Pretrained Models")
 parser.add_argument(
     "--model_path",
@@ -28,7 +30,6 @@ parser.add_argument(
     # default="slakonet/tests/slakonet_v1_sic",
     help="Provide model path ",
 )
-
 parser.add_argument(
     "--pairwise_cutoff_length",
     type=float,
@@ -39,31 +40,27 @@ parser.add_argument(
 parser.add_argument(
     "--file_format", default="poscar", help="poscar/cif/xyz/pdb file format."
 )
-
 parser.add_argument(
     "--file_path",
     default=None,
     help="Path to atomic structure file.",
 )
-
 parser.add_argument(
     "--output_filename",
     default="slakonet_bands_dos.png",
     help="Path to desired output file name",
 )
-
 parser.add_argument(
     "--energy_range",
     default="-8 8",
     help="Energy range for bandstructure and DOS plots",
 )
-
-
 parser.add_argument(
     "--jid",
     default="JVASP-107",
     help="JARVIS-DFT Identifier",
 )
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -84,11 +81,9 @@ def get_properties(jid="", model=None, atoms=None, dataset=None, pairwise_cutoff
         atoms, opt_gap, mbj_gap = get_atoms(jid=jid, dataset=dataset)
     if model is None:
         model = default_model()
-
     # model=model.float()
     geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
     shell_dict = generate_shell_dict_upto_Z65()
-
     kpoints = Kpoints().kpath(atoms, line_density=20)
     klines = kpts_to_klines(kpoints.kpts, default_points=2)
 
@@ -102,17 +97,15 @@ def get_properties(jid="", model=None, atoms=None, dataset=None, pairwise_cutoff
             device=device,
             pairwise_cutoff_length=pairwise_cutoff_length,
         )
-
     if not success:
         raise RuntimeError("Failed to compute properties")
-
+    # print("properties",properties)
     return properties, atoms, kpoints
 
 
 def _format_kpath_ticks(labels):
     """
-    Make safe mathtext tick labels; skip empties and
-    dedup repeats; normalize Gamma.
+    Make safe mathtext tick labels; skip empties and dedup repeats; normalize Gamma.
     """
     xticks, xtick_labels = [], []
     last = None
@@ -139,7 +132,7 @@ def compute_orbital_projected_dos(
     """Compute orbital-projected DOS (s, p, d, f) from eigenvectors with Gaussian broadening."""
     # Eigen info from calculator (assumed in eV)
     fermi_eV = properties["fermi_energy_eV"]
-    eigenvalues = properties["calc"].eigenvalue * H2E  # [1, nk, nb]
+    eigenvalues = properties["calc"].eigenvalue  # * H2E  # [1, nk, nb]
     eigenvectors = properties["calc"].eigenvectors  # [1, norb, nb, nk]
 
     # Get atom types from geometry
@@ -169,7 +162,7 @@ def compute_orbital_projected_dos(
     energy_grid = torch.linspace(
         energy_range[0], energy_range[1], n_points, device=eigenvalues.device
     )
-    energy_grid_eV = energy_grid + fermi_eV
+    energy_grid_eV = energy_grid  # - fermi_eV
 
     # Initialize orbital PDOS for each atom type
     orbital_pdos = {}
@@ -181,7 +174,6 @@ def compute_orbital_projected_dos(
 
     # Build orbital-to-atom-and-shell mapping
     orbital_info = []  # List of (atom_idx, atom_type, shell_type)
-
     orbital_idx = 0
     for atom_idx, (atom_type, n_orbs, n_shells) in enumerate(
         zip(atom_types, orbs_per_atom, shells_per_atom)
@@ -189,7 +181,6 @@ def compute_orbital_projected_dos(
         # Determine which shells this atom has based on n_orbs
         # For example: 9 orbitals = s(1) + p(3) + d(5), so shells [0,1,2]
         # For example: 4 orbitals = s(1) + p(3), so shells [0,1]
-
         remaining_orbs = n_orbs
         shell_idx = 0
         while remaining_orbs > 0 and shell_idx < len(orbitals_per_shell):
@@ -216,6 +207,7 @@ def compute_orbital_projected_dos(
         for b in range(n_bands):
             eigenval = eigenvalues[0, k, b]
             psi = eigenvectors[0, :, b, k]  # shape [n_orbitals]
+
             diff = energy_grid_eV - eigenval
             gaussian = norm_factor * torch.exp(-0.5 * (diff / sigma) ** 2)
 
@@ -257,7 +249,6 @@ def plot_orbital_projected_dos(
 
     n_atoms = len(unique_atoms)
     fig, axes = plt.subplots(n_atoms, 1, figsize=(8, 4 * n_atoms), sharex=True)
-
     if n_atoms == 1:
         axes = [axes]
 
@@ -265,7 +256,6 @@ def plot_orbital_projected_dos(
 
     for idx, atom in enumerate(unique_atoms):
         ax = axes[idx]
-
         for shell in ["s", "p", "d", "f"]:
             if shell in orbital_pdos_np[atom]:
                 dos = orbital_pdos_np[atom][shell]
@@ -290,9 +280,8 @@ def plot_orbital_projected_dos(
 
     axes[-1].set_xlabel("Energy - E_F (eV)")
     plt.tight_layout()
-    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.savefig(filename, dpi=100, bbox_inches="tight")
     print(f"Orbital-projected DOS saved to {filename}")
-
     return fig
 
 
@@ -305,16 +294,16 @@ def compute_atom_projected_dos(
 ):
     """Compute atom-type projected DOS from eigenvectors with Gaussian broadening."""
     # Eigen info from calculator (assumed in eV)
-    fermi_eV = properties["fermi_energy_eV"]
-    eigenvalues = properties["calc"].eigenvalue * H2E  # [1, nk, nb]
-    eigenvectors = properties["calc"].eigenvectors  # [1, norb, nb, nk]
+    fermi_eV = properties["fermi_energy"]  # .detach().cpu().numpy()
+    eigenvalues = properties["eigenvalues"]  # * H2E  # [1, nk, nb]
+    eigenvectors = properties["eigenvectors"]  # [1, norb, nb, nk]
 
     # Get atom types from geometry
     atom_types = geometry.chemical_symbols[0]  # e.g., ['Zn', 'Zn', 'O', 'O']
     unique_atoms = list(dict.fromkeys(atom_types))  # preserve order
 
     # Get orbital-to-atom mapping from basis
-    basis = properties["calc"].basis
+    basis = properties["basis"]
     orbs_per_atom = basis.orbs_per_atom[0].cpu().numpy()  # [9, 9, 4, 4]
     on_atoms = (
         basis.on_atoms[0].cpu().numpy()
@@ -329,7 +318,7 @@ def compute_atom_projected_dos(
     energy_grid = torch.linspace(
         energy_range[0], energy_range[1], n_points, device=eigenvalues.device
     )
-    energy_grid_eV = energy_grid + fermi_eV
+    energy_grid_eV = energy_grid  # - fermi_eV
 
     # Initialize PDOS
     atom_pdos = {
@@ -355,17 +344,24 @@ def compute_atom_projected_dos(
 
     # Loop over k-points and bands
     batch_size, n_kpoints, n_bands = eigenvalues.shape
+    print(f"eigenvectors shape: {eigenvectors.shape}")
+    print(f"n_kpoints: {n_kpoints}")
+    print(f"n_bands: {n_bands}")
+
     for k in range(n_kpoints):
         for b in range(n_bands):
             eigenval = eigenvalues[0, k, b]
-            psi = eigenvectors[0, :, b, k]  # shape [n_orbitals]
+            psi = eigenvectors[0, k, b, :]  # shape [n_orbitals]
+            # psi = eigenvectors[0, :, b, k]  # shape [n_orbitals]
+
             diff = energy_grid_eV - eigenval
             gaussian = norm_factor * torch.exp(-0.5 * (diff / sigma) ** 2)
 
             for atom in unique_atoms:
                 orbital_indices = atom_orbital_map[atom]
                 atom_weight = torch.sum(torch.abs(psi[orbital_indices]) ** 2)
-                atom_pdos[atom] += atom_weight * gaussian
+                atom_pdos[atom] += (atom_weight * gaussian).squeeze()
+                # atom_weight * gaussian
 
     # Average over k-points
     for atom in atom_pdos:
@@ -391,7 +387,8 @@ def plot_band_dos_atoms(
 ):
     if not model:
         model = load_trained_model(model_path)
-    model = model.float()
+        model = model.float()
+    # print("MODEL PATHHHHH", model_path)
     properties, atoms, kpoints = get_properties(
         jid=jid,
         model=model,
@@ -399,19 +396,35 @@ def plot_band_dos_atoms(
         pairwise_cutoff_length=pairwise_cutoff_length
     )
     properties["model"] = model
+    info = {}
+
     if filename is None:
         filename = "slakonet_out.png"
     if jid is not None and filename is None:
         filename = str(jid) + "_slakonet_out.png"
 
     # Band structure data (assumed eV)
-    eigenvalues = properties["calc"].eigenvalue * H2E  # [1, nk, nb], eV
-    fermi_eV = float(properties["fermi_energy_eV"])  # scalar eV
+    eigenvalues = (
+        properties["eigenvalues"].detach().cpu().numpy()
+    )  # * H2E  # [1, nk, nb], eV
+    # eigenvalues = properties["calc"].eigenvalue * H2E  # [1, nk, nb], eV
+
+    # Eigenvalues are already referenced to Fermi energy, so fermi_eV = 0 for plotting
+    fermi_eV = 0.0  # Already subtracted in the eigenvalues
+
     formula = atoms.composition.reduced_formula
-    bandgap = float(properties["band_gap_eV"])
-    print("bandgap", bandgap)
+    bandgap = float(properties["bandgap"].detach().cpu().numpy())
+    print(f"Bandgap: {bandgap:.3f} eV")
+    cbm = float(properties["cbm"].detach().cpu().numpy())
+    print(f"CBM: {cbm:.3f} eV")
+    vbm = float(properties["vbm"].detach().cpu().numpy())
+    print(f"VBM: {vbm:.3f} eV")
+    info["cbm"] = cbm
+    info["vbm"] = vbm
+    info["atoms"] = atoms.to_dict()
+
     # Geometry for PDOS
-    geometry = properties["calc"].geometry
+    geometry = properties["geometry"]
 
     # Compute atom-projected DOS
     energy_grid, atom_pdos, unique_atoms = compute_atom_projected_dos(
@@ -421,23 +434,25 @@ def plot_band_dos_atoms(
     # K-point labels
     labels = kpoints.labels
     xticks, xtick_labels = _format_kpath_ticks(labels)
-
+    info["xticks"] = xticks
+    info["xtick_labels"] = xtick_labels
     # --- Plotting (constrained layout to avoid tight_layout warnings) ---
-    fig = plt.figure(figsize=(16, 6), layout="constrained")
+    fig = plt.figure(figsize=(10, 5), layout="constrained")
     gs = fig.add_gridspec(nrows=1, ncols=3, width_ratios=[3, 1, 1.5])
 
     ax1 = fig.add_subplot(gs[0])
     ax2 = fig.add_subplot(gs[1])
     ax3 = fig.add_subplot(gs[2])
 
-    # Bands: energy relative to Fermi
+    # Bands: eigenvalues already relative to Fermi (E_F = 0)
     for i in range(eigenvalues.shape[-1]):
-        y = eigenvalues[0, :, i].real.detach().cpu().numpy() - fermi_eV
+        y = eigenvalues[0, :, i].real  # Already referenced to Fermi
         ax1.plot(y, linewidth=0.8)
+    info["eigenvalues"] = eigenvalues[0, :, i].real.tolist()
     ax1.axhline(0, linestyle="--", alpha=0.7)
     ax1.set_xlabel("k-point")
     ax1.set_ylabel("Energy (eV)")
-    # ax1.set_title(f"{jid}  {formula}\nGap: {bandgap:.2f} eV")
+    # ax1.set_title(f"{jid} {formula}\nGap: {bandgap:.2f} eV")
     title = "(a) Gap " + str(round(bandgap, 2))
     ax1.set_title(title)
     # print("title", title)
@@ -446,49 +461,57 @@ def plot_band_dos_atoms(
     ax1.set_ylim(energy_range)
     # ax1.set_xlim([0,(eigenvalues.shape[-1])])
     ax1.grid(True, alpha=0.3)
+
     # Optional vertical guides at special k-points:
     # for x in xticks: ax1.axvline(x, linewidth=0.5, alpha=0.2)
 
-    # Total DOS: (x vs y so the curve appears horizontal)
+    # Total DOS: already referenced to Fermi
     dos_energies = (
         properties["dos_energy_grid_tensor"]
         .detach()
         .cpu()
-        .numpy()  # - fermi_eV
+        .numpy()  # Already referenced to Fermi
     )
+    info["dos_energies"] = dos_energies.tolist()
     dos_values = properties["dos_values_tensor"].detach().cpu().numpy()
+    info["dos_values"] = dos_values.tolist()
     ax2.plot(dos_values, dos_energies, linewidth=1.5)
     ax2.axhline(0, linestyle="--", alpha=0.7)
     ax2.set_xlabel("Total DOS")
     ax2.set_ylim(energy_range)
-    ax1.set_title("(b)")
+    ax2.set_title("(b)")
     ax2.grid(True, alpha=0.3)
     ax2.tick_params(left=False, labelleft=False)
-
-    # Atom-projected DOS
+    # info['atom_pdos']=atom_pdos
+    # Atom-projected DOS: already referenced to Fermi
     for atom in unique_atoms:
         ax3.plot(
-            atom_pdos[atom], np.array(energy_grid), linewidth=1.3, label=atom
+            atom_pdos[atom],
+            energy_grid,
+            linewidth=1.3,
+            label=atom,  # energy_grid already relative to Fermi
         )
         # ax3.fill_betweenx(energy_grid, 0, atom_pdos[atom], alpha=0.25)
+
     ax3.axhline(0, linestyle="--", alpha=0.7)
     ax3.set_xlabel("Atom PDOS")
-    # ax1.set_title("(a)")
-    ax1.set_title(title)
-    ax2.set_title("(b)")
     ax3.set_title("(c)")
     ax3.set_ylim(energy_range)
     ax3.grid(True, alpha=0.3)
     ax3.tick_params(left=False, labelleft=False)
     ax3.legend(loc="upper right")
+
     plt.tight_layout()
-    plt.savefig(filename)
+    plt.savefig(
+        filename, dpi=150, bbox_inches="tight"
+    )  # Reduced DPI from 300 to 150
     plt.close()
     # plt.show()
 
-    print(f"Fermi: {fermi_eV:.3f} eV | Gap: {bandgap:.3f} eV")
+    print(f"Gap: {bandgap:.3f} eV (Fermi level at E = 0)")
     # print(f"Atom types: {unique_atoms}")
-
+    # pprint.pprint(info)
+    dumpjson(data=info, filename="results.json")
     return fig, properties, atom_pdos, energy_grid
 
 
@@ -498,14 +521,17 @@ if __name__ == "__main__":
     model_path = args.model_path
     model = None
     atoms = None
+
     if model_path is None:
         model = default_model()
+
     file_path = args.file_path
     file_format = args.file_format
     output_filename = args.output_filename
     pairwise_cutoff_length = args.pairwise_cutoff_length
     energy_range = np.array(args.energy_range.split(" "), dtype="float")
     jid = args.jid
+
     if file_path is not None:
         if file_format == "poscar":
             atoms = Atoms.from_poscar(file_path)
