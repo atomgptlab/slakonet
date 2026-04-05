@@ -8,7 +8,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="slakonet",
-    version="2026.2.2",
+    version="2026.4.1",
     author="Kamal Choudhary",
     author_email="kchoudh2@jhu.edu",
     description="slakonet",
