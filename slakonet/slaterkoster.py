@@ -910,6 +910,7 @@ def add_kpoint(
     if isinstance(n_kpoints, Tensor):
         n_kpoints = torch.max(n_kpoints)
     # dtype = torch.complex64 if phase is not None else real_dtype
+    real_dtype = torch.get_default_dtype()
     dtype = torch.complex128 if phase is not None else real_dtype
     matc = torch.zeros(
         *shape_orbs,
