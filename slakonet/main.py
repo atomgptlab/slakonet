@@ -2673,6 +2673,7 @@ class SlakoNetCalculator(Calculator):
         return result
 
 
+"""
 # Example usage
 if __name__ == "__main__":
 
@@ -2971,3 +2972,4 @@ if __name__ == "__main__":
         fermi_shift=True, save_path="bands_enhanced.png"
     )
     plt.show()
+"""
