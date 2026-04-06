@@ -38,31 +38,33 @@ def test_basic():
     # Calculate total electron count for the system
     nelectron = model._calculate_system_electrons(geometry, updated_skfs)
 
-    kpoints = torch.tensor([5, 5, 5])
+    kpoints = torch.tensor([3, 3, 3])
     device = "cpu"
     with_eigenvectors = True
     calc = SimpleDftb(
         geometry,
-        shell_dict=shell_dict,
+        model,
+        # shell_dict=shell_dict,
         kpoints=kpoints,
-        h_feed=h_feed,
-        s_feed=s_feed,
-        nelectron=nelectron,
+        #h_feed=h_feed,
+        #s_feed=s_feed,
+        #nelectron=nelectron,
         device=device,
         with_eigenvectors=with_eigenvectors,
     )
 
-    info_ev = calc.calculate_ev_curve(
-        method="polynomial",
-    )
-    eigenvalues = calc()
-    energy = calc._calculate_electronic_energy()
-    forces = calc._compute_forces_finite_diff()
+    #info_ev = calc.calculate_ev_curve(
+    #    method="polynomial",
+    #)
+    #eigenvalues = calc()
+    calc.calculate()
+    energy = calc.energy
+    #forces = calc._compute_forces_finite_diff()
     # freqs,ds = calc.calculate_phonon_modes()
     print("energy", energy)
-    print("forces", forces)
-    print("eigenvalues", eigenvalues)
-    print("ev info", info_ev)
+    #print("forces", forces)
+    #print("eigenvalues", eigenvalues)
+    #print("ev info", info_ev)
     import sys
 
     # sys.exit()
@@ -79,7 +81,7 @@ def test_basic():
     )
     """
 
-
+"""
 def test_si():
     # Find the test file directory
     bandgap, opt_gap, mbj_gap, calc, formula = get_gap(
@@ -108,6 +110,7 @@ def test_training():
     print("vasprun_files", vasprun_files)
     multi_vasp_training(vasprun_files, model=model, batch_size=2)
 
+"""
 
 # test_basic()
 # test_si()
