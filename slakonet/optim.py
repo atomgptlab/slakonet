@@ -37,6 +37,7 @@ from tqdm import tqdm
 import zipfile
 import requests
 import io
+from jarvis.core.utils import get_cache_dir
 
 matplotlib.rcParams["figure.max_open_warning"] = 50
 # torch.set_default_dtype(torch.float32)
@@ -3024,7 +3025,8 @@ def default_model(dir_path=None, model_name="slakonet_v0"):
     Load or download the SlakoNet model with proper Figshare handling
     """
     if dir_path is None:
-        dir_path = str(os.path.join(os.path.dirname(__file__), model_name))
+        dir_path = os.path.join(get_cache_dir("slakonet"), model_name)
+        # dir_path = str(os.path.join(os.path.dirname(__file__), model_name))
     dir_path = os.path.abspath(dir_path)
 
     # Check for cached .pt file first

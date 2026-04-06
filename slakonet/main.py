@@ -2615,59 +2615,6 @@ class SlakoNetCalculator(Calculator):
                 result["eigenvalues"].detach().cpu().numpy()
             )
 
-    def calculateX(
-        self,
-        atoms=None,
-        properties=["energy", "forces", "bandgap", "eigenvalues", "results"],
-        system_changes=all_changes,
-    ):
-        """
-        Calculate properties using SlakoNet
-
-        Args:
-            atoms: ASE Atoms object
-            properties: List of properties to calculate
-            system_changes: Changes since last calculation
-        """
-        Calculator.calculate(self, atoms, properties, system_changes)
-        elements_in_structure = set(atoms.get_chemical_symbols())
-        if self.elements_needed != elements_in_structure:
-            self.set_elements(elements_in_structure)
-        # Auto-detect elements from structure if not set
-        # Get filtered SKFs
-        filtered_skfs = self._get_filtered_skfs()
-
-        # Run calculation with filtered model
-        result = self._run_calc_with_filtered_skfs(
-            atoms=atoms,
-            filtered_skfs=filtered_skfs,
-        )
-
-        # Extract results and convert to numpy arrays on CPU
-        self.results["energy"] = result["energy"].detach().cpu().numpy().item()
-        self.results["result"] = result
-        if "forces" in properties and result.get("forces") is not None:
-            forces = result["forces"].detach().cpu().numpy()
-            self.results["forces"] = forces.reshape(-1, 3)
-        if "stress" in properties and result.get("stress") is not None:
-            stress = result["stress"].detach().cpu().numpy()
-            self.results["stress"] = stress.reshape(-1, 3)
-            # self.results["stress"] = 160.21766208*stress.reshape(-1, 3)
-
-        if "fermi_energy" in result:
-            self.results["fermi_energy"] = (
-                result["fermi_energy"].detach().cpu().numpy().item()
-            )
-        if "bandgap" in result:
-            self.results["bandgap"] = (
-                result["bandgap"].detach().cpu().numpy().item()
-            )
-
-        if "eigenvalues" in result:
-            self.results["eigenvalues"] = (
-                result["eigenvalues"].detach().cpu().numpy()
-            )
-
     def get_bandgap(self):
         """Convenience method to get bandgap"""
         if "bandgap" not in self.results:
@@ -2726,225 +2673,7 @@ class SlakoNetCalculator(Calculator):
         return result
 
 
-class SlakoNetCalculatorX(Calculator):
-    """ASE Calculator interface for SlakoNet with dynamic element filtering"""
-
-    implemented_properties = ["energy", "forces", "stress"]
-
-    # Class-level model cache for sharing across instances
-    _model_cache = {}
-
-    def __init__(
-        self,
-        model=None,
-        model_path=None,
-        kpoints_array=[1, 1, 1],
-        device="cuda",
-        alpha=0.1,
-        beta=0.1,
-        compute_forces=True,
-        elements_needed=None,
-        use_cached_model=True,  # NEW: Enable model reuse
-        **kwargs,
-    ):
-        Calculator.__init__(self, **kwargs)
-
-        # Load or reuse model
-        if model is None and model_path is not None:
-            if use_cached_model and model_path in self._model_cache:
-                print(f"♻️  Reusing cached model for {model_path}")
-                model = self._model_cache[model_path]
-            else:
-                from slakonet.optim import MultiElementSkfParameterOptimizer
-
-                print(f"🔄 Loading full model from {model_path}...")
-
-                # Load FULL model with caching
-                model = MultiElementSkfParameterOptimizer.load_with_cache(
-                    model_path, cache_dir=".model_cache"
-                )
-
-                # Cache for reuse
-                if use_cached_model:
-                    self._model_cache[model_path] = model
-
-        elif model is None:
-            raise ValueError("Either model or model_path must be provided")
-
-        # Prepare model once
-        self.full_model = model.to(device).float()
-        self.full_model.eval()
-
-        # Store settings
-        self.model_path = model_path
-        self.elements_needed = elements_needed
-        self.kpoints_array = kpoints_array
-        self.device = device
-        self.compute_forces = compute_forces
-        self.alpha = alpha
-        self.beta = beta
-
-        # Create filtered view if elements specified
-        if elements_needed:
-            print(f"🎯 Filtering model for elements: {elements_needed}")
-            self.active_model = self._create_filtered_model(elements_needed)
-        else:
-            self.active_model = self.full_model
-
-    def _create_filtered_model(self, elements_needed):
-        """Create a lightweight filtered view of the model"""
-        # This creates a wrapper that only uses specified element pairs
-        # without copying the entire model
-        return FilteredModelView(self.full_model, elements_needed)
-
-    def set_elements(self, elements_needed):
-        """Dynamically change which elements to use"""
-        if elements_needed:
-            print(f"🔄 Switching to elements: {elements_needed}")
-            self.active_model = self._create_filtered_model(elements_needed)
-            self.elements_needed = elements_needed
-        else:
-            self.active_model = self.full_model
-            self.elements_needed = None
-
-    def calculate(
-        self,
-        atoms=None,
-        properties=["energy", "forces", "bandgap", "eigenvalues", "results"],
-        system_changes=all_changes,
-    ):
-        Calculator.calculate(self, atoms, properties, system_changes)
-
-        # Auto-detect elements if not specified
-        if self.elements_needed is None:
-            elements_in_structure = set(atoms.get_chemical_symbols())
-            self.set_elements(elements_in_structure)
-
-        # Use the active (possibly filtered) model
-        result = run_calc(
-            ase_atoms=atoms,
-            model=self.active_model,
-            model_path=None,
-            device=self.device,
-            kpoints_array=self.kpoints_array,
-            compute_forces=self.compute_forces,
-            alpha=self.alpha,
-            beta=self.beta,
-            elements_needed=None,
-        )
-
-        # Extract results
-        self.results["energy"] = result["energy"].detach().cpu().numpy().item()
-        self.results["result"] = result
-
-        if "forces" in properties:
-            forces = result["forces"].detach().cpu().numpy()
-            self.results["forces"] = forces.reshape(-1, 3)
-
-        if "fermi_energy" in result:
-            self.results["fermi_energy"] = (
-                result["fermi_energy"].detach().cpu().numpy().item()
-            )
-
-        if "bandgap" in result:
-            self.results["bandgap"] = (
-                result["bandgap"].detach().cpu().numpy().item()
-            )
-
-        if "eigenvalues" in result:
-            self.results["eigenvalues"] = (
-                result["eigenvalues"].detach().cpu().numpy()
-            )
-
-
-class SlakoNetCalculatorX(Calculator):
-    """ASE Calculator interface for SlakoNet"""
-
-    implemented_properties = ["energy", "forces", "stress"]
-
-    def __init__(
-        self,
-        model=None,
-        model_path=None,
-        kpoints_array=[1, 1, 1],
-        device="cuda",
-        alpha=0.1,
-        beta=0.1,
-        compute_forces=True,
-        elements_needed=None,
-        **kwargs,
-    ):
-        Calculator.__init__(self, **kwargs)
-
-        # Load model if needed
-        if model is None and model_path is not None:
-            from slakonet.optim import MultiElementSkfParameterOptimizer
-
-            print(f"🔄 Loading model from {model_path}...")
-            model = MultiElementSkfParameterOptimizer.load_ultra_compact_lazy(
-                model_path, elements_needed=elements_needed
-            )
-        elif model is None:
-            raise ValueError("Either model or model_path must be provided")
-
-        # ✅ PREPARE MODEL ONCE AT INITIALIZATION
-        self.model = model.to(device).float()
-        self.model.eval()
-
-        # Store other settings
-        self.model_path = model_path
-        self.elements_needed = elements_needed
-        self.kpoints_array = kpoints_array
-        self.device = device
-        self.compute_forces = compute_forces
-        self.alpha = alpha
-        self.beta = beta
-
-    def calculate(
-        self,
-        atoms=None,
-        properties=["energy", "forces", "bandgap", "eigenvalues", "results"],
-        system_changes=all_changes,
-    ):
-        Calculator.calculate(self, atoms, properties, system_changes)
-
-        # ✅ Use pre-prepared model (no loading/moving/converting here)
-        result = run_calc(
-            ase_atoms=atoms,
-            model=self.model,  # Pass the already-prepared model
-            model_path=None,  # Don't reload
-            device=self.device,
-            kpoints_array=self.kpoints_array,
-            compute_forces=self.compute_forces,
-            alpha=self.alpha,
-            beta=self.beta,
-            elements_needed=None,  # Already filtered at init
-        )
-
-        # Extract results
-        self.results["energy"] = result["energy"].detach().cpu().numpy().item()
-        self.results["result"] = result
-
-        if "forces" in properties:
-            forces = result["forces"].detach().cpu().numpy()
-            self.results["forces"] = forces.reshape(-1, 3)
-
-        if "fermi_energy" in result:
-            self.results["fermi_energy"] = (
-                result["fermi_energy"].detach().cpu().numpy().item()
-            )
-
-        if "bandgap" in result:
-            self.results["bandgap"] = (
-                result["bandgap"].detach().cpu().numpy().item()
-            )
-
-        if "eigenvalues" in result:
-            self.results["eigenvalues"] = (
-                result["eigenvalues"].detach().cpu().numpy()
-            )
-
-
+"""
 # Example usage
 if __name__ == "__main__":
 
@@ -2965,7 +2694,7 @@ if __name__ == "__main__":
 
     sys.exit()
 
-    ase_atoms.calc = SimpleDftbCalculator(model, kpoints=[2, 2, 2])
+    ase_atoms.calc = SlakoNetCalculator(model, kpoints=[2, 2, 2])
 
     # Get energy and forces
     energy = ase_atoms.get_potential_energy()
@@ -3032,7 +2761,7 @@ if __name__ == "__main__":
     print("ele", s.nelectron)
     res = s.calculate()
     print("res", res)
-    calc = SimpleDftbCalculator(
+    calc = SlakoNetCalculator(
         model=model,
         device="cuda",
     )
@@ -3118,9 +2847,7 @@ if __name__ == "__main__":
     kpoints = Kpoints3D().kpath(jarvis_atoms, line_density=20)
     klines = kpts_to_klines(kpoints.kpts, default_points=2)
 
-    calc_bands = SimpleDftbCalculator(
-        model=model, klines=klines, device="cuda"
-    )
+    calc_bands = SlakoNetCalculator(model=model, klines=klines, device="cuda")
 
     atoms.calc = calc_bands
     atoms.get_potential_energy()
@@ -3245,3 +2972,4 @@ if __name__ == "__main__":
         fermi_shift=True, save_path="bands_enhanced.png"
     )
     plt.show()
+"""
