@@ -2207,6 +2207,7 @@ class SimpleDftb:
             "occupations": occupations,
             "geometry": self.geometry,
             "basis": self.basis,
+            "hk_tensor": H,
         }
         # Calculate DOS data if needed
         # include_dos_data=False
