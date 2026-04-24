@@ -104,7 +104,7 @@ class Periodic:
                 self.positions_pe,
                 self.positions_vec,
                 self.periodic_distances,
-            ) = self._periodic_distance()
+            ) = self._periodic_distance_matscipy()
             self.neighbour_pos, self.neighbour_vec, self.neighbour_dis = (
                 self._neighbourlist()
             )
@@ -290,6 +290,76 @@ class Periodic:
         )
 
         return cellvec, rcellvec, ncell
+
+    def _periodic_distance_matscipy(self):
+        """Matscipy-accelerated neighbor-cell detection with differentiable reconstruction."""
+        if self.mask_zero.any():
+            return self._periodic_distance()
+        try:
+            from matscipy.neighbours import neighbour_list as _msp_nl
+        except ImportError:
+            return self._periodic_distance()
+
+        import numpy as np
+        device = self.positions.device
+        dtype = self.positions.dtype
+        all_positions_pe, all_positions_vec, all_distances = [], [], []
+        all_rcellvec, all_cellvec = [], []
+
+        for ibatch in range(self._n_batch):
+            n_atoms = int(self.atomic_numbers[ibatch].ne(0).sum().item())
+            pos = self.positions[ibatch]       # [N_max, 3]  — keeps grad
+            latvec = self.latvec[ibatch]       # [3, 3]
+            pos_np = pos[:n_atoms].detach().cpu().numpy()
+            latvec_np = latvec.detach().cpu().numpy()
+            cutoff_val = float(self.cutoff[ibatch].item())
+
+            _, _, S_ij = _msp_nl(
+                "ijS", positions=pos_np, cell=latvec_np,
+                cutoff=cutoff_val, pbc=[True, True, True],
+            )
+            if len(S_ij) > 0:
+                S_np = np.unique(np.vstack([[[0,0,0]], S_ij]), axis=0).astype(np.float64)
+            else:
+                S_np = np.array([[0,0,0]], dtype=np.float64)
+
+            S_t = torch.tensor(S_np, dtype=dtype, device=device)   # [n_sub, 3]
+            rcellvec_sub = S_t @ latvec                             # [n_sub, 3]
+            positions_pe_b = rcellvec_sub.unsqueeze(1) + pos.unsqueeze(0)  # [n_sub, N_max, 3]
+            positions_vec_b = (
+                -positions_pe_b.unsqueeze(-3) + pos.unsqueeze(0).unsqueeze(-2)
+            )  # [n_sub, N_max, N_max, 3]
+            eps = 1e-12
+            distance_b = torch.sqrt(eps + (positions_vec_b ** 2).sum(-1))
+
+            if not self.atomic_numbers[ibatch].ne(0).all():
+                atom_mask = self.atomic_numbers[ibatch].ne(0)
+                pad_mask = ~(atom_mask.unsqueeze(-1) & atom_mask.unsqueeze(0))
+                distance_b = distance_b.masked_fill(pad_mask.unsqueeze(0), 1e3)
+
+            all_positions_pe.append(positions_pe_b)
+            all_positions_vec.append(positions_vec_b)
+            all_distances.append(distance_b)
+            all_rcellvec.append(rcellvec_sub)
+            all_cellvec.append(S_t)
+
+        if self._n_batch == 1:
+            positions_pe = all_positions_pe[0].unsqueeze(0)
+            positions_vec = all_positions_vec[0].unsqueeze(0)
+            periodic_distances = all_distances[0].unsqueeze(0)
+            new_rcellvec = all_rcellvec[0].unsqueeze(0)
+            new_cellvec = all_cellvec[0].unsqueeze(0)
+        else:
+            positions_pe = pack(all_positions_pe, value=1e3)
+            positions_vec = pack(all_positions_vec, value=1e3)
+            periodic_distances = pack(all_distances, value=1e3)
+            new_rcellvec = pack(all_rcellvec, value=1e3)
+            new_cellvec = pack(all_cellvec, value=1e3)
+
+        self.rcellvec = new_rcellvec
+        self.cellvec = new_cellvec
+        mask_central_cell = (new_rcellvec.abs().sum(-1) == 0)
+        return mask_central_cell, positions_pe, positions_vec, periodic_distances
 
     def _periodic_distance(self):
         """Get distances between central cell and neighbour cells - fully vectorized."""
