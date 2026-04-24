@@ -73,6 +73,10 @@ class SimpleDftb:
         beta=0.1,
         updated_skfs=None,
         fermi_surface=False,
+        use_scc=False,
+        scc_max_iter=60,
+        scc_mixing=0.2,
+        scc_tol=1e-5,
         # shell_dict=None,
         # h_feed=None,
         # s_feed=None,
@@ -134,6 +138,11 @@ class SimpleDftb:
         self.alpha = alpha
         self.beta = beta
         self.fermi_surface = fermi_surface
+        self.use_scc = use_scc
+        self.scc_max_iter = scc_max_iter
+        self.scc_mixing = scc_mixing
+        self.scc_tol = scc_tol
+        self._scc_info = None
 
     def _generate_shell_dict_from_skfs(self):
         """
@@ -156,19 +165,13 @@ class SimpleDftb:
                 skf_dict = skf.to_dict()
                 atomic_data = skf_dict.get("atomic_data", {})
                 occ = atomic_data.get("occupations", []) if atomic_data else []
+                # SKF atomic_data lists one occupation per shell in order
+                # (s, p, d, f, ...), irrespective of whether the shell is
+                # empty. So the basis contains shells [0, 1, ..., len(occ)-1].
                 n = len(occ)
-
-                shells = []
-                remaining = n
-                for l, size in [(0, 1), (1, 3), (2, 5), (3, 7)]:
-                    if remaining <= 0:
-                        break
-                    if remaining >= size:
-                        shells.append(l)
-                        remaining -= size
-
-                if not shells:
-                    # print(f"  WARNING: Could not infer shells for {symbol} (Z={Z}), occ={occ}. Defaulting to [0,1].")
+                if n > 0:
+                    shells = list(range(min(n, 4)))
+                else:
                     shells = [0, 1]
 
                 # print(f"  shell_dict[{Z}] ({symbol}): {n} occupations → shells {shells}")
@@ -352,6 +355,76 @@ class SimpleDftb:
             else None
         )
         occupations = torch.stack(occupations_list, dim=1)
+
+        return eigenvalues, eigenvectors, occupations
+
+    def _solve_scc(self, H, S):
+        """Self-consistent-charge solve using slakonet.scc."""
+        from slakonet.scc import (
+            atom_U_from_skf, reference_charges, scc_solve,
+        )
+
+        # unbatched tensors
+        H_u = H[0] if H.ndim == 4 else H
+        S_u = S[0] if S.ndim == 4 else S
+
+        # Atom-level U's
+        atomic_numbers = self.geometry.atomic_numbers
+        if atomic_numbers.ndim == 2:
+            atomic_numbers = atomic_numbers[0]
+        U_list = []
+        for Z in atomic_numbers.tolist():
+            if Z <= 0:
+                U_list.append(0.0); continue
+            u = atom_U_from_skf(self.updated_skfs, Z, self.shell_dict)
+            U_list.append(u if u is not None else 0.0)
+        U_atom = torch.tensor(U_list, dtype=torch.float64, device=self.device)
+
+        # Reference charges
+        q_ref = reference_charges(
+            atomic_numbers, self.updated_skfs, self.shell_dict
+        ).to(self.device)
+
+        # Positions in Bohr (slakonet internal)
+        positions = self.geometry.positions
+        if positions.ndim == 3:
+            positions = positions[0]
+        positions = positions.to(torch.float64).to(self.device)
+
+        nelec = float(self.nelectron.flatten()[0].item())
+        kw = self.k_weights.flatten().to(torch.float64).to(self.device)
+        kT_Ha = float(self.kT) / self.H2E
+
+        info = scc_solve(
+            H0=H_u, S=S_u, basis=self.basis,
+            positions_bohr=positions, U_per_atom=U_atom,
+            q_ref=q_ref, nelectron=nelec, k_weights=kw,
+            kT_Ha=kT_Ha, max_iter=self.scc_max_iter,
+            mixing=self.scc_mixing, tol=self.scc_tol,
+            verbose=False,
+        )
+        self._scc_info = {
+            "delta_q": info["delta_q"],
+            "E_scc_Ha": info["E_scc"],
+            "E_scc_eV": info["E_scc"] * self.H2E,
+            "converged": info["converged"],
+            "n_iter": info["n_iter"],
+            "mu_Ha": info["mu_Ha"],
+        }
+
+        # Package to match _solve_eigenvalue_problem return layout:
+        #   eigenvalues (eV): [batch=1, Nk, Nband]
+        #   eigenvectors     : [batch=1, Nk, Nband, Norb]  (if requested)
+        #   occupations      : [batch=1, Nk, Nband]
+        ev_Ha = info["eigenvalues"].real                    # [Nband, Nk]
+        Nband, Nk = ev_Ha.shape
+        eigenvalues = ev_Ha.T.unsqueeze(0) * self.H2E       # [1, Nk, Nband]
+        occupations = info["occupations"].T.unsqueeze(0)    # [1, Nk, Nband]
+        if self.with_eigenvectors:
+            C = info["eigenvectors"]                        # [Norb, Nband, Nk]
+            eigenvectors = C.permute(2, 1, 0).unsqueeze(0)  # [1, Nk, Nband, Norb]
+        else:
+            eigenvectors = None
 
         return eigenvalues, eigenvectors, occupations
 
@@ -811,14 +884,17 @@ class SimpleDftb:
 
             skf = self.updated_skfs[element_pair]
             if not skf.r_spline:
-                return 0
+                continue
             # Create atom pair mask
             mask_i = atom_pairs[..., 0] == iap[0]
             mask_j = atom_pairs[..., 1] == iap[1]
             mask_pair = mask_i & mask_j
 
-            # Only non-zero distances
-            mask_nonzero = dist_mat.gt(1e-8)
+            # Only non-zero distances. dist_mat = sqrt(dv^2 + 1e-10) has a
+            # floor of ~1e-5 for true self-pairs (atom with itself in the
+            # central cell), so the threshold must be well above that to
+            # exclude them from the repulsive sum.
+            mask_nonzero = dist_mat.gt(1e-3)
             mask = mask_pair & mask_nonzero
 
             if not mask.any():
@@ -826,59 +902,64 @@ class SimpleDftb:
 
             d_masked = dist_mat[mask]
 
-            # Get grid and coefficients
-            r_cutoff = skf.r_spline.cutoff  # *2
-            grid = skf.r_spline.grid.to(self.device)  # *2
+            # Get grid and coefficients. SKF stores repulsive in Hartree; the
+            # *27.211 factor converts to eV so the result matches electronic
+            # energy (which is already converted to eV in _solve_eigenvalue...).
+            r_cutoff = skf.r_spline.cutoff
+            grid = skf.r_spline.grid.to(self.device)
             exp_coef = skf.r_spline.exp_coef.to(self.device) * 27.211
             spline_coef = skf.r_spline.spline_coef.to(self.device) * 27.211
             tail_coef = skf.r_spline.tail_coef.to(self.device) * 27.211
-            in_tail = (d_masked >= grid[0]) & (d_masked <= grid[1])
-            in_spline = (d_masked > grid[1]) & (d_masked < grid[-1])
-            in_exp = (d_masked >= grid[-1]) & (d_masked < r_cutoff)
 
-            # Initialize energy for this pair type
+            # SKF repulsive regions (standard Slater-Koster convention):
+            #   r < grid[0]             : exponential head  exp(-a*r + b) + c
+            #   grid[0] <= r < grid[-1] : cubic spline (one segment per interval)
+            #   grid[-1] <= r < cutoff  : 5th-order tail polynomial
+            #   r >= cutoff             : 0
+            in_exp_head = d_masked < grid[0]
+            in_spline = (d_masked >= grid[0]) & (d_masked < grid[-1])
+            in_tail = (d_masked >= grid[-1]) & (d_masked < r_cutoff)
+
             pair_energy = torch.zeros_like(d_masked)
 
-            # 1. Tail region (closest distances)
-            if in_tail.any():
-                d_tail = d_masked[in_tail]
-                ind = torch.searchsorted(grid[:2], d_tail) - 1
-                ind = torch.clamp(ind, 0, 0)  # Only one interval in tail
-                dr = d_tail - grid[ind]
-
-                pair_energy[in_tail] = (
-                    tail_coef[0]
-                    + tail_coef[1] * dr
-                    + tail_coef[2] * dr**2
-                    + tail_coef[3] * dr**3
-                    + tail_coef[4] * dr**4
-                    + tail_coef[5] * dr**5
+            # 1. Exponential head (very short range)
+            if in_exp_head.any():
+                d_hd = d_masked[in_exp_head]
+                pair_energy[in_exp_head] = (
+                    torch.exp(-exp_coef[0] * d_hd + exp_coef[1]) + exp_coef[2]
                 )
 
-            # 2. Spline region (middle distances)
+            # 2. Cubic spline (covers all grid intervals)
             if in_spline.any():
-                d_spline = d_masked[in_spline]
-                ind = torch.searchsorted(grid, d_spline) - 1
-                ind = torch.clamp(ind, 0, len(grid) - 2)
+                d_sp = d_masked[in_spline]
+                # locate interval index: searchsorted with 'right' and -1 so
+                # grid[ind] <= d_sp < grid[ind+1], clamped to last interval
+                ind = torch.searchsorted(grid, d_sp, right=True) - 1
+                ind = torch.clamp(ind, 0, spline_coef.shape[0] - 1)
                 r_pol = spline_coef[ind]
-                dr = d_spline - grid[ind]
-
+                dr = d_sp - grid[ind]
                 pair_energy[in_spline] = (
                     r_pol[..., 0]
                     + r_pol[..., 1] * dr
-                    + r_pol[..., 2] * dr**2
-                    + r_pol[..., 3] * dr**3
+                    + r_pol[..., 2] * dr ** 2
+                    + r_pol[..., 3] * dr ** 3
                 )
 
-            # 3. Exponential region (far distances)
-            if in_exp.any():
-                d_exp = d_masked[in_exp]
-                pair_energy[in_exp] = (
-                    torch.exp(-exp_coef[0] * d_exp + exp_coef[1]) + exp_coef[2]
+            # 3. 5th-order tail (grid[-1] to cutoff)
+            if in_tail.any():
+                d_tl = d_masked[in_tail]
+                dr = d_tl - grid[-1]
+                pair_energy[in_tail] = (
+                    tail_coef[0]
+                    + tail_coef[1] * dr
+                    + tail_coef[2] * dr ** 2
+                    + tail_coef[3] * dr ** 3
+                    + tail_coef[4] * dr ** 4
+                    + tail_coef[5] * dr ** 5
                 )
 
-            # Accumulate (0.5 to avoid double counting)
-            total_rep_energy += 0.5 * pair_energy.sum()
+            # Accumulate (0.5 to avoid double counting pairs)
+            total_rep_energy = total_rep_energy + 0.5 * pair_energy.sum()
 
         return total_rep_energy
 
@@ -2080,18 +2161,31 @@ class SimpleDftb:
         H = hs_matrix(self.periodic, self.basis, self.h_feed).to(self.device)
         S = hs_matrix(self.periodic, self.basis, self.s_feed).to(self.device)
 
-        # Solve eigenvalue problem
-        eigenvalues, eigenvectors, occupations = (
-            self._solve_eigenvalue_problem(H, S)
-        )
+        # Solve eigenvalue problem (SCC or non-SCC)
+        if self.use_scc:
+            eigenvalues, eigenvectors, occupations = (
+                self._solve_scc(H, S)
+            )
+        else:
+            eigenvalues, eigenvectors, occupations = (
+                self._solve_eigenvalue_problem(H, S)
+            )
 
-        # Compute Fermi energy
-        fermi_energy = fermi_search(
-            eigenvalues=eigenvalues,
-            n_electrons=self.nelectron,
-            k_weights=self.k_weights,
-            kT=self.kT,
-        )
+        # Compute Fermi energy. If SCC ran it already exposed a consistent mu;
+        # use that to avoid a second-pass Fermi search disagreeing with the
+        # charges actually used in the SCC loop.
+        if self.use_scc and self._scc_info is not None:
+            mu_eV = float(self._scc_info["mu_Ha"]) * self.H2E
+            fermi_energy = torch.tensor(
+                [mu_eV], device=self.device, dtype=eigenvalues.dtype
+            )
+        else:
+            fermi_energy = fermi_search(
+                eigenvalues=eigenvalues,
+                n_electrons=self.nelectron,
+                k_weights=self.k_weights,
+                kT=self.kT,
+            )
 
         # Electronic energy
         electronic_energy = torch.sum(
@@ -2106,6 +2200,13 @@ class SimpleDftb:
         else:
             potential_energy = torch.tensor(0.0, device=self.device)
             total_energy = electronic_energy
+
+        # Add SCC second-order energy if SCC was used
+        if self.use_scc and self._scc_info is not None:
+            E_scc_eV = self._scc_info["E_scc_eV"]
+            if not torch.is_tensor(E_scc_eV):
+                E_scc_eV = torch.tensor(float(E_scc_eV), device=self.device)
+            total_energy = total_energy + E_scc_eV
 
         # Shift eigenvalues relative to Fermi level
         eigenvalues_shifted = eigenvalues - fermi_energy
@@ -2244,6 +2345,8 @@ class SimpleDftb:
         else:
             dos_data = {}
         self._results.update(dos_data)
+        if self.use_scc and self._scc_info is not None:
+            self._results["scc"] = self._scc_info
 
         # Store results
         if self.include_HS:

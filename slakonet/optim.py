@@ -124,7 +124,7 @@ def get_klines_example(
     # atoms=Atoms.from_poscar("tests/POSCAR-SiC.vasp")
     geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
     # Generate shell dictionary
-    shell_dict = generate_shell_dict_upto_Z65()
+    shell_dict = generate_shell_dict_upto_Z65(model=model)
     kpoints = Kpoints().kpath(atoms, line_density=line_density)
     labels = kpoints.labels
     xticks = []
@@ -1325,7 +1325,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         print(f"Atomic numbers in geometry: {atomic_nums}")
 
         # Get shell information
-        shell_dict = generate_shell_dict_upto_Z65()
+        shell_dict = generate_shell_dict_upto_Z65(model=self)
 
         # Check what interactions we need
         needed_interactions = []
@@ -1807,7 +1807,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         print(f"Atomic numbers in geometry: {atomic_nums}")
 
         # Get shell information
-        shell_dict = generate_shell_dict_upto_Z65()
+        shell_dict = generate_shell_dict_upto_Z65(model=self)
 
         # Check what interactions we need
         needed_interactions = []
@@ -2593,7 +2593,7 @@ def train_multi_vasp_skf_parameters(
     multi_element_optimizer.print_multi_element_summary()
 
     # Setup training
-    shell_dict = generate_shell_dict_upto_Z65()
+    shell_dict = generate_shell_dict_upto_Z65(model=multi_element_optimizer)
     kpoints = torch.tensor([5, 5, 5])
 
     # Setup optimizer and scheduler
@@ -2944,7 +2944,7 @@ def analyze_multi_vasp_performance(
     print("MULTI-VASP PERFORMANCE ANALYSIS")
     print("=" * 50)
 
-    shell_dict = generate_shell_dict_upto_Z65()
+    shell_dict = generate_shell_dict_upto_Z65(model=trained_optimizer)
     kpoints = torch.tensor([5, 5, 5])
     # kpoints = torch.tensor([11, 11, 11])
 

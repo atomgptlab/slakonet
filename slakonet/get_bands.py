@@ -70,7 +70,7 @@ def get_gap(
     # atoms=Atoms.from_poscar("tests/POSCAR-SiC.vasp")
     geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
     # Generate shell dictionary
-    shell_dict = generate_shell_dict_upto_Z65()
+    shell_dict = generate_shell_dict_upto_Z65(model=model)
     kpoints = Kpoints().kpath(atoms, line_density=line_density)
     labels = kpoints.labels
     xticks = []

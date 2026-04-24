@@ -1395,10 +1395,46 @@ def create_feeds(updated_skfs, shell_dict, integral_type):
     return SkfFeed(hs_dict, onsite_hs_dict, shell_dict)
 
 
-def generate_shell_dict_upto_Z65():
-    """Generate shell_dict for atomic numbers 1-65."""
+def generate_shell_dict_upto_Z65(model=None):
+    """Generate shell_dict for atomic numbers 1-99.
+
+    If `model` is provided (any slakonet model exposing get_updated_skfs()),
+    shells are derived from the SKF atomic_data.occupations length (one entry
+    per shell in order s, p, d, f), which is the authoritative source.
+    Elements not covered by the model fall back to the hardcoded table below.
+
+    The hardcoded table is a coarse fallback; it can be wrong where the
+    underlying SKF actually carries d-integrals for a main-group element
+    (e.g. Si in Si_only.pt has an spd basis, whereas the hardcoded table
+    lists Si as sp).
+    """
     shell_dict = {}
+
+    # 1) If a model is provided, harvest shells from its SKFs first.
+    if model is not None and hasattr(model, "get_updated_skfs"):
+        try:
+            from jarvis.core.specie import Specie
+            for pair_key, skf in model.get_updated_skfs().items():
+                for sym in pair_key.split("-"):
+                    Z = Specie(sym).Z
+                    if Z in shell_dict:
+                        continue
+                    try:
+                        occ = skf.to_dict().get("atomic_data", {}).get(
+                            "occupations", []
+                        )
+                    except Exception:
+                        occ = []
+                    if occ:
+                        shell_dict[Z] = list(range(min(len(occ), 4)))
+        except Exception:
+            # Any SKF introspection failure -> fall through to hardcoded table
+            pass
+
+    # 2) Hardcoded fallback for Z's not resolved above.
     for Z in range(1, 100):
+        if Z in shell_dict:
+            continue
         if Z <= 2:  # H, He
             shell_dict[Z] = [0]
         elif Z <= 10:  # Li to Ne
@@ -1409,15 +1445,14 @@ def generate_shell_dict_upto_Z65():
             shell_dict[Z] = [0, 1, 2]
         elif Z <= 36:  # Ga to Kr
             shell_dict[Z] = [0, 1]
-        elif Z <= 48:  # transition metals
+        elif Z <= 48:
             shell_dict[Z] = [0, 1, 2]
         elif Z <= 54:  # In to Xe
             shell_dict[Z] = [0, 1]
         elif Z <= 57:  # Cs, Ba, La
             shell_dict[Z] = [0, 1, 2]
-        else:  # lanthanides
+        else:
             shell_dict[Z] = [0, 1, 2]
-            # shell_dict[Z] = [0, 1, 2, 3]
     return shell_dict
 
 
