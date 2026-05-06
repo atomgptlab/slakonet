@@ -25,7 +25,7 @@ from jarvis.core.specie import atomic_numbers_to_symbols
 from slakonet.skf import Skf
 from slakonet.main import SimpleDftb, generate_shell_dict_upto_Z65
 from slakonet.skfeed import SkfFeed, _get_hs_dict, _get_onsite_dict
-from slakonet.interpolation import PolyInterpU
+from slakonet.interpolation import PolyInterpU, get_default_interpolator
 from slakonet.atoms import Geometry
 from jarvis.io.vasp.outputs import Vasprun
 import matplotlib.pyplot as plt
@@ -849,6 +849,250 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             f"Loaded {len(self.skf_optimizers)} optimizers from universal parameters"
         )
 
+    # ------------------------------------------------------------------
+    # safetensors serialization (fast, mmap-able, lazy-by-element)
+    # ------------------------------------------------------------------
+    def save_safetensors(self, save_path, *, dedup=True):
+        """Save the model as a safetensors blob + JSON manifest.
+
+        Output:
+            <stem>.safetensors  -- all tensors, mmap-able
+            <stem>.manifest.json -- top-level + per-pair metadata
+        Lazy loaders can read the manifest, then pull only the tensors for
+        the requested element pairs from the safetensors file.
+        """
+        import json
+        from safetensors.torch import save_file as _safe_save
+
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        if save_path.suffix in (".pt", ".safetensors"):
+            stem = save_path.with_suffix("")
+        else:
+            stem = save_path
+        st_path = stem.with_suffix(".safetensors")
+        mf_path = stem.with_suffix(".manifest.json")
+
+        tensors = {}                      # flat key -> torch.Tensor
+        manifest_pairs = {}
+        # Optional dedup: identical tensors (same shape+dtype+content hash)
+        # share storage by recording a single canonical key per group.
+        dedup_table = {}                  # blake2b -> canonical_key
+
+        def _put_tensor(key, t):
+            t_cpu = t.detach().cpu().contiguous()
+            if dedup:
+                import hashlib
+                h = hashlib.blake2b(
+                    t_cpu.numpy().tobytes(),
+                    digest_size=16,
+                    key=str(t_cpu.dtype).encode() + str(tuple(t_cpu.shape)).encode(),
+                ).hexdigest()
+                if h in dedup_table:
+                    return dedup_table[h]
+                dedup_table[h] = key
+            tensors[key] = t_cpu
+            return key
+
+        def _serialize_value(parent_key, value):
+            """Return a JSON-safe representation. Tensors are pushed to the
+            tensor blob and replaced with {"@tensor": key}.  Recurses into
+            dicts/lists/tuples."""
+            if isinstance(value, torch.Tensor):
+                k = _put_tensor(parent_key, value)
+                return {"@tensor": k}
+            if isinstance(value, (list, tuple)):
+                return [_serialize_value(f"{parent_key}.{i}", v)
+                        for i, v in enumerate(value)]
+            if isinstance(value, dict):
+                return {str(kk): _serialize_value(f"{parent_key}.{kk}", v)
+                        for kk, v in value.items()}
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            # numpy scalar / array
+            if hasattr(value, "tolist"):
+                return value.tolist()
+            return repr(value)            # fallback (shouldn't happen for SKF data)
+
+        for pair_key, opt in self.skf_optimizers.items():
+            pair_meta = {"h_params_keys": [], "s_params_keys": [],
+                         "skf_dict_extra": {}}
+
+            for sub_k, p in opt.h_params.items():
+                tk = _put_tensor(f"{pair_key}/h_params/{sub_k}", p)
+                pair_meta["h_params_keys"].append({"name": sub_k, "tensor": tk})
+            for sub_k, p in opt.s_params.items():
+                tk = _put_tensor(f"{pair_key}/s_params/{sub_k}", p)
+                pair_meta["s_params_keys"].append({"name": sub_k, "tensor": tk})
+
+            # SKF non-(h,s) metadata: serialize tensors + non-tensors
+            extra = {k: v for k, v in opt.skf_dict.items()
+                     if k not in ("hamiltonian", "overlap")}
+            pair_meta["skf_dict_extra"] = _serialize_value(
+                f"{pair_key}/skf_extra", extra
+            )
+
+            # Repulsive spline (object with tensor fields)
+            if getattr(opt, "r_spline", None) is not None:
+                rs = opt.r_spline
+                pair_meta["r_spline"] = {
+                    "grid":        {"@tensor": _put_tensor(
+                        f"{pair_key}/r_spline/grid", torch.as_tensor(rs.grid))},
+                    "cutoff":      float(rs.cutoff) if not torch.is_tensor(rs.cutoff)
+                                   else float(rs.cutoff.item()
+                                              if rs.cutoff.numel() == 1
+                                              else rs.cutoff.flatten()[0]),
+                    "spline_coef": {"@tensor": _put_tensor(
+                        f"{pair_key}/r_spline/spline_coef", torch.as_tensor(rs.spline_coef))},
+                    "exp_coef":    {"@tensor": _put_tensor(
+                        f"{pair_key}/r_spline/exp_coef", torch.as_tensor(rs.exp_coef))},
+                    "tail_coef":   {"@tensor": _put_tensor(
+                        f"{pair_key}/r_spline/tail_coef", torch.as_tensor(rs.tail_coef))},
+                }
+            else:
+                pair_meta["r_spline"] = None
+
+            manifest_pairs[pair_key] = pair_meta
+
+        manifest = {
+            "format_version": 1,
+            "class_name": "MultiElementSkfParameterOptimizer",
+            "skf_directory": getattr(self, "skf_directory", None),
+            "elements_in_system": sorted(getattr(self, "elements_in_system", []) or []),
+            "element_pairs": [list(p) for p in (getattr(self, "element_pairs", []) or [])],
+            "available_pairs": sorted(self.skf_optimizers.keys()),
+            "pairs": manifest_pairs,
+        }
+
+        _safe_save(tensors, str(st_path))
+        with open(mf_path, "w") as f:
+            json.dump(manifest, f)
+
+        n_tensors = len(tensors)
+        sz = os.path.getsize(st_path) / (1024 * 1024)
+        print(f"✅ safetensors saved : {st_path}  ({sz:.1f} MB, {n_tensors} unique tensors)")
+        print(f"   manifest        : {mf_path}")
+        return str(st_path), str(mf_path)
+
+    @classmethod
+    def load_safetensors(cls, load_path, *, elements=None, mmap=True):
+        """Lazy load a safetensors-backed model.
+
+        Args:
+            load_path: path to either the .safetensors file or its stem.
+            elements: optional iterable of element symbols. Only pairs whose
+                two species both appear in this set are materialized. If
+                None, all pairs are loaded.
+            mmap: use safe_open(..., framework="pt") which mmaps the file.
+        """
+        import json
+        import time
+        from safetensors import safe_open
+        from slakonet.skf import Skf
+
+        t_total = time.time()
+
+        load_path = Path(load_path)
+        if load_path.suffix == ".safetensors":
+            stem = load_path.with_suffix("")
+        elif load_path.suffix == ".json":
+            stem = load_path.with_suffix("").with_suffix("")
+        else:
+            stem = load_path
+        st_path = stem.with_suffix(".safetensors")
+        mf_path = stem.with_suffix(".manifest.json")
+
+        with open(mf_path, "r") as f:
+            manifest = json.load(f)
+
+        all_pairs = manifest["available_pairs"]
+        if elements is not None:
+            elements = set(elements)
+            pairs_to_load = [
+                p for p in all_pairs
+                if all(part in elements for part in p.split("-"))
+            ]
+        else:
+            pairs_to_load = list(all_pairs)
+        print(f"🎯 safetensors lazy-load: {len(pairs_to_load)}/{len(all_pairs)} "
+              f"pairs{' (elements=' + str(sorted(elements)) + ')' if elements else ''}")
+
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+        instance.skf_directory = manifest.get("skf_directory")
+        instance.elements_in_system = set(manifest.get("elements_in_system") or [])
+        instance.element_pairs = set(
+            tuple(p) for p in manifest.get("element_pairs") or []
+        )
+        instance.skf_optimizers = nn.ModuleDict()
+
+        from jarvis.core.specie import atomic_numbers_to_symbols
+        zz = list(range(1, 100))
+        z = atomic_numbers_to_symbols(zz)
+        instance.atomic_num_to_symbol = dict(zip(zz, z))
+
+        def _resolve(spec, fh):
+            """Replace {"@tensor": key} entries with materialized tensors."""
+            if isinstance(spec, dict):
+                if "@tensor" in spec and len(spec) == 1:
+                    return fh.get_tensor(spec["@tensor"])
+                return {k: _resolve(v, fh) for k, v in spec.items()}
+            if isinstance(spec, list):
+                return [_resolve(v, fh) for v in spec]
+            return spec
+
+        framework = "pt"
+        with safe_open(str(st_path), framework=framework) as fh:
+            for pair_key in pairs_to_load:
+                pmeta = manifest["pairs"][pair_key]
+
+                opt = SkfParameterOptimizer.__new__(SkfParameterOptimizer)
+                nn.Module.__init__(opt)
+
+                # Hamiltonian / overlap
+                h_params = {}
+                for entry in pmeta["h_params_keys"]:
+                    h_params[entry["name"]] = fh.get_tensor(entry["tensor"])
+                s_params = {}
+                for entry in pmeta["s_params_keys"]:
+                    s_params[entry["name"]] = fh.get_tensor(entry["tensor"])
+
+                opt.h_params = nn.ParameterDict(
+                    {k: nn.Parameter(v) for k, v in h_params.items()}
+                )
+                opt.s_params = nn.ParameterDict(
+                    {k: nn.Parameter(v) for k, v in s_params.items()}
+                )
+
+                # SKF dict extras
+                extra = _resolve(pmeta["skf_dict_extra"], fh) or {}
+                skf_dict = dict(extra)
+                skf_dict["hamiltonian"] = h_params
+                skf_dict["overlap"] = s_params
+                opt.skf_dict = skf_dict
+                opt.grid = skf_dict.get("grid", None)
+                opt.atomic_data = skf_dict.get("atomic_data", None)
+                opt.atom_pair = skf_dict.get("atom_pair", None)
+                opt.hs_cutoff = skf_dict.get("hs_cutoff", None)
+
+                rspl = pmeta.get("r_spline")
+                if rspl is not None:
+                    rspl_resolved = _resolve(rspl, fh)
+                    opt.r_spline = Skf.RSpline(
+                        grid=rspl_resolved["grid"],
+                        cutoff=rspl_resolved["cutoff"],
+                        spline_coef=rspl_resolved["spline_coef"],
+                        exp_coef=rspl_resolved["exp_coef"],
+                        tail_coef=rspl_resolved["tail_coef"],
+                    )
+                else:
+                    opt.r_spline = None
+
+                instance.skf_optimizers[pair_key] = opt
+
+        print(f"✅ safetensors load complete in {time.time()-t_total:.2f}s")
+        return instance
+
     def save_ultra_compact(self, save_path):
         """
         Save everything in a single .pt file with minimal redundancy
@@ -1477,11 +1721,11 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             skf_path = os.path.join(self.skf_directory, filename)
             try:
                 print(f"Loading SKF optimizer for {pair_key} from {skf_path}")
-                self.skf_optimizers[pair_key] = SkfParameterOptimizer(skf_path)
-                successful_pairs.append(
-                    pair_key,
+                self.skf_optimizers[pair_key] = SkfParameterOptimizer(
+                    skf_path,
                     optimize_repulsive_only=self.optimize_repulsive_only,
                 )
+                successful_pairs.append(pair_key)
             except Exception as e:
                 print(f"Failed to load {pair_key}: {e}")
 
@@ -1638,7 +1882,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         self, updated_skfs, shell_dict, integral_type
     ):
         """Create comprehensive feed that includes all element interactions with proper orientation handling"""
-        interpolator = PolyInterpU
+        interpolator = get_default_interpolator()
 
         # Initialize dictionaries
         hs_dict = {}
@@ -3020,17 +3264,73 @@ def analyze_multi_vasp_performance(
     return results
 
 
-def default_model(dir_path=None, model_name="slakonet_v0"):
+def _smart_load_slakonet_model(stem_or_pt, elements=None, prefer=None):
+    """Choose the best available format and lazy-load if possible.
+
+    Args:
+        stem_or_pt: either '<stem>' or '<stem>.pt'. Looks for
+            '<stem>.safetensors' + '<stem>.manifest.json' first.
+        elements: optional set of element symbols. If provided AND the
+            safetensors format is available, only those pairs are loaded.
+        prefer: 'safetensors' | 'pt' | None. None reads SLAKONET_LOADER from
+            env (default 'safetensors'). Use 'pt' to force the legacy path.
+
+    Returns: loaded model in eval/float mode.
     """
-    Load or download the SlakoNet model with proper Figshare handling
+    p = Path(stem_or_pt)
+    stem = p.with_suffix("") if p.suffix == ".pt" else p
+    st_path = stem.with_suffix(".safetensors")
+    mf_path = stem.with_suffix(".manifest.json")
+    pt_path = stem.with_suffix(".pt")
+
+    if prefer is None:
+        prefer = os.environ.get("SLAKONET_LOADER", "safetensors").lower()
+
+    can_st = st_path.exists() and mf_path.exists()
+    if prefer == "safetensors" and can_st:
+        print(f"Loading safetensors from {st_path}"
+              + (f"  (elements={sorted(elements)})" if elements else ""))
+        model = MultiElementSkfParameterOptimizer.load_safetensors(
+            stem, elements=elements
+        )
+    else:
+        if prefer == "safetensors" and not can_st:
+            print(f"safetensors not found beside {pt_path}; falling back to .pt")
+        print(f"Loading cached model from {pt_path}")
+        model = MultiElementSkfParameterOptimizer.load_ultra_compact(pt_path)
+    model.eval()
+    model = model.float()
+    return model
+
+
+def default_model(dir_path=None, model_name="slakonet_v0", elements=None,
+                  prefer=None):
+    """
+    Load or download the SlakoNet model with proper Figshare handling.
+
+    Args:
+        elements: optional iterable of element symbols. When the
+            safetensors-format cache exists, only the matching SKF pairs are
+            materialized (fast, low-memory). Has no effect on the legacy
+            .pt path.
+        prefer: 'safetensors' | 'pt' | None. Overrides SLAKONET_LOADER env.
     """
     if dir_path is None:
         dir_path = os.path.join(get_cache_dir("slakonet"), model_name)
         # dir_path = str(os.path.join(os.path.dirname(__file__), model_name))
     dir_path = os.path.abspath(dir_path)
 
-    # Check for cached .pt file first
-    cached_model_file = os.path.join(dir_path, f"{model_name}.pt")
+    cached_pt = os.path.join(dir_path, f"{model_name}.pt")
+    if os.path.exists(cached_pt) or os.path.exists(
+        os.path.join(dir_path, f"{model_name}.safetensors")
+    ):
+        return _smart_load_slakonet_model(
+            os.path.join(dir_path, model_name),
+            elements=elements, prefer=prefer,
+        )
+
+    # Old behaviour kept below for the download/extract path
+    cached_model_file = cached_pt
     if os.path.exists(cached_model_file):
         print(f"Loading cached model from {cached_model_file}")
         model = MultiElementSkfParameterOptimizer.load_ultra_compact(

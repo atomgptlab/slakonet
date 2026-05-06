@@ -331,13 +331,25 @@ class SkfFeed(_SkFeed):
             shell_pair_tuple = combo[2:].tolist()
             key = (*atom_pair_tuple, *shell_pair_tuple)
 
-            splines = self.off_site_dict[key]
+            splines = self.off_site_dict.get(key)
 
-            # Evaluate spline for all distances with this combo
-            integrals = splines(combo_distances)
-
-            if isinstance(integrals, np.ndarray):
-                integrals = torch.from_numpy(integrals)
+            if splines is None:
+                # SKF table doesn't tabulate this shell-pair (e.g. d on a
+                # light element). The Slater-Koster integral is zero by
+                # convention; the number of SK integrals for shell pair
+                # (l1, l2) is min(l1, l2) + 1  (σ, π, δ, ...).
+                l1, l2 = int(shell_pair_tuple[0]), int(shell_pair_tuple[1])
+                n_int = min(l1, l2) + 1
+                integrals = torch.zeros(
+                    combo_distances.shape[0], n_int,
+                    dtype=combo_distances.dtype,
+                    device=combo_distances.device,
+                )
+            else:
+                # Evaluate spline for all distances with this combo
+                integrals = splines(combo_distances)
+                if isinstance(integrals, np.ndarray):
+                    integrals = torch.from_numpy(integrals)
 
             all_results.append((mask, integrals))
 
@@ -350,7 +362,7 @@ class SkfFeed(_SkFeed):
         )
 
         for mask, integrals in all_results:
-            output[mask] = integrals
+            output[mask] = integrals.to(dtype=output.dtype, device=output.device)
 
         return output
 

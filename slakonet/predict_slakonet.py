@@ -62,14 +62,18 @@ parser.add_argument(
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def load_trained_model(model_path, method="compact"):
-    model = MultiElementSkfParameterOptimizer.load_ultra_compact(
-        # model = MultiElementSkfParameterOptimizer.load_model(
-        model_path
-        # model_path, method="state_dict"
+def load_trained_model(model_path, method="compact", elements=None, prefer=None):
+    """Load a SlakoNet model.
+
+    Prefers the safetensors layout (lazy, mmap) when available next to
+    `model_path`. Set `prefer="pt"` (or env SLAKONET_LOADER=pt) to force the
+    legacy torch.load path. Pass `elements={"Si","C"}` to materialize only
+    the relevant SKF pairs.
+    """
+    from slakonet.optim import _smart_load_slakonet_model
+    model = _smart_load_slakonet_model(
+        model_path, elements=elements, prefer=prefer
     )
-    # model.float()
-    # model=model.half()
     model.eval()
     return model
 
@@ -101,23 +105,87 @@ def get_properties(jid="", model=None, atoms=None, dataset=None, cutoff=None):
     return properties, atoms, kpoints
 
 
+def _split_path_discontinuities(eigenvalues, labels):
+    """Insert NaN rows at k-path discontinuities so band lines break cleanly.
+
+    A label containing '|' marks a jump between non-adjacent high-symmetry
+    points (end of segment N | start of segment N+1). We duplicate the
+    k-index, replace eigenvalues at the inserted slot with NaN so the
+    polyline is broken, and split the label into ``left`` and ``right``
+    at neighboring indices.
+    """
+    import numpy as np
+
+    if not any(isinstance(l, str) and "|" in l for l in labels):
+        return eigenvalues, list(labels)
+
+    new_labels = []
+    insert_positions = []
+    for i, lbl in enumerate(labels):
+        if isinstance(lbl, str) and "|" in lbl:
+            left, right = lbl.split("|", 1)
+            new_labels.append(left)
+            new_labels.append(right)
+            insert_positions.append(i)
+        else:
+            new_labels.append(lbl)
+
+    if eigenvalues is None or eigenvalues.size == 0 or not insert_positions:
+        return eigenvalues, new_labels
+
+    eig = np.asarray(eigenvalues)
+    nan_row = np.full_like(eig[..., :1, :], np.nan)
+    pieces = []
+    last = 0
+    for p in insert_positions:
+        pieces.append(eig[..., last : p + 1, :])
+        pieces.append(nan_row)
+        last = p + 1
+    pieces.append(eig[..., last:, :])
+    return np.concatenate(pieces, axis=-2), new_labels
+
+
 def _format_kpath_ticks(labels):
     """
     Make safe mathtext tick labels; skip empties and dedup repeats; normalize Gamma.
+
+    When two non-empty high-symmetry labels land on adjacent k-indices
+    (the result of a ``|`` discontinuity having been split), merge them
+    into a single ``L|R`` tick rendered at the midpoint so they don't
+    visually overlap.
     """
-    xticks, xtick_labels = [], []
-    last = None
+    def _render(lbl):
+        if lbl in ("G", r"\Gamma", "Γ"):
+            return r"$\Gamma$"
+        return rf"${lbl}$"
+
+    raw = []
     for i, lbl in enumerate(labels):
         if not lbl or lbl.strip() == "":
             continue
-        if lbl in ("G", r"\Gamma", "Γ"):
-            show = r"$\Gamma$"
-        else:
-            show = rf"${lbl}$"
-        if show != last:
+        raw.append((i, lbl))
+
+    xticks, xtick_labels = [], []
+    last_text = None
+    j = 0
+    while j < len(raw):
+        i, lbl = raw[j]
+        if j + 1 < len(raw) and raw[j + 1][0] == i + 1:
+            i2, lbl2 = raw[j + 1]
+            show = rf"${lbl}|{lbl2}$" if lbl != lbl2 else _render(lbl)
+            pos = (i + i2) / 2.0
+            if show != last_text:
+                xticks.append(pos)
+                xtick_labels.append(show)
+                last_text = show
+            j += 2
+            continue
+        show = _render(lbl)
+        if show != last_text:
             xticks.append(i)
             xtick_labels.append(show)
-            last = show
+            last_text = show
+        j += 1
     return xticks, xtick_labels
 
 
@@ -605,7 +673,16 @@ def plot_band_dos_atoms(
     plotly_filename=None,
 ):
     if not model:
-        model = load_trained_model(model_path)
+        elements_hint = None
+        if atoms is not None:
+            try:
+                elements_hint = set(atoms.elements)
+            except AttributeError:
+                try:
+                    elements_hint = set(atoms.get_chemical_symbols())
+                except Exception:
+                    elements_hint = None
+        model = load_trained_model(model_path, elements=elements_hint)
         model = model.float()
     # print("MODEL PATHHHHH", model_path)
     properties, atoms, kpoints = get_properties(
@@ -652,8 +729,9 @@ def plot_band_dos_atoms(
         for a, d in orbital_pdos.items()
     }
 
-    # K-point labels
+    # K-point labels — split discontinuities so band lines break cleanly
     labels = kpoints.labels
+    eigenvalues, labels = _split_path_discontinuities(eigenvalues, labels)
     xticks, xtick_labels = _format_kpath_ticks(labels)
     info["xticks"] = xticks
     info["xtick_labels"] = xtick_labels

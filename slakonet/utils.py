@@ -970,7 +970,7 @@ def eighb_memory_efficient(h_k, s_k, n_electrons=None):
 
 def eighb(h_k, s_k, scheme="chol"):
     """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
-    eps = 1e-8
+    eps = 1e-6
     device = h_k.device
     dtype = h_k.dtype
     n = h_k.shape[-1]
@@ -981,7 +981,8 @@ def eighb(h_k, s_k, scheme="chol"):
     if scheme == "chol":
         try:
             L = torch.linalg.cholesky(s_k_reg)
-            L_inv = torch.linalg.inv(L)
+            I_b = eye.expand_as(L)
+            L_inv = torch.linalg.solve_triangular(L, I_b, upper=False)
             H_tilde = L_inv @ h_k @ L_inv.mH
             eigenvals, eigenvecs_tilde = torch.linalg.eigh(H_tilde)
             eigenvecs = L_inv.mH @ eigenvecs_tilde
@@ -1372,7 +1373,7 @@ def tetrahedral_root(x: Union[Tensor, Real]) -> Union[Tensor, Real]:
 
 def create_feeds(updated_skfs, shell_dict, integral_type):
     """Create feed for H or S integrals."""
-    from slakonet.interpolation import PolyInterpU
+    from slakonet.interpolation import get_default_interpolator
     from slakonet.skfeed import (
         SkfFeed,
         SkfParamFeed,
@@ -1380,7 +1381,7 @@ def create_feeds(updated_skfs, shell_dict, integral_type):
         _get_onsite_dict,
     )
 
-    interpolator = PolyInterpU
+    interpolator = get_default_interpolator()
     hs_dict = {}
     onsite_hs_dict = {}
 

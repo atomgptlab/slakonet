@@ -95,11 +95,13 @@ class Basis:
 
         def map_to_atom_number(val):
             """Helps to build _shells/orbitals_per_species"""
+            keys = torch.tensor(
+                list(shell_dict.keys()), dtype=torch.long
+            )
+            src = torch.tensor(list(val), dtype=torch.long)
             return (
                 torch.zeros(MAX_ATOMIC_NUMBER, dtype=torch.long)
-                .scatter(
-                    0, torch.tensor(list(shell_dict.keys())), torch.tensor(val)
-                )
+                .scatter(0, keys, src)
                 .to(**kwargs)
             )
 
@@ -112,6 +114,13 @@ class Basis:
             [sum([l * 2 + 1 for l in v]) for v in shell_dict.values()]
         )
 
+        unknown = [int(n) for n in self.atomic_numbers.view(-1)
+                   if int(n) != 0 and int(n) not in shell_dict]
+        if unknown:
+            raise KeyError(
+                f"shell_dict has no entry for atomic number(s) {sorted(set(unknown))}; "
+                f"the loaded SKF model does not parameterise these elements"
+            )
         self.shell_ns, self.shell_ls = torch.tensor(
             [
                 (i, l)

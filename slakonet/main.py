@@ -164,11 +164,29 @@ class SimpleDftb:
 
                 skf_dict = skf.to_dict()
                 atomic_data = skf_dict.get("atomic_data", {})
-                occ = atomic_data.get("occupations", []) if atomic_data else []
-                # SKF atomic_data lists one occupation per shell in order
-                # (s, p, d, f, ...), irrespective of whether the shell is
-                # empty. So the basis contains shells [0, 1, ..., len(occ)-1].
-                n = len(occ)
+                # Prefer len(on_sites): SKFs pad occupations with empty
+                # higher-l shells (e.g. boron lists d-occupation = 0) but
+                # only tabulate on-sites for shells that are actually
+                # parameterised. Falling back to occupations if missing.
+                on_sites = atomic_data.get("on_sites", []) if atomic_data else []
+                if not on_sites:
+                    on_sites = atomic_data.get("on_site", []) if atomic_data else []
+                if on_sites:
+                    n = len(on_sites)
+                else:
+                    n = len(atomic_data.get("occupations", []) if atomic_data else [])
+                # Cross-check with the actual H/S keys: the largest l index
+                # appearing in keys like 'l1-l2' bounds the basis from above.
+                ham = skf_dict.get("hamiltonian", {})
+                max_l_keys = -1
+                for k in ham.keys():
+                    try:
+                        l1, l2 = (int(x) for x in str(k).split("-"))
+                        max_l_keys = max(max_l_keys, l1, l2)
+                    except Exception:
+                        pass
+                if max_l_keys >= 0:
+                    n = min(n if n > 0 else max_l_keys + 1, max_l_keys + 1)
                 if n > 0:
                     shells = list(range(min(n, 4)))
                 else:
@@ -923,18 +941,16 @@ class SimpleDftb:
                     + r_pol[..., 3] * dr ** 3
                 )
 
-            # 3. 5th-order tail (grid[-1] to cutoff)
+            # 3. Polynomial tail (grid[-1] to cutoff). Standard SKF format
+            # gives 6 coefficients (5th-order); some pair files only ship 4.
+            # Evaluate via Horner's rule over whatever order is provided.
             if in_tail.any():
                 d_tl = d_masked[in_tail]
                 dr = d_tl - grid[-1]
-                pair_energy[in_tail] = (
-                    tail_coef[0]
-                    + tail_coef[1] * dr
-                    + tail_coef[2] * dr ** 2
-                    + tail_coef[3] * dr ** 3
-                    + tail_coef[4] * dr ** 4
-                    + tail_coef[5] * dr ** 5
-                )
+                acc = torch.zeros_like(d_tl)
+                for c in tail_coef.flip(0):
+                    acc = acc * dr + c
+                pair_energy[in_tail] = acc
 
             # Accumulate (0.5 to avoid double counting pairs)
             total_rep_energy = total_rep_energy + 0.5 * pair_energy.sum()
