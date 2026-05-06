@@ -714,6 +714,7 @@ def plot_band_dos_atoms(
     print(f"VBM: {vbm:.3f} eV")
     info["cbm"] = cbm
     info["vbm"] = vbm
+    info["kpoints"] = kpoints.to_dict()
     info["atoms"] = atoms.to_dict()
 
     # Geometry for PDOS
