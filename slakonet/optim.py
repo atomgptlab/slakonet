@@ -1773,6 +1773,15 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         device=None,
         with_eigenvectors=False,
         cutoff=10.0,
+        # SCC + smearing: defaults match SimpleDftb's defaults so the
+        # behaviour is unchanged when these aren't passed. For ionic
+        # compounds (oxides, halides) override use_scc=True at the call
+        # site to get correct band edges.
+        use_scc=False,
+        kT=0.025,
+        alpha=0.1,
+        scc_max_iter=30,
+        scc_tol=1e-4,
     ):
         """Compute DFTB properties for multi-element systems using ALL available optimizers"""
         if device is None:
@@ -1791,35 +1800,26 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         # Setup k-lines for band structure
         # klines = self._get_default_klines()
 
-        # Create calculator with comprehensive feeds
+        # Create calculator with comprehensive feeds.
+        # Pass through SCC + smearing knobs — defaults of use_scc=True,
+        # kT=0.1 are needed for ionic compounds (e.g. SrTiO3) where
+        # charge transfer matters for the band edges.
+        common_kw = dict(
+            model=self,
+            device=device,
+            compute_forces=get_forces,
+            with_eigenvectors=with_eigenvectors,
+            cutoff=cutoff,
+            use_scc=use_scc,
+            kT=kT,
+            alpha=alpha,
+            scc_max_iter=scc_max_iter,
+            scc_tol=scc_tol,
+        )
         if klines is not None:
-            calc = SimpleDftb(
-                geometry,
-                # shell_dict=shell_dict,
-                klines=klines,
-                model=self,
-                # h_feed=h_feed,
-                # s_feed=s_feed,
-                # nelectron=nelectron,
-                device=device,
-                compute_forces=get_forces,
-                with_eigenvectors=with_eigenvectors,
-                cutoff=cutoff,
-            )
+            calc = SimpleDftb(geometry, klines=klines, **common_kw)
         else:
-            calc = SimpleDftb(
-                geometry,
-                # shell_dict=shell_dict,
-                kpoints=kpoints,
-                # h_feed=h_feed,
-                # s_feed=s_feed,
-                # nelectron=nelectron,
-                device=device,
-                model=self,
-                compute_forces=get_forces,
-                with_eigenvectors=with_eigenvectors,
-                cutoff=cutoff,
-            )
+            calc = SimpleDftb(geometry, kpoints=kpoints, **common_kw)
 
         # Compute properties
         properties = calc.calculate()
@@ -1979,14 +1979,17 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
     def _get_electrons_for_element(self, element_symbol, updated_skfs):
         """Get electron count for a specific element from SKF data"""
-        # Look for homo-nuclear pair first
+        # Look for homo-nuclear pair first.
+        # Spin-pair: every shell occupation listed in the SKF atomic_data
+        # already includes both spins (e.g. carbon's 2s² 2p² is occupations
+        # [2, 2]). So total electrons-per-atom = sum(occupations); no extra
+        # ×2 — the legacy fallback below was wrong.
         pair_key = f"{element_symbol}-{element_symbol}"
         if pair_key in updated_skfs:
             skf_dict = updated_skfs[pair_key].to_dict()
             if "atomic_data" in skf_dict and skf_dict["atomic_data"]:
                 occupations = skf_dict["atomic_data"]["occupations"]
-                return sum(occupations)  # Factor of 2 for spin
-                # return 2 * sum(occupations)  # Factor of 2 for spin
+                return sum(occupations)
 
         # Fallback: look in any pair containing this element
         for pair_key, skf in updated_skfs.items():
@@ -1996,7 +1999,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 if atomic_data:
                     occupations = atomic_data.get("occupations", [])
                     if occupations:
-                        return 2 * sum(occupations)
+                        return sum(occupations)   # consistent with homo branch
 
         # Default fallback based on atomic number
         atomic_num = None

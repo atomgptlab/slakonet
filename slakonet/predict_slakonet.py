@@ -58,6 +58,18 @@ parser.add_argument(
     default="10",
     help="Pairwise cutoff",
 )
+parser.add_argument(
+    "--use_scc", action="store_true",
+    help="Enable self-consistent charges. Recommended for ionic compounds "
+         "(oxides, halides, perovskites). Slower but correct band edges.",
+)
+parser.add_argument(
+    "--kT", default="0.025", help="Fermi smearing kT in eV",
+)
+parser.add_argument(
+    "--alpha", default="0.1",
+    help="Electronic-energy weighting alpha (use 1.0 for total energy / EOS)",
+)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -78,7 +90,8 @@ def load_trained_model(model_path, method="compact", elements=None, prefer=None)
     return model
 
 
-def get_properties(jid="", model=None, atoms=None, dataset=None, cutoff=None):
+def get_properties(jid="", model=None, atoms=None, dataset=None, cutoff=None,
+                   use_scc=False, kT=0.025, alpha=0.1):
     if atoms is None:
         atoms, opt_gap, mbj_gap = get_atoms(jid=jid, dataset=dataset)
     if model is None:
@@ -98,6 +111,9 @@ def get_properties(jid="", model=None, atoms=None, dataset=None, cutoff=None):
             with_eigenvectors=True,
             device=device,
             cutoff=cutoff,
+            use_scc=use_scc,
+            kT=kT,
+            alpha=alpha,
         )
     if not success:
         raise RuntimeError("Failed to compute properties")
@@ -671,6 +687,9 @@ def plot_band_dos_atoms(
     filename=None,
     cutoff=10.0,
     plotly_filename=None,
+    use_scc=False,
+    kT=0.025,
+    alpha=0.1,
 ):
     if not model:
         elements_hint = None
@@ -686,7 +705,8 @@ def plot_band_dos_atoms(
         model = model.float()
     # print("MODEL PATHHHHH", model_path)
     properties, atoms, kpoints = get_properties(
-        jid=jid, model=model, atoms=atoms, cutoff=cutoff
+        jid=jid, model=model, atoms=atoms, cutoff=cutoff,
+        use_scc=use_scc, kT=kT, alpha=alpha,
     )
     properties["model"] = model
     info = {}
@@ -746,16 +766,36 @@ def plot_band_dos_atoms(
     ax4 = fig.add_subplot(gs[3])
 
     # Bands: eigenvalues already relative to Fermi (E_F = 0).
-    # Mask numerical garbage from ill-conditioned eigh at boundary k-points
-    # (occasional ~±100-1000 eV outliers); replace with NaN so matplotlib
-    # breaks the line instead of drawing a vertical streak across the panel.
-    BAND_PLOT_MASK_EV = 50.0     # |E - E_F| beyond this is unphysical
+    # Two kinds of plot-side noise to suppress:
+    #   (a) Outlier eigenvalues from ill-conditioned eigh at certain
+    #       k-points (|E| can run to 100s of eV). Mask those to NaN.
+    #   (b) Band re-ordering at degeneracies / discontinuities — adjacent
+    #       k-points can have band[i] reshuffled, so connecting them
+    #       produces vertical streaks. Sort per-k (visual band index =
+    #       energy rank), then break the polyline whenever a band jumps
+    #       more than `JUMP_EV` between adjacent k-points.
+    BAND_PLOT_MASK_EV = 50.0
+    JUMP_EV = 2.0
     eigs_for_plot = np.asarray(eigenvalues, dtype=float).copy()
-    bad = np.abs(eigs_for_plot) > BAND_PLOT_MASK_EV
-    if bad.any():
-        eigs_for_plot[bad] = np.nan
-    for i in range(eigs_for_plot.shape[-1]):
-        y = eigs_for_plot[0, :, i].real
+    eigs_for_plot[np.abs(eigs_for_plot) > BAND_PLOT_MASK_EV] = np.nan
+
+    # Sort each k-point's band list in ascending energy
+    eigs_sorted = np.sort(eigs_for_plot, axis=-1)
+
+    # Break lines where the per-k jump is implausible
+    diffs = np.abs(np.diff(eigs_sorted, axis=-2))   # [batch, nk-1, nb]
+    big_jump = diffs > JUMP_EV
+    # Insert NaN at the latter k-point of each jump so the polyline breaks
+    # (replicate to match shape: jump[k-1] → NaN at k for the affected band)
+    eigs_plot2 = eigs_sorted.copy()
+    if eigs_plot2.shape[-2] > 1:
+        nan_mask = np.concatenate(
+            [np.zeros_like(big_jump[..., :1, :]), big_jump], axis=-2
+        ).astype(bool)
+        eigs_plot2[nan_mask] = np.nan
+
+    for i in range(eigs_plot2.shape[-1]):
+        y = eigs_plot2[0, :, i].real
         ax1.plot(y, linewidth=0.8)
     info["eigenvalues"] = eigenvalues[0, :, i].real.tolist()
     ax1.axhline(0, linestyle="--", alpha=0.7)
@@ -916,6 +956,9 @@ if __name__ == "__main__":
         energy_range=energy_range,
         filename=output_filename,
         cutoff=cutoff,
+        use_scc=args.use_scc,
+        kT=float(args.kT),
+        alpha=float(args.alpha),
     )
     t2 = time.time()
     print("Time(s)", t2 - t1)

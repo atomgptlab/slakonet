@@ -128,21 +128,30 @@ class SimpleDftb:
                 continue
             try:
                 _grid = torch.as_tensor(_rs.grid).to(self.device)
-                _exp_coef  = torch.as_tensor(_rs.exp_coef).to(self.device)  * 27.211
-                _spl_coef  = torch.as_tensor(_rs.spline_coef).to(self.device) * 27.211
-                _tail_coef = torch.as_tensor(_rs.tail_coef).to(self.device) * 27.211
-                _cutoff = (float(_rs.cutoff.item())
-                           if torch.is_tensor(_rs.cutoff)
-                           and _rs.cutoff.numel() == 1
-                           else (float(_rs.cutoff)
-                                 if not torch.is_tensor(_rs.cutoff)
-                                 else float(_rs.cutoff.flatten()[0].item())))
+                _exp_coef = (
+                    torch.as_tensor(_rs.exp_coef).to(self.device) * 27.211
+                )
+                _spl_coef = (
+                    torch.as_tensor(_rs.spline_coef).to(self.device) * 27.211
+                )
+                _tail_coef = (
+                    torch.as_tensor(_rs.tail_coef).to(self.device) * 27.211
+                )
+                _cutoff = (
+                    float(_rs.cutoff.item())
+                    if torch.is_tensor(_rs.cutoff) and _rs.cutoff.numel() == 1
+                    else (
+                        float(_rs.cutoff)
+                        if not torch.is_tensor(_rs.cutoff)
+                        else float(_rs.cutoff.flatten()[0].item())
+                    )
+                )
                 self._rspl_cache[_pair_key] = {
-                    "grid":        _grid,
-                    "cutoff":      _cutoff,
-                    "exp_coef":    _exp_coef,
+                    "grid": _grid,
+                    "cutoff": _cutoff,
+                    "exp_coef": _exp_coef,
                     "spline_coef": _spl_coef,
-                    "tail_coef":   _tail_coef,
+                    "tail_coef": _tail_coef,
                 }
             except Exception:
                 continue
@@ -201,13 +210,21 @@ class SimpleDftb:
                 # higher-l shells (e.g. boron lists d-occupation = 0) but
                 # only tabulate on-sites for shells that are actually
                 # parameterised. Falling back to occupations if missing.
-                on_sites = atomic_data.get("on_sites", []) if atomic_data else []
+                on_sites = (
+                    atomic_data.get("on_sites", []) if atomic_data else []
+                )
                 if not on_sites:
-                    on_sites = atomic_data.get("on_site", []) if atomic_data else []
+                    on_sites = (
+                        atomic_data.get("on_site", []) if atomic_data else []
+                    )
                 if on_sites:
                     n = len(on_sites)
                 else:
-                    n = len(atomic_data.get("occupations", []) if atomic_data else [])
+                    n = len(
+                        atomic_data.get("occupations", [])
+                        if atomic_data
+                        else []
+                    )
                 # Cross-check with the actual H/S keys: the largest l index
                 # appearing in keys like 'l1-l2' bounds the basis from above.
                 ham = skf_dict.get("hamiltonian", {})
@@ -303,15 +320,24 @@ class SimpleDftb:
         elif self.k_weights.numel() >= nkpoints:
             kw = self.k_weights[:nkpoints]
         else:
-            kw = torch.full((nkpoints,), 1.0 / nkpoints, device=self.device,
-                            dtype=energy_grid.dtype)
+            kw = torch.full(
+                (nkpoints,),
+                1.0 / nkpoints,
+                device=self.device,
+                dtype=energy_grid.dtype,
+            )
 
-        eigs = eigenvals[0]                                   # [nk, nb]
+        eigs = eigenvals[0]  # [nk, nb]
         # Gaussian broadening: g[ie, ik, ib] = exp(-0.5 ((E_e - eig_kb)/σ)²) / (σ √2π)
-        norm = (sigma_tensor * torch.sqrt(
-            torch.tensor(2.0 * torch.pi, device=self.device, dtype=energy_grid.dtype)))
-        diffs = (energy_grid.view(-1, 1, 1) - eigs.view(1, nkpoints, nbands)) / sigma_tensor
-        gauss = torch.exp(-0.5 * diffs * diffs) / norm        # [ne, nk, nb]
+        norm = sigma_tensor * torch.sqrt(
+            torch.tensor(
+                2.0 * torch.pi, device=self.device, dtype=energy_grid.dtype
+            )
+        )
+        diffs = (
+            energy_grid.view(-1, 1, 1) - eigs.view(1, nkpoints, nbands)
+        ) / sigma_tensor
+        gauss = torch.exp(-0.5 * diffs * diffs) / norm  # [ne, nk, nb]
         # Sum bands then weight-sum k-points: dos[ie] = Σ_k w_k * Σ_b g[ie,k,b]
         dos = (gauss.sum(dim=-1) * kw.view(1, -1)).sum(dim=-1)
         return energy_grid, dos
@@ -359,6 +385,7 @@ class SimpleDftb:
         # ~1.5–2× faster than the full generalised eigh.
         if not getattr(self, "with_eigenvectors", True):
             from slakonet.utils import eighb_vals_only
+
             eigenvals = eighb_vals_only(H_b, S_b, scheme="chol")
             eigenvecs = None
         else:
@@ -382,7 +409,11 @@ class SimpleDftb:
 
         if self.with_eigenvectors and eigenvecs is not None:
             ndim_ec = eigenvecs.ndim
-            perm_back_ec = tuple(range(1, ndim_ec - 2)) + (0, ndim_ec - 2, ndim_ec - 1)
+            perm_back_ec = tuple(range(1, ndim_ec - 2)) + (
+                0,
+                ndim_ec - 2,
+                ndim_ec - 1,
+            )
             eigenvectors = eigenvecs.permute(perm_back_ec)
         else:
             eigenvectors = None
@@ -392,7 +423,9 @@ class SimpleDftb:
     def _solve_scc(self, H, S):
         """Self-consistent-charge solve using slakonet.scc."""
         from slakonet.scc import (
-            atom_U_from_skf, reference_charges, scc_solve,
+            atom_U_from_skf,
+            reference_charges,
+            scc_solve,
         )
 
         # unbatched tensors
@@ -406,7 +439,8 @@ class SimpleDftb:
         U_list = []
         for Z in atomic_numbers.tolist():
             if Z <= 0:
-                U_list.append(0.0); continue
+                U_list.append(0.0)
+                continue
             u = atom_U_from_skf(self.updated_skfs, Z, self.shell_dict)
             U_list.append(u if u is not None else 0.0)
         U_atom = torch.tensor(U_list, dtype=torch.float64, device=self.device)
@@ -427,11 +461,18 @@ class SimpleDftb:
         kT_Ha = float(self.kT) / self.H2E
 
         info = scc_solve(
-            H0=H_u, S=S_u, basis=self.basis,
-            positions_bohr=positions, U_per_atom=U_atom,
-            q_ref=q_ref, nelectron=nelec, k_weights=kw,
-            kT_Ha=kT_Ha, max_iter=self.scc_max_iter,
-            mixing=self.scc_mixing, tol=self.scc_tol,
+            H0=H_u,
+            S=S_u,
+            basis=self.basis,
+            positions_bohr=positions,
+            U_per_atom=U_atom,
+            q_ref=q_ref,
+            nelectron=nelec,
+            k_weights=kw,
+            kT_Ha=kT_Ha,
+            max_iter=self.scc_max_iter,
+            mixing=self.scc_mixing,
+            tol=self.scc_tol,
             verbose=False,
         )
         self._scc_info = {
@@ -447,13 +488,15 @@ class SimpleDftb:
         #   eigenvalues (eV): [batch=1, Nk, Nband]
         #   eigenvectors     : [batch=1, Nk, Nband, Norb]  (if requested)
         #   occupations      : [batch=1, Nk, Nband]
-        ev_Ha = info["eigenvalues"].real                    # [Nband, Nk]
+        ev_Ha = info["eigenvalues"].real  # [Nband, Nk]
         Nband, Nk = ev_Ha.shape
-        eigenvalues = ev_Ha.T.unsqueeze(0) * self.H2E       # [1, Nk, Nband]
-        occupations = info["occupations"].T.unsqueeze(0)    # [1, Nk, Nband]
+        eigenvalues = ev_Ha.T.unsqueeze(0) * self.H2E  # [1, Nk, Nband]
+        occupations = info["occupations"].T.unsqueeze(0)  # [1, Nk, Nband]
         if self.with_eigenvectors:
-            C = info["eigenvectors"]                        # [Norb, Nband, Nk]
-            eigenvectors = C.permute(2, 1, 0).unsqueeze(0)  # [1, Nk, Nband, Norb]
+            C = info["eigenvectors"]  # [Norb, Nband, Nk]
+            eigenvectors = C.permute(2, 1, 0).unsqueeze(
+                0
+            )  # [1, Nk, Nband, Norb]
         else:
             eigenvectors = None
 
@@ -936,17 +979,17 @@ class SimpleDftb:
             # Use cached eV-converted on-device tensors when present.
             cache = getattr(self, "_rspl_cache", {}).get(element_pair, None)
             if cache is not None:
-                r_cutoff   = cache["cutoff"]
-                grid       = cache["grid"]
-                exp_coef   = cache["exp_coef"]
-                spline_coef= cache["spline_coef"]
-                tail_coef  = cache["tail_coef"]
+                r_cutoff = cache["cutoff"]
+                grid = cache["grid"]
+                exp_coef = cache["exp_coef"]
+                spline_coef = cache["spline_coef"]
+                tail_coef = cache["tail_coef"]
             else:
-                r_cutoff   = skf.r_spline.cutoff
-                grid       = skf.r_spline.grid.to(self.device)
-                exp_coef   = skf.r_spline.exp_coef.to(self.device) * 27.211
-                spline_coef= skf.r_spline.spline_coef.to(self.device) * 27.211
-                tail_coef  = skf.r_spline.tail_coef.to(self.device) * 27.211
+                r_cutoff = skf.r_spline.cutoff
+                grid = skf.r_spline.grid.to(self.device)
+                exp_coef = skf.r_spline.exp_coef.to(self.device) * 27.211
+                spline_coef = skf.r_spline.spline_coef.to(self.device) * 27.211
+                tail_coef = skf.r_spline.tail_coef.to(self.device) * 27.211
 
             # SKF repulsive regions (standard Slater-Koster convention):
             #   r < grid[0]             : exponential head  exp(-a*r + b) + c
@@ -978,8 +1021,8 @@ class SimpleDftb:
                 pair_energy[in_spline] = (
                     r_pol[..., 0]
                     + r_pol[..., 1] * dr
-                    + r_pol[..., 2] * dr ** 2
-                    + r_pol[..., 3] * dr ** 3
+                    + r_pol[..., 2] * dr**2
+                    + r_pol[..., 3] * dr**3
                 )
 
             # 3. Polynomial tail (grid[-1] to cutoff). Standard SKF format
@@ -2167,6 +2210,27 @@ class SimpleDftb:
 
         print(f"✅ Charge density written to {filename}")
 
+    # ────────────────────────────────────────────────────────────────
+    # Green's-function forwarding shims (impl in slakonet.greens)
+    # ────────────────────────────────────────────────────────────────
+    def green_function(self, omegas, **kw):
+        """G(k, ω); see slakonet.greens.lattice_green_function."""
+        from .greens import lattice_green_function
+
+        return lattice_green_function(self, omegas, **kw)
+
+    def local_green_function(self, omegas, correlated_subspace, **kw):
+        """G_loc(ω); see slakonet.greens.local_green_function."""
+        from .greens import local_green_function
+
+        return local_green_function(self, omegas, correlated_subspace, **kw)
+
+    def hybridization(self, omegas, correlated_subspace, **kw):
+        """Δ(ω); see slakonet.greens.hybridization."""
+        from .greens import hybridization
+
+        return hybridization(self, omegas, correlated_subspace, **kw)
+
     def calculate(self):
         """Main calculation method."""
         compute_forces = self.compute_forces
@@ -2198,9 +2262,7 @@ class SimpleDftb:
 
         # Solve eigenvalue problem (SCC or non-SCC)
         if self.use_scc:
-            eigenvalues, eigenvectors, occupations = (
-                self._solve_scc(H, S)
-            )
+            eigenvalues, eigenvectors, occupations = self._solve_scc(H, S)
         else:
             eigenvalues, eigenvectors, occupations = (
                 self._solve_eigenvalue_problem(H, S)
@@ -2268,9 +2330,12 @@ class SimpleDftb:
         # output is sorted, but safe-sort here covers numerical re-ordering).
         eigs_sorted, _ = torch.sort(eigenvalues, dim=-1)
 
-        vbm_val = torch.full(eigs_sorted.shape[:-2],
-                             float("nan"),
-                             dtype=eigs_sorted.dtype, device=self.device)
+        vbm_val = torch.full(
+            eigs_sorted.shape[:-2],
+            float("nan"),
+            dtype=eigs_sorted.dtype,
+            device=self.device,
+        )
         cbm_val = torch.full_like(vbm_val, float("nan"))
         bandgap = torch.zeros_like(vbm_val)
 
@@ -2279,17 +2344,21 @@ class SimpleDftb:
         # Threshold = 100 eV from zero — well outside any realistic valence
         # or low-conduction state.
         BAD_E_THRESHOLD = 100.0
-        bad_kp = (eigs_sorted.abs() > BAD_E_THRESHOLD).any(dim=-1)  # [batch, nk]
+        bad_kp = (eigs_sorted.abs() > BAD_E_THRESHOLD).any(
+            dim=-1
+        )  # [batch, nk]
         if bad_kp.any():
-            print(f"   ! bandgap: masking {int(bad_kp.sum())} ill-conditioned "
-                  f"k-points (eigenvalues with |E| > {BAD_E_THRESHOLD} eV)")
+            print(
+                f"   ! bandgap: masking {int(bad_kp.sum())} ill-conditioned "
+                f"k-points (eigenvalues with |E| > {BAD_E_THRESHOLD} eV)"
+            )
 
         if not (np.isnan(nelec_scalar) or nelec_scalar <= 0):
             n_val = int(round(nelec_scalar / 2.0))
             n_bands = eigs_sorted.shape[-1]
             if 1 <= n_val <= n_bands - 1:
-                vbm_per_k = eigs_sorted[..., :, n_val - 1]   # [batch, nk]
-                cbm_per_k = eigs_sorted[..., :, n_val]       # [batch, nk]
+                vbm_per_k = eigs_sorted[..., :, n_val - 1]  # [batch, nk]
+                cbm_per_k = eigs_sorted[..., :, n_val]  # [batch, nk]
                 # Replace bad k-points with values that won't dominate min/max
                 neg_inf = torch.full_like(vbm_per_k, float("-inf"))
                 pos_inf = torch.full_like(cbm_per_k, float("+inf"))
@@ -2302,6 +2371,60 @@ class SimpleDftb:
                 vbm_val = eigs_sorted[..., :, -1].max(dim=-1)[0]
                 cbm_val = vbm_val.clone()
                 bandgap = torch.zeros_like(vbm_val)
+
+        # ---- DOS-based fallback bandgap ----
+        # If the electron-count cut gives a near-zero gap (often because the
+        # SKF basis treats some shells as filled that shouldn't be, e.g. on
+        # SrTiO3 with the universal SKF), look for a wide *empty* interval
+        # in the eigenvalue spectrum near the Fermi level. If we find one
+        # ≥ 0.5 eV wide, prefer it over the count-based answer.
+        try:
+            for_search = eigs_sorted.detach()
+            for_search = (
+                for_search[~bad_kp.unsqueeze(-1).expand_as(for_search)]
+                if bad_kp.any()
+                else for_search
+            )
+            ev_flat = for_search.flatten().cpu().numpy()
+            ev_flat = ev_flat[np.abs(ev_flat) <= BAD_E_THRESHOLD]
+            ev_flat = np.sort(ev_flat)
+            f_eV = (
+                float(fermi_energy.flatten()[0].item())
+                if torch.is_tensor(fermi_energy)
+                else 0.0
+            )
+            # Largest gap in the spectrum that brackets f_eV
+            gaps = np.diff(ev_flat)
+            if gaps.size:
+                low = ev_flat[:-1]
+                high = ev_flat[1:]
+                # Largest spectrum gap whose midpoint is near the Fermi
+                # level. This catches cases where fermi_search positions
+                # Ef just below or above the actual gap.
+                near_f = 1.5  # eV window
+                mid = 0.5 * (low + high)
+                cand_mask = np.abs(mid - f_eV) <= near_f
+                if cand_mask.any():
+                    cand_gaps = gaps[cand_mask]
+                    dos_gap = float(cand_gaps.max())
+                    chosen = int(np.where(cand_mask)[0][np.argmax(cand_gaps)])
+                else:
+                    dos_gap = 0.0
+                    chosen = -1
+            else:
+                dos_gap = 0.0
+                chosen = -1
+            curr_gap = (
+                float(bandgap.flatten()[0].item())
+                if torch.is_tensor(bandgap)
+                else 0.0
+            )
+            if dos_gap >= 0.5 and curr_gap < 0.1 and chosen >= 0:
+                bandgap = torch.full_like(bandgap, dos_gap)
+                vbm_val = torch.full_like(vbm_val, float(ev_flat[chosen]))
+                cbm_val = torch.full_like(cbm_val, float(ev_flat[chosen + 1]))
+        except Exception:
+            pass
 
         # Compute forces
         forces = None
@@ -3144,3 +3267,116 @@ if __name__ == "__main__":
     )
     plt.show()
 """
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Public helper: H, S from ASE / JARVIS / pymatgen atoms
+# ────────────────────────────────────────────────────────────────────────────
+def hs_from_atoms(
+    atoms,
+    model=None,
+    kpoints=(3, 3, 3),
+    klines=None,
+    units="eV",
+    device=None,
+    use_scc=False,
+    repulsive=False,
+    return_calc=False,
+):
+    """
+    Build a slakonet calculator for a given structure and return the
+    k-resolved Hamiltonian and overlap.
+
+    Parameters
+    ----------
+    atoms : ASE Atoms | jarvis.core.atoms.Atoms | pymatgen Structure
+        Crystal structure. JARVIS / pymatgen objects are auto-converted
+        to ASE via ``ase_converter()`` / ``to_ase_atoms()`` if available.
+    model : slakonet model or None
+        Defaults to ``slakonet.optim.default_model()``.
+    kpoints : tuple[int, int, int] or None
+        Monkhorst-Pack mesh. Ignored if ``klines`` is given.
+    klines : tensor or None
+        Band-path lines. Takes precedence over ``kpoints``.
+    units : {"eV", "Ha"}
+        Unit of the returned Hamiltonian. Overlap is dimensionless.
+    device : str or None
+        Torch device. Defaults to CUDA if available, else CPU.
+    use_scc, repulsive : bool
+        Forwarded to ``SimpleDftb``.
+    return_calc : bool
+        If True, also return the calculator object (useful when you
+        want to keep using it for Green's functions, DOS, etc.).
+
+    Returns
+    -------
+    H : tensor, shape (Nk, Norb, Norb), complex
+    S : tensor, shape (Nk, Norb, Norb), complex
+    k_weights : tensor, shape (Nk,)
+    fermi_energy : float (eV)
+    calc : SimpleDftb        (only if ``return_calc=True``)
+    """
+    # ── Normalize input to ASE Atoms ──
+    if hasattr(atoms, "ase_converter"):  # JARVIS Atoms
+        ase_atoms = atoms.ase_converter()
+    elif hasattr(atoms, "to_ase_atoms"):  # pymatgen Structure
+        ase_atoms = atoms.to_ase_atoms()
+    else:
+        ase_atoms = atoms  # assume already ASE
+
+    if model is None:
+        from slakonet.optim import default_model
+
+        model = default_model()
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    geom = Geometry.from_ase_atoms([ase_atoms])
+
+    kpts_kw = None if klines is not None else torch.tensor(list(kpoints))
+    calc = SimpleDftb(
+        geom,
+        model,
+        kpoints=kpts_kw,
+        klines=klines,
+        device=device,
+        with_eigenvectors=False,
+        compute_forces=False,
+        include_dos_data=False,
+        include_HS=True,
+        repulsive=repulsive,
+        use_scc=use_scc,
+    )
+    calc.calculate()
+
+    # H, S stored as (batch, Norb, Norb, Nk) → reshape to (Nk, N, N)
+    H = calc._results["hamiltonian"]
+    S = calc._results["overlap"]
+    if H.ndim == 4:
+        H = H[0]
+        S = S[0]
+    H = H.permute(2, 0, 1).contiguous()
+    S = S.permute(2, 0, 1).contiguous()
+
+    if units.lower() == "ev":
+        H = H * calc.H2E
+    elif units.lower() != "ha":
+        raise ValueError(f"units must be 'eV' or 'Ha', got {units!r}")
+
+    k_weights = calc.k_weights
+    if k_weights.ndim == 2:
+        k_weights = k_weights[0]
+    fermi_eV = float(calc._results["fermi_energy"].flatten()[0].item())
+
+    if return_calc:
+        return H, S, k_weights, fermi_eV, calc
+    return H, S, k_weights, fermi_eV
+
+
+# from slakonet.main import hs_from_atoms
+# from slakonet.greens import OrbitalSubspace
+
+# H, S, kw, EF, calc = hs_from_atoms(jarvis_atoms, kpoints=(4,4,4), return_calc=True)
+# sub = OrbitalSubspace.from_atom_shells(calc.basis, atom_indices=[0], shells=[2])  # d-shell
+# G_loc = calc.local_green_function(torch.linspace(EF-5, EF+5, 200), sub, eta=0.1)
