@@ -631,19 +631,24 @@ def eighb_cpu(h_k, s_k, scheme="chol"):
     # ========================================
     if scheme == "chol":
         try:
-            # S = L·L^T (Cholesky decomposition)
+            # S = L·L^T  →  L^{-1} H L^{-T} via triangular solves
+            # (more accurate and faster than forming L^{-1} explicitly).
             L = torch.linalg.cholesky(s_k)
+            # X = L^{-1} H ⇔ L X = H
+            X = torch.linalg.solve_triangular(L, h_k, upper=False)
+            # h_transformed = X L^{-T} = (L^{-1} (L^{-1} H)^T)^T
+            h_transformed = torch.linalg.solve_triangular(
+                L, X.transpose(-2, -1).conj(), upper=False
+            ).transpose(-2, -1).conj()
 
-            # Transform: L^-1 · H · L^-T
-            L_inv = torch.linalg.inv(L)
-            h_transformed = L_inv @ h_k @ L_inv.transpose(-2, -1)
-
-            # Standard eigenvalue problem
             eigenvals, eigenvecs_transformed = torch.linalg.eigh(h_transformed)
 
-            # Back-transform eigenvectors: ψ = L^-T · ψ'
-            eigenvecs = L_inv.transpose(-2, -1) @ eigenvecs_transformed
-
+            # Back-transform eigenvectors: ψ = L^{-T} ψ'
+            eigenvecs = torch.linalg.solve_triangular(
+                L.transpose(-2, -1).conj(),
+                eigenvecs_transformed,
+                upper=True,
+            )
             return eigenvals, eigenvecs
 
         except RuntimeError as e:
@@ -979,6 +984,32 @@ def eighb_memory_efficient(h_k, s_k, n_electrons=None):
         print(f"❌ Memory-efficient solver failed: {e}")
         print(f"   Falling back to standard solver...")
         return eighb(h_k, s_k, scheme="chol")
+
+
+def eighb_vals_only(h_k, s_k, scheme="chol"):
+    """Eigenvalues-only generalised eigh.
+
+    For DOS / bandgap / Fermi search we don't need eigenvectors —
+    `eigvalsh` skips the eigenvector construction (~1.5–2× faster than
+    `eigh` for the same matrix). On Cholesky failure we fall back to
+    Löwdin orthogonalisation with eigenvalues-only.
+    """
+    try:
+        L = torch.linalg.cholesky(s_k)
+        X = torch.linalg.solve_triangular(L, h_k, upper=False)
+        h_transformed = torch.linalg.solve_triangular(
+            L, X.transpose(-2, -1).conj(), upper=False
+        ).transpose(-2, -1).conj()
+        return torch.linalg.eigvalsh(h_transformed)
+    except RuntimeError:
+        s_eig, s_vec = torch.linalg.eigh(s_k)
+        s_eig_safe = torch.clamp(s_eig, min=1e-6)
+        inv_sqrt = (1.0 / torch.sqrt(s_eig_safe)).to(s_vec.dtype)
+        S_invhalf = s_vec @ torch.diag_embed(inv_sqrt) \
+                          @ s_vec.transpose(-2, -1).conj()
+        H_lowdin = S_invhalf @ h_k @ S_invhalf
+        H_lowdin = 0.5 * (H_lowdin + H_lowdin.transpose(-2, -1).conj())
+        return torch.linalg.eigvalsh(H_lowdin)
 
 
 def eighb(h_k, s_k, scheme="chol"):

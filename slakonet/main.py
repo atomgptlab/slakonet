@@ -113,6 +113,39 @@ class SimpleDftb:
 
         self.h_feed = create_feeds(self.updated_skfs, self.shell_dict, "H")
         self.s_feed = create_feeds(self.updated_skfs, self.shell_dict, "S")
+
+        # Pre-cache repulsive-spline tensors on `self.device` and pre-multiply
+        # by H2E so _compute_repulsive_energy / forces / charge density don't
+        # redo it every iteration (matters for SCC's 30-60 evaluations).
+        # Layout: self._rspl_cache[pair_key] = dict with eV-converted, on-device
+        # tensors.  Re-run get_updated_skfs() any time the user modifies
+        # repulsive parameters (slakonet's training paths already invalidate
+        # this implicitly by recreating SimpleDftb).
+        self._rspl_cache = {}
+        for _pair_key, _skf in self.updated_skfs.items():
+            _rs = getattr(_skf, "r_spline", None)
+            if _rs is None:
+                continue
+            try:
+                _grid = torch.as_tensor(_rs.grid).to(self.device)
+                _exp_coef  = torch.as_tensor(_rs.exp_coef).to(self.device)  * 27.211
+                _spl_coef  = torch.as_tensor(_rs.spline_coef).to(self.device) * 27.211
+                _tail_coef = torch.as_tensor(_rs.tail_coef).to(self.device) * 27.211
+                _cutoff = (float(_rs.cutoff.item())
+                           if torch.is_tensor(_rs.cutoff)
+                           and _rs.cutoff.numel() == 1
+                           else (float(_rs.cutoff)
+                                 if not torch.is_tensor(_rs.cutoff)
+                                 else float(_rs.cutoff.flatten()[0].item())))
+                self._rspl_cache[_pair_key] = {
+                    "grid":        _grid,
+                    "cutoff":      _cutoff,
+                    "exp_coef":    _exp_coef,
+                    "spline_coef": _spl_coef,
+                    "tail_coef":   _tail_coef,
+                }
+            except Exception:
+                continue
         # ===== CRITICAL: Store original kpoints/klines for force calculations =====
         self._original_kpoints = kpoints
         self._original_klines = klines
@@ -261,31 +294,26 @@ class SimpleDftb:
                 sig * torch.sqrt(2 * pi_tensor)
             )
 
-        # Calculate DOS using vectorized approach
+        # Vectorized DOS: a single matmul over (nk*nbands) Gaussians
+        # against the energy grid, contracted with k-weights.
         nbatch, nkpoints, nbands = eigenvals.shape
 
-        for ik in range(nkpoints):
-            # Get k-point weight - handle different k_weights shapes
-            if len(self.k_weights.shape) == 2:
-                weight = self.k_weights[0, ik]  # Extract scalar from 2D tensor
-            elif ik < len(self.k_weights):
-                weight = self.k_weights[ik]
-            else:
-                weight = torch.tensor(1.0 / nkpoints, device=self.device)
+        if self.k_weights.dim() == 2:
+            kw = self.k_weights[0, :nkpoints]
+        elif self.k_weights.numel() >= nkpoints:
+            kw = self.k_weights[:nkpoints]
+        else:
+            kw = torch.full((nkpoints,), 1.0 / nkpoints, device=self.device,
+                            dtype=energy_grid.dtype)
 
-            # Get all bands for this k-point
-            kpoint_eigenvals = eigenvals[0, ik, :]  # Shape: (nbands,)
-
-            # Process each band individually
-            for ib in range(nbands):
-                eigenval = kpoint_eigenvals[ib]  # Single eigenvalue
-
-                # Add Gaussian contribution for this eigenvalue
-                gaussian_contrib = gaussian(
-                    energy_grid, eigenval, sigma_tensor
-                )
-                dos += weight * gaussian_contrib
-
+        eigs = eigenvals[0]                                   # [nk, nb]
+        # Gaussian broadening: g[ie, ik, ib] = exp(-0.5 ((E_e - eig_kb)/σ)²) / (σ √2π)
+        norm = (sigma_tensor * torch.sqrt(
+            torch.tensor(2.0 * torch.pi, device=self.device, dtype=energy_grid.dtype)))
+        diffs = (energy_grid.view(-1, 1, 1) - eigs.view(1, nkpoints, nbands)) / sigma_tensor
+        gauss = torch.exp(-0.5 * diffs * diffs) / norm        # [ne, nk, nb]
+        # Sum bands then weight-sum k-points: dos[ie] = Σ_k w_k * Σ_b g[ie,k,b]
+        dos = (gauss.sum(dim=-1) * kw.view(1, -1)).sum(dim=-1)
         return energy_grid, dos
 
     def _build_electron_lookup(self):
@@ -327,7 +355,14 @@ class SimpleDftb:
             H_b = H_b.to(torch.complex128)
             S_b = S_b.to(torch.complex128)
 
-        eigenvals, eigenvecs = eighb(H_b, S_b, scheme="chol")
+        # Skip eigenvector computation when not needed (DOS / bandgap-only).
+        # ~1.5–2× faster than the full generalised eigh.
+        if not getattr(self, "with_eigenvectors", True):
+            from slakonet.utils import eighb_vals_only
+            eigenvals = eighb_vals_only(H_b, S_b, scheme="chol")
+            eigenvecs = None
+        else:
+            eigenvals, eigenvecs = eighb(H_b, S_b, scheme="chol")
         # eigenvals: [K, ..., n_orb]   eigenvecs: [K, ..., n_orb, n_orb]
 
         if self.use_float32:
@@ -898,14 +933,20 @@ class SimpleDftb:
 
             d_masked = dist_mat[mask]
 
-            # Get grid and coefficients. SKF stores repulsive in Hartree; the
-            # *27.211 factor converts to eV so the result matches electronic
-            # energy (which is already converted to eV in _solve_eigenvalue...).
-            r_cutoff = skf.r_spline.cutoff
-            grid = skf.r_spline.grid.to(self.device)
-            exp_coef = skf.r_spline.exp_coef.to(self.device) * 27.211
-            spline_coef = skf.r_spline.spline_coef.to(self.device) * 27.211
-            tail_coef = skf.r_spline.tail_coef.to(self.device) * 27.211
+            # Use cached eV-converted on-device tensors when present.
+            cache = getattr(self, "_rspl_cache", {}).get(element_pair, None)
+            if cache is not None:
+                r_cutoff   = cache["cutoff"]
+                grid       = cache["grid"]
+                exp_coef   = cache["exp_coef"]
+                spline_coef= cache["spline_coef"]
+                tail_coef  = cache["tail_coef"]
+            else:
+                r_cutoff   = skf.r_spline.cutoff
+                grid       = skf.r_spline.grid.to(self.device)
+                exp_coef   = skf.r_spline.exp_coef.to(self.device) * 27.211
+                spline_coef= skf.r_spline.spline_coef.to(self.device) * 27.211
+                tail_coef  = skf.r_spline.tail_coef.to(self.device) * 27.211
 
             # SKF repulsive regions (standard Slater-Koster convention):
             #   r < grid[0]             : exponential head  exp(-a*r + b) + c
