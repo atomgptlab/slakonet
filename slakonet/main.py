@@ -2205,29 +2205,62 @@ class SimpleDftb:
         # Shift eigenvalues relative to Fermi level
         eigenvalues_shifted = eigenvalues - fermi_energy
 
-        # Compute bandgap
-        Ef_expanded = fermi_energy.view(-1, 1, 1)
-        occ = eigenvalues <= Ef_expanded
-        unocc = eigenvalues > Ef_expanded
+        # Compute bandgap by electron-count (robust on band-path k-meshes
+        # where Fermi search is unreliable). Eigenvalues from eighb come back
+        # sorted ascending per k. For non-spin-polarised systems the lowest
+        # N_val = nelectron / 2 bands are valence at every k:
+        #     VBM = max over k of band[N_val - 1]
+        #     CBM = min over k of band[N_val]
+        # This gives the same gap as the Fermi-based path for a uniform BZ
+        # mesh and a meaningful gap on klines paths (where fermi_search's
+        # k-weight integration is misleading).
+        try:
+            nelec_scalar = float(
+                self.nelectron.flatten()[0].item()
+                if torch.is_tensor(self.nelectron)
+                else float(self.nelectron)
+            )
+        except Exception:
+            nelec_scalar = float("nan")
 
-        vbm = torch.where(
-            occ,
-            eigenvalues,
-            torch.tensor(
-                float("-inf"), dtype=eigenvalues.dtype, device=self.device
-            ),
-        )
-        cbm = torch.where(
-            unocc,
-            eigenvalues,
-            torch.tensor(
-                float("inf"), dtype=eigenvalues.dtype, device=self.device
-            ),
-        )
+        # Make sure eigenvalues are sorted along band axis (defensive: eighb
+        # output is sorted, but safe-sort here covers numerical re-ordering).
+        eigs_sorted, _ = torch.sort(eigenvalues, dim=-1)
 
-        vbm_val = vbm.max(dim=-1)[0].max(dim=-1)[0]
-        cbm_val = cbm.min(dim=-1)[0].min(dim=-1)[0]
-        bandgap = (cbm_val - vbm_val).clamp(min=0.0)
+        vbm_val = torch.full(eigs_sorted.shape[:-2],
+                             float("nan"),
+                             dtype=eigs_sorted.dtype, device=self.device)
+        cbm_val = torch.full_like(vbm_val, float("nan"))
+        bandgap = torch.zeros_like(vbm_val)
+
+        # Mask k-points where the eigh solver returned unphysical values
+        # (very deep/high eigenvalues from ill-conditioned overlap matrix).
+        # Threshold = 100 eV from zero — well outside any realistic valence
+        # or low-conduction state.
+        BAD_E_THRESHOLD = 100.0
+        bad_kp = (eigs_sorted.abs() > BAD_E_THRESHOLD).any(dim=-1)  # [batch, nk]
+        if bad_kp.any():
+            print(f"   ! bandgap: masking {int(bad_kp.sum())} ill-conditioned "
+                  f"k-points (eigenvalues with |E| > {BAD_E_THRESHOLD} eV)")
+
+        if not (np.isnan(nelec_scalar) or nelec_scalar <= 0):
+            n_val = int(round(nelec_scalar / 2.0))
+            n_bands = eigs_sorted.shape[-1]
+            if 1 <= n_val <= n_bands - 1:
+                vbm_per_k = eigs_sorted[..., :, n_val - 1]   # [batch, nk]
+                cbm_per_k = eigs_sorted[..., :, n_val]       # [batch, nk]
+                # Replace bad k-points with values that won't dominate min/max
+                neg_inf = torch.full_like(vbm_per_k, float("-inf"))
+                pos_inf = torch.full_like(cbm_per_k, float("+inf"))
+                vbm_per_k = torch.where(bad_kp, neg_inf, vbm_per_k)
+                cbm_per_k = torch.where(bad_kp, pos_inf, cbm_per_k)
+                vbm_val = vbm_per_k.max(dim=-1)[0]
+                cbm_val = cbm_per_k.min(dim=-1)[0]
+                bandgap = (cbm_val - vbm_val).clamp(min=0.0)
+            elif n_val >= n_bands:
+                vbm_val = eigs_sorted[..., :, -1].max(dim=-1)[0]
+                cbm_val = vbm_val.clone()
+                bandgap = torch.zeros_like(vbm_val)
 
         # Compute forces
         forces = None

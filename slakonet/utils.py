@@ -657,11 +657,24 @@ def eighb_cpu(h_k, s_k, scheme="chol"):
                 raise
 
     # ========================================
-    # Strategy 3: Direct solve (more stable)
+    # Strategy 3: Löwdin orthogonalisation (stable for ill-conditioned S)
     # ========================================
+    # H ψ = E S ψ  ⟺  (S^{-1/2} H S^{-1/2}) ψ' = E ψ',  ψ = S^{-1/2} ψ'
+    # Build S^{-1/2} from the eigendecomposition of S, clamping tiny
+    # eigenvalues to a floor that prevents the inverse-sqrt blow-up that
+    # produces the ±100s-of-eV garbage eigenvalues seen at certain
+    # boundary k-points with the universal SKF set.
     try:
-        # Solve H·ψ = E·S·ψ as (S^-1·H)·ψ = E·ψ
-        eigenvals, eigenvecs = torch.linalg.eigh(torch.linalg.solve(s_k, h_k))
+        s_eig, s_vec = torch.linalg.eigh(s_k)
+        s_eig_safe = torch.clamp(s_eig, min=1e-6)
+        inv_sqrt = 1.0 / torch.sqrt(s_eig_safe)
+        S_invhalf = s_vec @ torch.diag_embed(inv_sqrt.to(s_vec.dtype)) \
+                          @ s_vec.transpose(-2, -1).conj()
+        H_lowdin = S_invhalf @ h_k @ S_invhalf
+        # Symmetrise to defeat round-off non-Hermiticity
+        H_lowdin = 0.5 * (H_lowdin + H_lowdin.transpose(-2, -1).conj())
+        eigenvals, eigvecs_lowdin = torch.linalg.eigh(H_lowdin)
+        eigenvecs = S_invhalf @ eigvecs_lowdin
         return eigenvals, eigenvecs
 
     except RuntimeError as e:

@@ -745,9 +745,17 @@ def plot_band_dos_atoms(
     ax3 = fig.add_subplot(gs[2])
     ax4 = fig.add_subplot(gs[3])
 
-    # Bands: eigenvalues already relative to Fermi (E_F = 0)
-    for i in range(eigenvalues.shape[-1]):
-        y = eigenvalues[0, :, i].real  # Already referenced to Fermi
+    # Bands: eigenvalues already relative to Fermi (E_F = 0).
+    # Mask numerical garbage from ill-conditioned eigh at boundary k-points
+    # (occasional ~±100-1000 eV outliers); replace with NaN so matplotlib
+    # breaks the line instead of drawing a vertical streak across the panel.
+    BAND_PLOT_MASK_EV = 50.0     # |E - E_F| beyond this is unphysical
+    eigs_for_plot = np.asarray(eigenvalues, dtype=float).copy()
+    bad = np.abs(eigs_for_plot) > BAND_PLOT_MASK_EV
+    if bad.any():
+        eigs_for_plot[bad] = np.nan
+    for i in range(eigs_for_plot.shape[-1]):
+        y = eigs_for_plot[0, :, i].real
         ax1.plot(y, linewidth=0.8)
     info["eigenvalues"] = eigenvalues[0, :, i].real.tolist()
     ax1.axhline(0, linestyle="--", alpha=0.7)

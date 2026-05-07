@@ -932,8 +932,28 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 f"{pair_key}/skf_extra", extra
             )
 
-            # Repulsive spline (object with tensor fields)
-            if getattr(opt, "r_spline", None) is not None:
+            # Repulsive spline. Prefer trainable r_*coef (set when in
+            # repulsive-only mode); fall back to opt.r_spline otherwise.
+            if hasattr(opt, "r_exp_coef"):
+                grid_t   = opt.r_grid.detach()
+                cutoff_t = opt.r_cutoff.detach()
+                exp_t    = opt.r_exp_coef.detach()
+                spl_t    = opt.r_spline_coef.detach()
+                tail_t   = opt.r_tail_coef.detach()
+                cutoff_v = float(cutoff_t.item() if cutoff_t.numel() == 1
+                                 else cutoff_t.flatten()[0].item())
+                pair_meta["r_spline"] = {
+                    "grid":        {"@tensor": _put_tensor(
+                        f"{pair_key}/r_spline/grid", grid_t)},
+                    "cutoff":      cutoff_v,
+                    "spline_coef": {"@tensor": _put_tensor(
+                        f"{pair_key}/r_spline/spline_coef", spl_t)},
+                    "exp_coef":    {"@tensor": _put_tensor(
+                        f"{pair_key}/r_spline/exp_coef", exp_t)},
+                    "tail_coef":   {"@tensor": _put_tensor(
+                        f"{pair_key}/r_spline/tail_coef", tail_t)},
+                }
+            elif getattr(opt, "r_spline", None) is not None:
                 rs = opt.r_spline
                 pair_meta["r_spline"] = {
                     "grid":        {"@tensor": _put_tensor(
