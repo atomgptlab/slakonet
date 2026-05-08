@@ -1013,30 +1013,76 @@ def eighb_vals_only(h_k, s_k, scheme="chol"):
 
 
 def eighb(h_k, s_k, scheme="chol"):
-    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
-    eps = 1e-6
+    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability.
+
+    Tries cholesky-regularized solve at progressively larger eps until it
+    succeeds. This handles ill-conditioned overlap matrices (common for
+    transition-metal oxides like SrTiO3 with universal SK parameter sets)
+    without falling back to non-Hermitian `eig`, which produces unphysical
+    spectra at the bad k-points.
+    """
     device = h_k.device
     dtype = h_k.dtype
     n = h_k.shape[-1]
-
     eye = torch.eye(n, device=device, dtype=dtype)
-    s_k_reg = s_k + eps * eye  # Optional regularization
 
     if scheme == "chol":
+        # Try the fast batched path first; if any k fails, drop into a
+        # per-k escalation loop so good k-points are not poisoned by bad ones.
         try:
+            s_k_reg = s_k + 1e-6 * eye
             L = torch.linalg.cholesky(s_k_reg)
             I_b = eye.expand_as(L)
             L_inv = torch.linalg.solve_triangular(L, I_b, upper=False)
             H_tilde = L_inv @ h_k @ L_inv.mH
             eigenvals, eigenvecs_tilde = torch.linalg.eigh(H_tilde)
             eigenvecs = L_inv.mH @ eigenvecs_tilde
-        except RuntimeError as e:
-            print(f"Cholesky failed: {e}, falling back to eig")
-            eigenvals, eigenvecs = torch.linalg.eig(
-                torch.linalg.solve(s_k_reg, h_k)
-            )
-            eigenvals = eigenvals.real
+            return eigenvals, eigenvecs
+        except RuntimeError:
+            pass
+
+        # Per-k fallback: process each matrix in the batch independently.
+        is_batched = h_k.ndim >= 3
+        H_list = h_k.unsqueeze(0) if not is_batched else h_k.reshape(-1, n, n)
+        S_list = s_k.unsqueeze(0) if not is_batched else s_k.reshape(-1, n, n)
+        nb = H_list.shape[0]
+        out_vals = torch.empty(nb, n, device=device,
+                               dtype=torch.real(h_k).dtype)
+        out_vecs = torch.empty(nb, n, n, device=device, dtype=dtype)
+        n_failed = 0
+        eye_single = torch.eye(n, device=device, dtype=dtype)
+        for ib in range(nb):
+            hi, si = H_list[ib], S_list[ib]
+            done = False
+            for eps in (1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
+                try:
+                    L = torch.linalg.cholesky(si + eps * eye_single)
+                    Linv = torch.linalg.solve_triangular(
+                        L, eye_single, upper=False)
+                    Ht = Linv @ hi @ Linv.mH
+                    e, ct = torch.linalg.eigh(Ht)
+                    out_vals[ib] = e
+                    out_vecs[ib] = Linv.mH @ ct
+                    done = True
+                    break
+                except RuntimeError:
+                    continue
+            if not done:
+                # Last-resort: non-Hermitian eig (this k will be filtered later).
+                e, c = torch.linalg.eig(
+                    torch.linalg.solve(si + 1e-6 * eye_single, hi)
+                )
+                out_vals[ib] = e.real
+                out_vecs[ib] = c
+                n_failed += 1
+        if n_failed:
+            print(f"   [eighb] cholesky failed for {n_failed}/{nb} k-points; "
+                  f"used non-Hermitian eig fallback there")
+        if not is_batched:
+            return out_vals[0], out_vecs[0]
+        return out_vals.reshape(*h_k.shape[:-1]), out_vecs.reshape(h_k.shape)
     else:
+        s_k_reg = s_k + 1e-6 * eye
         # Direct method (more stable)
         eigenvals, eigenvecs = torch.linalg.eig(
             torch.linalg.solve(s_k_reg, h_k)
