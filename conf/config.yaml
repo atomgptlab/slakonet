@@ -1,0 +1,6 @@
+defaults:
+  - data: default
+  - training: default
+  - optimizer: default
+  - model: default
+  - _self_

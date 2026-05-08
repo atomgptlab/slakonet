@@ -17,6 +17,8 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/atomgptlab/slakonet",
     packages=setuptools.find_packages(),
+    package_data={"slakonet": ["../conf/**/*.yaml"]},
+    include_package_data=True,
     entry_points={
         "console_scripts": [
             "predict_slakonet=slakonet.predict_slakonet:main",
