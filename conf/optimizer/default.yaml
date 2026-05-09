@@ -1,0 +1,7 @@
+# @package optimizer
+kpoints: [5, 5, 5]
+scheduler_factor: 0.8
+scheduler_patience: 10
+hs_regularization: 1.0e-10
+rep_regularization: 1.0e-8
+random_seed: 42

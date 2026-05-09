@@ -5,4 +5,5 @@ jarvis-tools>=2021.07.19
 torch
 ase
 spglib
-pydantic_settings
+hydra-core>=1.3.2
+omegaconf>=2.3.0

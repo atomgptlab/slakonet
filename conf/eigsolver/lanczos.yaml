@@ -1,0 +1,8 @@
+# @package eigsolver
+solver_name: lanczos
+m: 20
+tol: 1.0e-6
+max_iter: 300
+reorthogonalization: true
+reorthogonalization_type: modified_gram_schmidt
+eps: 1.0e-8

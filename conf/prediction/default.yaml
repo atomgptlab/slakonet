@@ -1,0 +1,8 @@
+# @package prediction
+model_path: null
+file_format: poscar
+file_path: null
+output_filename: slakonet_bands_dos.png
+energy_range: [-8.0, 8.0]
+jid: JVASP-107
+cutoff: 10.0

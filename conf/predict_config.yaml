@@ -1,0 +1,4 @@
+defaults:
+  - prediction: default
+  - model: default
+  - _self_

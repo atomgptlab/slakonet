@@ -73,6 +73,7 @@ class SimpleDftb:
         beta=0.1,
         updated_skfs=None,
         fermi_surface=False,
+        eigsolver=None,
         # shell_dict=None,
         # h_feed=None,
         # s_feed=None,
@@ -134,6 +135,13 @@ class SimpleDftb:
         self.alpha = alpha
         self.beta = beta
         self.fermi_surface = fermi_surface
+
+        if eigsolver is not None:
+            self.eigsolver = eigsolver
+        else:
+            from slakonet.eigsolvers import make_eigsolver
+            from slakonet.conf import CholeskyEighConfig
+            self.eigsolver = make_eigsolver(CholeskyEighConfig())
 
     def _generate_shell_dict_from_skfs(self):
         """
@@ -294,64 +302,42 @@ class SimpleDftb:
         return total_electrons.unsqueeze(0)
 
     def _solve_eigenvalue_problem(self, H, S):
-        """Solve H*c = E*S*c with appropriate precision."""
+        """Solve H*c = E*S*c, batching all k-points into a single eigensolver call."""
         n_kpoints = self.max_nk.item()
-        eigenvalues_list = []
-        eigenvecs_list = []
-        occupations_list = []
 
-        for ik in range(n_kpoints):
-            h_k = H[..., ik]
-            s_k = S[..., ik]
+        # H: [..., n_orb, n_orb, K] → [K, ..., n_orb, n_orb]
+        perm_fwd = (-1,) + tuple(range(H.ndim - 1))
+        H_b = H.permute(perm_fwd)
+        S_b = S.permute(perm_fwd)
 
-            # CRITICAL: Use float64 for eigenvalue decomposition
-            # This is where precision matters most
-            if self.use_float32:
-                h_k = h_k.to(torch.complex128)  # Complex128 for stability
-                s_k = s_k.to(torch.complex128)
+        if self.use_float32:
+            H_b = H_b.to(torch.complex128)
+            S_b = S_b.to(torch.complex128)
 
-            # Solve generalized eigenvalue problem
-            eigenvals, eigenvecs = eighb(h_k, s_k, scheme="chol")
+        eigenvals, eigenvecs = self.eigsolver.solve(H_b, S_b)
+        # eigenvals: [K, ..., n_orb]   eigenvecs: [K, ..., n_orb, n_orb]
 
-            # Convert back to float32 after solve (if needed)
-            if self.use_float32:
-                eigenvals = eigenvals.to(torch.float32)
-                if eigenvecs is not None:
-                    eigenvecs = eigenvecs.to(torch.complex64)
-
-            """
-            # ===== CRITICAL FIX: Normalize eigenvectors =====
+        if self.use_float32:
+            eigenvals = eigenvals.to(torch.float32)
             if eigenvecs is not None:
-                # Compute norms: <c|S|c> for each eigenvector
-                if eigenvecs.is_complex():
-                    # norms[i] = sqrt(<c_i|S|c_i>)
-                    norms = torch.sqrt(
-                        torch.sum(eigenvecs.conj() * (s_k @ eigenvecs), dim=0).real
-                    )
-                else:
-                    norms = torch.sqrt(
-                        torch.sum(eigenvecs * (s_k @ eigenvecs), dim=0)
-                    )
+                eigenvecs = eigenvecs.to(torch.complex64)
 
-                # Normalize: c_normalized = c / sqrt(<c|S|c>)
-                eigenvecs = eigenvecs / norms.unsqueeze(0)
-            # ===== End normalization =====
-            """
-            # Fermi occupation
-            occ, _ = fermi(eigenvals, self.nelectron.to(self.device))
+        # Occupations: same pattern at every k-point with integer filling
+        occ_0, _ = fermi(eigenvals[0], self.nelectron.to(self.device))
+        occupations = occ_0.unsqueeze(0).expand(n_kpoints, *occ_0.shape)
 
-            eigenvalues_list.append(eigenvals)
-            eigenvecs_list.append(eigenvecs)
-            occupations_list.append(occ)
+        # Permute back: [K, ..., n_orb] → [..., K, n_orb]
+        ndim_ev = eigenvals.ndim
+        perm_back = tuple(range(1, ndim_ev - 1)) + (0, ndim_ev - 1)
+        eigenvalues = eigenvals.permute(perm_back) * self.H2E
+        occupations = occupations.permute(perm_back)
 
-        # Stack and convert to eV
-        eigenvalues = torch.stack(eigenvalues_list, dim=1) * self.H2E
-        eigenvectors = (
-            torch.stack(eigenvecs_list, dim=1)
-            if self.with_eigenvectors
-            else None
-        )
-        occupations = torch.stack(occupations_list, dim=1)
+        if self.with_eigenvectors and eigenvecs is not None:
+            ndim_ec = eigenvecs.ndim
+            perm_back_ec = tuple(range(1, ndim_ec - 2)) + (0, ndim_ec - 2, ndim_ec - 1)
+            eigenvectors = eigenvecs.permute(perm_back_ec)
+        else:
+            eigenvectors = None
 
         return eigenvalues, eigenvectors, occupations
 

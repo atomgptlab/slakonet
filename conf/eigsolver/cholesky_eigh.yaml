@@ -1,0 +1,3 @@
+# @package eigsolver
+solver_name: cholesky_eigh
+eps: 1.0e-8

@@ -12,52 +12,20 @@ from slakonet.atoms import Geometry
 from slakonet.main import generate_shell_dict_upto_Z65
 import torch
 from jarvis.core.atoms import Atoms
-import argparse
 from jarvis.io.vasp.inputs import Poscar
-import argparse
-import sys
 import time
 from jarvis.db.jsonutils import dumpjson
 import pprint
+import hydra
+from omegaconf import DictConfig
+from hydra.utils import to_absolute_path
+
+from slakonet.conf import register_configs
 
 plt.rcParams.update({"font.size": 14})
 H2E = 27.211
 
-parser = argparse.ArgumentParser(description="SlakoNet Pretrained Models")
-parser.add_argument(
-    "--model_path",
-    default=None,
-    # default="slakonet/tests/slakonet_v1_sic",
-    help="Provide model path ",
-)
-parser.add_argument(
-    "--file_format", default="poscar", help="poscar/cif/xyz/pdb file format."
-)
-parser.add_argument(
-    "--file_path",
-    default=None,
-    help="Path to atomic structure file.",
-)
-parser.add_argument(
-    "--output_filename",
-    default="slakonet_bands_dos.png",
-    help="Path to desired output file name",
-)
-parser.add_argument(
-    "--energy_range",
-    default="-8 8",
-    help="Energy range for bandstructure and DOS plots",
-)
-parser.add_argument(
-    "--jid",
-    default="JVASP-107",
-    help="JARVIS-DFT Identifier",
-)
-parser.add_argument(
-    "--cutoff",
-    default="10",
-    help="Pairwise cutoff",
-)
+register_configs()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -510,24 +478,24 @@ def plot_band_dos_atoms(
     return fig, properties, atom_pdos, energy_grid
 
 
-# Usage
-if __name__ == "__main__":
-    args = parser.parse_args(sys.argv[1:])
-    model_path = args.model_path
+def run_prediction(cfg: DictConfig):
+    """Execute prediction from a DictConfig. Callable without the Hydra runtime."""
+    model_path = cfg.prediction.model_path
     model = None
     atoms = None
 
     if model_path is None:
         model = default_model()
 
-    file_path = args.file_path
-    file_format = args.file_format
-    output_filename = args.output_filename
-    energy_range = np.array(args.energy_range.split(" "), dtype="float")
-    jid = args.jid
-    cutoff = float(args.cutoff)
+    file_path = cfg.prediction.file_path
+    file_format = cfg.prediction.file_format
+    output_filename = cfg.prediction.output_filename
+    energy_range = np.array(list(cfg.prediction.energy_range), dtype="float")
+    jid = cfg.prediction.jid
+    cutoff = float(cfg.prediction.cutoff)
 
     if file_path is not None:
+        file_path = to_absolute_path(file_path)
         if file_format == "poscar":
             atoms = Atoms.from_poscar(file_path)
         elif file_format == "cif":
@@ -541,7 +509,6 @@ if __name__ == "__main__":
                 "File format not implemented", file_format
             )
 
-    # fig, properties, atom_pdos, energy_grid = plot_band_dos_atoms(jid='JVASP-107')
     t1 = time.time()
     fig, properties, atom_pdos, energy_grid = plot_band_dos_atoms(
         atoms=atoms,
@@ -554,3 +521,13 @@ if __name__ == "__main__":
     )
     t2 = time.time()
     print("Time(s)", t2 - t1)
+    return fig, properties, atom_pdos, energy_grid
+
+
+@hydra.main(config_path="../conf", config_name="predict_config", version_base=None)
+def main(cfg: DictConfig) -> None:
+    run_prediction(cfg)
+
+
+if __name__ == "__main__":
+    main()

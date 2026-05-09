@@ -1,0 +1,5 @@
+# @package eigsolver
+solver_name: vqe
+n_layers: 2
+n_shots: 1000
+eps: 1.0e-8

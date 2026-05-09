@@ -1,0 +1,13 @@
+# @package training
+num_epochs: 3
+learning_rate: 0.001
+batch_size: 2
+save_directory: out
+plot_frequency: 3
+weight_by_system_size: true
+early_stopping_patience: 20
+target_property: bandgap
+force_weight: 0.0
+energy_weight: 1.0
+bandgap_weight: 1.0
+cutoff: 10.0

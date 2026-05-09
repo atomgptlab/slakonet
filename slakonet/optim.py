@@ -37,28 +37,40 @@ from tqdm import tqdm
 import zipfile
 import requests
 import io
-from jarvis.core.utils import get_cache_dir
+try:
+    from jarvis.core.utils import get_cache_dir
+except ImportError:
+    import pathlib
+
+    def get_cache_dir(name: str) -> str:
+        d = pathlib.Path.home() / ".cache" / name
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d)
 
 matplotlib.rcParams["figure.max_open_warning"] = 50
 # torch.set_default_dtype(torch.float32)
 # torch.set_default_dtype(torch.float32)
 
-random_seed = 42
-random.seed(random_seed)
-torch.manual_seed(random_seed)
-np.random.seed(random_seed)
-torch.cuda.manual_seed_all(random_seed)
-try:
-    import torch_xla.core.xla_model as xm
+def set_random_seed(seed: int = 42) -> None:
+    """Set all relevant random seeds for reproducibility."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    try:
+        import torch_xla.core.xla_model as xm
 
-    xm.set_rng_state(random_seed)
-except ImportError:
-    pass
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-os.environ["PYTHONHASHSEED"] = str(random_seed)
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(":4096:8")
-torch.use_deterministic_algorithms(True)
+        xm.set_rng_state(seed)
+    except ImportError:
+        pass
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True)
+
+
+set_random_seed(42)
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -1509,6 +1521,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         device=None,
         with_eigenvectors=False,
         cutoff=10.0,
+        eigsolver=None,
     ):
         """Compute DFTB properties for multi-element systems using ALL available optimizers"""
         if device is None:
@@ -1541,6 +1554,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
                 cutoff=cutoff,
+                eigsolver=eigsolver,
             )
         else:
             calc = SimpleDftb(
@@ -1555,6 +1569,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
                 cutoff=cutoff,
+                eigsolver=eigsolver,
             )
 
         # Compute properties
@@ -2522,6 +2537,12 @@ def train_multi_vasp_skf_parameters(
     bandgap_weight=1.0,
     device="cuda",
     cutoff=10.0,
+    kpoints=None,
+    scheduler_factor=0.8,
+    scheduler_patience=10,
+    hs_regularization=1e-10,
+    rep_regularization=1e-8,
+    eigsolver=None,
 ):
     """
     Enhanced training function for multiple VASP datasets with flexible loss targets
@@ -2594,14 +2615,14 @@ def train_multi_vasp_skf_parameters(
 
     # Setup training
     shell_dict = generate_shell_dict_upto_Z65()
-    kpoints = torch.tensor([5, 5, 5])
+    kpoints = torch.tensor(kpoints if kpoints is not None else [5, 5, 5])
 
     # Setup optimizer and scheduler
     optimizer = optim.AdamW(
         multi_element_optimizer.parameters(), lr=learning_rate
     )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.8, patience=10
+        optimizer, mode="min", factor=scheduler_factor, patience=scheduler_patience
     )
 
     print(f"\nStarting multi-VASP training:")
@@ -2662,6 +2683,7 @@ def train_multi_vasp_skf_parameters(
                     get_forces=True,
                     device=device,
                     cutoff=cutoff,
+                    eigsolver=eigsolver,
                 )
             )
             print(f"    Properties computed, success={success}")
@@ -2758,7 +2780,7 @@ def train_multi_vasp_skf_parameters(
                 total_rep_reg += (opt.r_tail_coef**2).sum()
 
         regularization = (
-            1e-10 * (total_h_reg + total_s_reg) + 1e-8 * total_rep_reg
+            hs_regularization * (total_h_reg + total_s_reg) + rep_regularization * total_rep_reg
         )
 
         # Final loss
@@ -3284,7 +3306,7 @@ def default_model_old(dir_path=None, model_name="slakonet_v0"):
         return model
 
 
-def get_hamiltonian(jarvis_atoms=None, kpts=[1, 4, 4], model=None):
+def get_hamiltonian(jarvis_atoms=None, kpts=[1, 4, 4], model=None, eigsolver=None):
 
     geometry = Geometry.from_ase_atoms([jarvis_atoms.ase_converter()])
 
@@ -3296,6 +3318,7 @@ def get_hamiltonian(jarvis_atoms=None, kpts=[1, 4, 4], model=None):
         model=model,
         compute_forces=False,
         include_dos_data=False,
+        eigsolver=eigsolver,
     )
     calc.calculate()
 

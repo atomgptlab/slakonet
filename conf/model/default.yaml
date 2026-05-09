@@ -1,0 +1,6 @@
+# @package model
+max_Z: 100
+kT: 0.025
+alpha: 0.1
+beta: 0.1
+use_float32: true
