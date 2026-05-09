@@ -1,7 +1,39 @@
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Any
 from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
+
+
+@dataclass
+class EigsolverConfig:
+    """Base config for all eigensolver variants. Not used directly."""
+    solver_name: str = MISSING
+    eps: float = 1e-8
+
+
+@dataclass
+class CholeskyEighConfig(EigsolverConfig):
+    """Generalized eigenproblem via Cholesky whitening + torch.linalg.eigh."""
+    solver_name: str = "cholesky_eigh"
+
+
+@dataclass
+class LanczosConfig(EigsolverConfig):
+    """Lanczos algorithm: finds the m lowest eigenvalues via a Krylov subspace."""
+    solver_name: str = "lanczos"
+    m: int = 20
+    tol: float = 1e-6
+    max_iter: int = 300
+    reorthogonalization: bool = True
+    reorthogonalization_type: str = "modified_gram_schmidt"
+
+
+@dataclass
+class VqeConfig(EigsolverConfig):
+    """Variational Quantum Eigensolver — stub pending paper implementation."""
+    solver_name: str = "vqe"
+    n_layers: int = 2
+    n_shots: int = 1000
 
 
 @dataclass
@@ -62,12 +94,14 @@ class SlakoNetTrainConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    eigsolver: Any = field(default_factory=CholeskyEighConfig)
 
 
 @dataclass
 class SlakoNetPredictConfig:
     prediction: PredictionConfig = field(default_factory=PredictionConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    eigsolver: Any = field(default_factory=CholeskyEighConfig)
 
 
 def register_configs() -> None:
@@ -79,3 +113,6 @@ def register_configs() -> None:
     cs.store(group="optimizer", name="default", node=OptimizerConfig)
     cs.store(group="model", name="default", node=ModelConfig)
     cs.store(group="prediction", name="default", node=PredictionConfig)
+    cs.store(group="eigsolver", name="cholesky_eigh", node=CholeskyEighConfig)
+    cs.store(group="eigsolver", name="lanczos", node=LanczosConfig)
+    cs.store(group="eigsolver", name="vqe", node=VqeConfig)

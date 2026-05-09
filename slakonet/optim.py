@@ -1521,6 +1521,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         device=None,
         with_eigenvectors=False,
         cutoff=10.0,
+        eigsolver=None,
     ):
         """Compute DFTB properties for multi-element systems using ALL available optimizers"""
         if device is None:
@@ -1553,6 +1554,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
                 cutoff=cutoff,
+                eigsolver=eigsolver,
             )
         else:
             calc = SimpleDftb(
@@ -1567,6 +1569,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 compute_forces=get_forces,
                 with_eigenvectors=with_eigenvectors,
                 cutoff=cutoff,
+                eigsolver=eigsolver,
             )
 
         # Compute properties
@@ -2539,6 +2542,7 @@ def train_multi_vasp_skf_parameters(
     scheduler_patience=10,
     hs_regularization=1e-10,
     rep_regularization=1e-8,
+    eigsolver=None,
 ):
     """
     Enhanced training function for multiple VASP datasets with flexible loss targets
@@ -2679,6 +2683,7 @@ def train_multi_vasp_skf_parameters(
                     get_forces=True,
                     device=device,
                     cutoff=cutoff,
+                    eigsolver=eigsolver,
                 )
             )
             print(f"    Properties computed, success={success}")
@@ -3301,7 +3306,7 @@ def default_model_old(dir_path=None, model_name="slakonet_v0"):
         return model
 
 
-def get_hamiltonian(jarvis_atoms=None, kpts=[1, 4, 4], model=None):
+def get_hamiltonian(jarvis_atoms=None, kpts=[1, 4, 4], model=None, eigsolver=None):
 
     geometry = Geometry.from_ase_atoms([jarvis_atoms.ase_converter()])
 
@@ -3313,6 +3318,7 @@ def get_hamiltonian(jarvis_atoms=None, kpts=[1, 4, 4], model=None):
         model=model,
         compute_forces=False,
         include_dos_data=False,
+        eigsolver=eigsolver,
     )
     calc.calculate()
 

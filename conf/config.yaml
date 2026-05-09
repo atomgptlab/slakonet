@@ -3,4 +3,5 @@ defaults:
   - training: default
   - optimizer: default
   - model: default
+  - eigsolver: cholesky_eigh
   - _self_

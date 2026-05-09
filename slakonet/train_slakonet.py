@@ -20,6 +20,9 @@ def run_training(cfg: DictConfig):
     """Execute training from a DictConfig. Callable without the Hydra runtime."""
     set_random_seed(cfg.optimizer.random_seed)
 
+    from slakonet.eigsolvers import make_eigsolver
+    eigsolver = make_eigsolver(cfg.eigsolver)
+
     xml_folder = to_absolute_path(cfg.data.xml_folder_path)
     xml_files = [
         os.path.join(xml_folder, f)
@@ -65,6 +68,7 @@ def run_training(cfg: DictConfig):
         scheduler_patience=cfg.optimizer.scheduler_patience,
         hs_regularization=cfg.optimizer.hs_regularization,
         rep_regularization=cfg.optimizer.rep_regularization,
+        eigsolver=eigsolver,
     )
     return trained_optimizer, history, data_loader
 

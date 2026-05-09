@@ -73,6 +73,7 @@ class SimpleDftb:
         beta=0.1,
         updated_skfs=None,
         fermi_surface=False,
+        eigsolver=None,
         # shell_dict=None,
         # h_feed=None,
         # s_feed=None,
@@ -134,6 +135,13 @@ class SimpleDftb:
         self.alpha = alpha
         self.beta = beta
         self.fermi_surface = fermi_surface
+
+        if eigsolver is not None:
+            self.eigsolver = eigsolver
+        else:
+            from slakonet.eigsolvers import make_eigsolver
+            from slakonet.conf import CholeskyEighConfig
+            self.eigsolver = make_eigsolver(CholeskyEighConfig())
 
     def _generate_shell_dict_from_skfs(self):
         """
@@ -306,7 +314,7 @@ class SimpleDftb:
             H_b = H_b.to(torch.complex128)
             S_b = S_b.to(torch.complex128)
 
-        eigenvals, eigenvecs = eighb(H_b, S_b, scheme="chol")
+        eigenvals, eigenvecs = self.eigsolver.solve(H_b, S_b)
         # eigenvals: [K, ..., n_orb]   eigenvecs: [K, ..., n_orb, n_orb]
 
         if self.use_float32:
