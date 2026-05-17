@@ -102,6 +102,27 @@ class SimpleDftb:
 
         # Use provided SKFs or get from model
         self.updated_skfs = self.model.get_updated_skfs()
+        # Filter SKF pairs down to elements actually present in the geometry.
+        # Universal models carry thousands of pairs; create_feeds and the
+        # repulsive-cache loop below are O(n_pairs), so for a 3-element cell
+        # this turns a ~33 s __init__ into <1 s with identical results
+        # (absent pairs never contribute to H/S/repulsive for this geometry).
+        try:
+            _zs = set(
+                int(z)
+                for z in self.geometry.atomic_numbers.flatten().tolist()
+                if int(z) != 0
+            )
+            _syms = set(atomic_numbers_to_symbols(sorted(_zs)))
+            _filt = {
+                k: v
+                for k, v in self.updated_skfs.items()
+                if set(str(k).split("-")).issubset(_syms)
+            }
+            if _filt:
+                self.updated_skfs = _filt
+        except Exception:
+            pass  # on any issue, fall back to the full set (correct, slow)
         self.shell_dict = self._generate_shell_dict_from_skfs()
         self.basis = Basis(self.geometry.atomic_numbers, self.shell_dict)
         """
