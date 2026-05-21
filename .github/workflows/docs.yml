@@ -1,0 +1,43 @@
+name: docs
+
+# Build the MkDocs site and publish it to GitHub Pages (gh-pages branch).
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: docs-pip-${{ hashFiles('.github/workflows/docs.yml') }}
+
+      - name: Install documentation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "mkdocs<2.0" "mkdocs-material>=9.5" "pymdown-extensions>=10.0"
+
+      - name: Build and deploy
+        run: mkdocs gh-deploy --force --clean

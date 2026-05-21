@@ -2313,8 +2313,8 @@ class SimpleDftb:
         if self.repulsive:
             potential_energy = self._compute_repulsive_energy()  # * self.H2E
             total_energy = self.alpha * electronic_energy + potential_energy
-            print("potential_energy", potential_energy)
-            print("electronic_energy", electronic_energy)
+            # print("potential_energy", potential_energy)
+            # print("electronic_energy", electronic_energy)
         else:
             potential_energy = torch.tensor(0.0, device=self.device)
             total_energy = electronic_energy
@@ -2460,39 +2460,53 @@ class SimpleDftb:
                     allow_unused=False,
                 )
 
-                forces = (
-                    -self.beta * grad_outputs[0]
-                )  # Forces are negative gradient
-                # print("forcessssssss", forces)
+                # UNIT NOTE: slakonet stores geometry.positions and
+                # geometry.cell in Bohr, while the total energy is in eV.
+                # torch.autograd.grad therefore yields eV/Bohr; the
+                # downstream stress/virial formula is then in eV/Bohr^3.
+                # ASE expects forces in eV/Ang and stress in eV/Ang^3
+                # (then * 160.21766208 -> GPa). Multiply by 1/_BOHR_TO_ANG
+                # and 1/_BOHR_TO_ANG**3 respectively to convert. The
+                # virial uses the *Bohr-units* forces with Bohr-units
+                # positions so the (eV/Bohr * Bohr -> eV) bookkeeping
+                # stays self-consistent; the conversion is applied once
+                # at the end.
+                _BOHR_TO_ANG = 0.52917721092
+
+                forces_Bohr = -self.beta * grad_outputs[0]   # eV/Bohr
                 dE_dh = torch.autograd.grad(
                     total_energy,
                     self.geometry.cell,
                     retain_graph=True,
                     create_graph=True,
-                )[0]
-                cell = self.geometry.cell[0]
-                volume = torch.abs(torch.det(cell))
-                # stress = 160.21766208* dE_dh[0] @ cell.T / volume
-                # ===== VIRIAL TERM =====
-                positions = self.geometry.positions[0]
+                )[0]                                           # eV/Bohr
+                cell = self.geometry.cell[0]                  # Bohr
+                volume = torch.abs(torch.det(cell))           # Bohr^3
+                positions = self.geometry.positions[0]        # Bohr
                 mask = self.geometry.atomic_numbers[0] > 0
-                stress_virial = torch.einsum(
-                    "ia,ib->ab", forces[0][mask], positions[mask]
-                )
 
-                # ===== TOTAL STRESS =====
-                stress_tensor = (stress_virial - dE_dh[0] @ cell.T) / volume
+                # virial in eV/Bohr^3 (Bohr-units throughout)
+                stress_virial = torch.einsum(
+                    "ia,ib->ab", forces_Bohr[0][mask], positions[mask]
+                )
+                stress_tensor = (
+                    stress_virial - dE_dh[0] @ cell.T
+                ) / volume                                     # eV/Bohr^3
+
+                # --- convert to ASE/SI units ---
+                forces = forces_Bohr / _BOHR_TO_ANG            # eV/Ang
+                stress_eVperA3 = stress_tensor / (_BOHR_TO_ANG ** 3)
 
                 # Voigt + GPa
                 stress = (
                     torch.tensor(
                         [
-                            stress_tensor[0, 0],
-                            stress_tensor[1, 1],
-                            stress_tensor[2, 2],
-                            stress_tensor[1, 2],
-                            stress_tensor[0, 2],
-                            stress_tensor[0, 1],
+                            stress_eVperA3[0, 0],
+                            stress_eVperA3[1, 1],
+                            stress_eVperA3[2, 2],
+                            stress_eVperA3[1, 2],
+                            stress_eVperA3[0, 2],
+                            stress_eVperA3[0, 1],
                         ],
                         device=self.device,
                     )

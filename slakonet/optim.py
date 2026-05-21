@@ -873,20 +873,22 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         st_path = stem.with_suffix(".safetensors")
         mf_path = stem.with_suffix(".manifest.json")
 
-        tensors = {}                      # flat key -> torch.Tensor
+        tensors = {}  # flat key -> torch.Tensor
         manifest_pairs = {}
         # Optional dedup: identical tensors (same shape+dtype+content hash)
         # share storage by recording a single canonical key per group.
-        dedup_table = {}                  # blake2b -> canonical_key
+        dedup_table = {}  # blake2b -> canonical_key
 
         def _put_tensor(key, t):
             t_cpu = t.detach().cpu().contiguous()
             if dedup:
                 import hashlib
+
                 h = hashlib.blake2b(
                     t_cpu.numpy().tobytes(),
                     digest_size=16,
-                    key=str(t_cpu.dtype).encode() + str(tuple(t_cpu.shape)).encode(),
+                    key=str(t_cpu.dtype).encode()
+                    + str(tuple(t_cpu.shape)).encode(),
                 ).hexdigest()
                 if h in dedup_table:
                     return dedup_table[h]
@@ -902,32 +904,46 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 k = _put_tensor(parent_key, value)
                 return {"@tensor": k}
             if isinstance(value, (list, tuple)):
-                return [_serialize_value(f"{parent_key}.{i}", v)
-                        for i, v in enumerate(value)]
+                return [
+                    _serialize_value(f"{parent_key}.{i}", v)
+                    for i, v in enumerate(value)
+                ]
             if isinstance(value, dict):
-                return {str(kk): _serialize_value(f"{parent_key}.{kk}", v)
-                        for kk, v in value.items()}
+                return {
+                    str(kk): _serialize_value(f"{parent_key}.{kk}", v)
+                    for kk, v in value.items()
+                }
             if isinstance(value, (str, int, float, bool)) or value is None:
                 return value
             # numpy scalar / array
             if hasattr(value, "tolist"):
                 return value.tolist()
-            return repr(value)            # fallback (shouldn't happen for SKF data)
+            return repr(value)  # fallback (shouldn't happen for SKF data)
 
         for pair_key, opt in self.skf_optimizers.items():
-            pair_meta = {"h_params_keys": [], "s_params_keys": [],
-                         "skf_dict_extra": {}}
+            pair_meta = {
+                "h_params_keys": [],
+                "s_params_keys": [],
+                "skf_dict_extra": {},
+            }
 
             for sub_k, p in opt.h_params.items():
                 tk = _put_tensor(f"{pair_key}/h_params/{sub_k}", p)
-                pair_meta["h_params_keys"].append({"name": sub_k, "tensor": tk})
+                pair_meta["h_params_keys"].append(
+                    {"name": sub_k, "tensor": tk}
+                )
             for sub_k, p in opt.s_params.items():
                 tk = _put_tensor(f"{pair_key}/s_params/{sub_k}", p)
-                pair_meta["s_params_keys"].append({"name": sub_k, "tensor": tk})
+                pair_meta["s_params_keys"].append(
+                    {"name": sub_k, "tensor": tk}
+                )
 
             # SKF non-(h,s) metadata: serialize tensors + non-tensors
-            extra = {k: v for k, v in opt.skf_dict.items()
-                     if k not in ("hamiltonian", "overlap")}
+            extra = {
+                k: v
+                for k, v in opt.skf_dict.items()
+                if k not in ("hamiltonian", "overlap")
+            }
             pair_meta["skf_dict_extra"] = _serialize_value(
                 f"{pair_key}/skf_extra", extra
             )
@@ -935,39 +951,75 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             # Repulsive spline. Prefer trainable r_*coef (set when in
             # repulsive-only mode); fall back to opt.r_spline otherwise.
             if hasattr(opt, "r_exp_coef"):
-                grid_t   = opt.r_grid.detach()
+                grid_t = opt.r_grid.detach()
                 cutoff_t = opt.r_cutoff.detach()
-                exp_t    = opt.r_exp_coef.detach()
-                spl_t    = opt.r_spline_coef.detach()
-                tail_t   = opt.r_tail_coef.detach()
-                cutoff_v = float(cutoff_t.item() if cutoff_t.numel() == 1
-                                 else cutoff_t.flatten()[0].item())
+                exp_t = opt.r_exp_coef.detach()
+                spl_t = opt.r_spline_coef.detach()
+                tail_t = opt.r_tail_coef.detach()
+                cutoff_v = float(
+                    cutoff_t.item()
+                    if cutoff_t.numel() == 1
+                    else cutoff_t.flatten()[0].item()
+                )
                 pair_meta["r_spline"] = {
-                    "grid":        {"@tensor": _put_tensor(
-                        f"{pair_key}/r_spline/grid", grid_t)},
-                    "cutoff":      cutoff_v,
-                    "spline_coef": {"@tensor": _put_tensor(
-                        f"{pair_key}/r_spline/spline_coef", spl_t)},
-                    "exp_coef":    {"@tensor": _put_tensor(
-                        f"{pair_key}/r_spline/exp_coef", exp_t)},
-                    "tail_coef":   {"@tensor": _put_tensor(
-                        f"{pair_key}/r_spline/tail_coef", tail_t)},
+                    "grid": {
+                        "@tensor": _put_tensor(
+                            f"{pair_key}/r_spline/grid", grid_t
+                        )
+                    },
+                    "cutoff": cutoff_v,
+                    "spline_coef": {
+                        "@tensor": _put_tensor(
+                            f"{pair_key}/r_spline/spline_coef", spl_t
+                        )
+                    },
+                    "exp_coef": {
+                        "@tensor": _put_tensor(
+                            f"{pair_key}/r_spline/exp_coef", exp_t
+                        )
+                    },
+                    "tail_coef": {
+                        "@tensor": _put_tensor(
+                            f"{pair_key}/r_spline/tail_coef", tail_t
+                        )
+                    },
                 }
             elif getattr(opt, "r_spline", None) is not None:
                 rs = opt.r_spline
                 pair_meta["r_spline"] = {
-                    "grid":        {"@tensor": _put_tensor(
-                        f"{pair_key}/r_spline/grid", torch.as_tensor(rs.grid))},
-                    "cutoff":      float(rs.cutoff) if not torch.is_tensor(rs.cutoff)
-                                   else float(rs.cutoff.item()
-                                              if rs.cutoff.numel() == 1
-                                              else rs.cutoff.flatten()[0]),
-                    "spline_coef": {"@tensor": _put_tensor(
-                        f"{pair_key}/r_spline/spline_coef", torch.as_tensor(rs.spline_coef))},
-                    "exp_coef":    {"@tensor": _put_tensor(
-                        f"{pair_key}/r_spline/exp_coef", torch.as_tensor(rs.exp_coef))},
-                    "tail_coef":   {"@tensor": _put_tensor(
-                        f"{pair_key}/r_spline/tail_coef", torch.as_tensor(rs.tail_coef))},
+                    "grid": {
+                        "@tensor": _put_tensor(
+                            f"{pair_key}/r_spline/grid",
+                            torch.as_tensor(rs.grid),
+                        )
+                    },
+                    "cutoff": (
+                        float(rs.cutoff)
+                        if not torch.is_tensor(rs.cutoff)
+                        else float(
+                            rs.cutoff.item()
+                            if rs.cutoff.numel() == 1
+                            else rs.cutoff.flatten()[0]
+                        )
+                    ),
+                    "spline_coef": {
+                        "@tensor": _put_tensor(
+                            f"{pair_key}/r_spline/spline_coef",
+                            torch.as_tensor(rs.spline_coef),
+                        )
+                    },
+                    "exp_coef": {
+                        "@tensor": _put_tensor(
+                            f"{pair_key}/r_spline/exp_coef",
+                            torch.as_tensor(rs.exp_coef),
+                        )
+                    },
+                    "tail_coef": {
+                        "@tensor": _put_tensor(
+                            f"{pair_key}/r_spline/tail_coef",
+                            torch.as_tensor(rs.tail_coef),
+                        )
+                    },
                 }
             else:
                 pair_meta["r_spline"] = None
@@ -978,8 +1030,12 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             "format_version": 1,
             "class_name": "MultiElementSkfParameterOptimizer",
             "skf_directory": getattr(self, "skf_directory", None),
-            "elements_in_system": sorted(getattr(self, "elements_in_system", []) or []),
-            "element_pairs": [list(p) for p in (getattr(self, "element_pairs", []) or [])],
+            "elements_in_system": sorted(
+                getattr(self, "elements_in_system", []) or []
+            ),
+            "element_pairs": [
+                list(p) for p in (getattr(self, "element_pairs", []) or [])
+            ],
             "available_pairs": sorted(self.skf_optimizers.keys()),
             "pairs": manifest_pairs,
         }
@@ -990,7 +1046,9 @@ class MultiElementSkfParameterOptimizer(nn.Module):
 
         n_tensors = len(tensors)
         sz = os.path.getsize(st_path) / (1024 * 1024)
-        print(f"✅ safetensors saved : {st_path}  ({sz:.1f} MB, {n_tensors} unique tensors)")
+        print(
+            f"✅ safetensors saved : {st_path}  ({sz:.1f} MB, {n_tensors} unique tensors)"
+        )
         print(f"   manifest        : {mf_path}")
         return str(st_path), str(mf_path)
 
@@ -1029,24 +1087,30 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         if elements is not None:
             elements = set(elements)
             pairs_to_load = [
-                p for p in all_pairs
+                p
+                for p in all_pairs
                 if all(part in elements for part in p.split("-"))
             ]
         else:
             pairs_to_load = list(all_pairs)
-        print(f"🎯 safetensors lazy-load: {len(pairs_to_load)}/{len(all_pairs)} "
-              f"pairs{' (elements=' + str(sorted(elements)) + ')' if elements else ''}")
+        print(
+            f"🎯 safetensors lazy-load: {len(pairs_to_load)}/{len(all_pairs)} "
+            f"pairs{' (elements=' + str(sorted(elements)) + ')' if elements else ''}"
+        )
 
         instance = cls.__new__(cls)
         nn.Module.__init__(instance)
         instance.skf_directory = manifest.get("skf_directory")
-        instance.elements_in_system = set(manifest.get("elements_in_system") or [])
+        instance.elements_in_system = set(
+            manifest.get("elements_in_system") or []
+        )
         instance.element_pairs = set(
             tuple(p) for p in manifest.get("element_pairs") or []
         )
         instance.skf_optimizers = nn.ModuleDict()
 
         from jarvis.core.specie import atomic_numbers_to_symbols
+
         zz = list(range(1, 100))
         z = atomic_numbers_to_symbols(zz)
         instance.atomic_num_to_symbol = dict(zip(zz, z))
@@ -1999,7 +2063,7 @@ class MultiElementSkfParameterOptimizer(nn.Module):
                 if atomic_data:
                     occupations = atomic_data.get("occupations", [])
                     if occupations:
-                        return sum(occupations)   # consistent with homo branch
+                        return sum(occupations)  # consistent with homo branch
 
         # Default fallback based on atomic number
         atomic_num = None
@@ -3311,14 +3375,18 @@ def _smart_load_slakonet_model(stem_or_pt, elements=None, prefer=None):
 
     can_st = st_path.exists() and mf_path.exists()
     if prefer == "safetensors" and can_st:
-        print(f"Loading safetensors from {st_path}"
-              + (f"  (elements={sorted(elements)})" if elements else ""))
+        print(
+            f"Loading safetensors from {st_path}"
+            + (f"  (elements={sorted(elements)})" if elements else "")
+        )
         model = MultiElementSkfParameterOptimizer.load_safetensors(
             stem, elements=elements
         )
     else:
         if prefer == "safetensors" and not can_st:
-            print(f"safetensors not found beside {pt_path}; falling back to .pt")
+            print(
+                f"safetensors not found beside {pt_path}; falling back to .pt"
+            )
         print(f"Loading cached model from {pt_path}")
         model = MultiElementSkfParameterOptimizer.load_ultra_compact(pt_path)
     model.eval()
@@ -3326,8 +3394,9 @@ def _smart_load_slakonet_model(stem_or_pt, elements=None, prefer=None):
     return model
 
 
-def default_model(dir_path=None, model_name="slakonet_v0", elements=None,
-                  prefer=None):
+def default_model(
+    dir_path=None, model_name="slakonet_v1", elements=None, prefer=None
+):
     """
     Load or download the SlakoNet model with proper Figshare handling.
 
@@ -3349,7 +3418,8 @@ def default_model(dir_path=None, model_name="slakonet_v0", elements=None,
     ):
         return _smart_load_slakonet_model(
             os.path.join(dir_path, model_name),
-            elements=elements, prefer=prefer,
+            elements=elements,
+            prefer=prefer,
         )
 
     # Old behaviour kept below for the download/extract path
@@ -3389,7 +3459,8 @@ def default_model(dir_path=None, model_name="slakonet_v0", elements=None,
         return model
 
     # Download from Figshare - use ndownloader subdomain
-    url = "https://ndownloader.figshare.com/files/57945370"
+    # v0 url = "https://ndownloader.figshare.com/files/57945370"
+    url = "https://ndownloader.figshare.com/files/64744347"
     # url="https://figshare.com/ndownloader/files/57945370"
     print(f"Downloading {model_name} model from Figshare...")
 
@@ -3436,7 +3507,30 @@ def default_model(dir_path=None, model_name="slakonet_v0", elements=None,
     return model
 
 
-def default_model_new(dir_path=None, model_name="slakonet_v0"):
+def default_mu(full=False):
+    """Return SlaKoNet's default per-element chemical potentials.
+
+    These are bundled with the package (``slakonet/data/default_mu.json``)
+    and are used to turn total energies into formation energies
+    (``E_form = (E_total - sum_i n_i * mu_i) / N_atoms``). Users who
+    prefer their own calibration can simply load a different JSON.
+
+    Args:
+        full: if True return the whole JSON dict (model name, calibration
+            metrics, etc.); otherwise just the ``{element: mu_eV}`` map.
+
+    Returns:
+        dict -- ``{element: mu_per_atom_eV}`` (default) or the full file.
+    """
+    import json
+    from importlib.resources import files
+
+    text = files("slakonet.data").joinpath("default_mu.json").read_text()
+    data = json.loads(text)
+    return data if full else data["mu_per_atom_eV"]
+
+
+def default_model_new(dir_path=None, model_name="slakonet_v1"):
     """
     More direct version - modify load function to accept BytesIO
     """
@@ -3518,7 +3612,7 @@ def default_model_new(dir_path=None, model_name="slakonet_v0"):
     return model
 
 
-def default_model_old(dir_path=None, model_name="slakonet_v0"):
+def default_model_old(dir_path=None, model_name="slakonet_v1"):
     """
     More direct version - modify load function to accept BytesIO
     """

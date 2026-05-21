@@ -103,6 +103,53 @@ dos_values = properties['dos_values_tensor']
 dos_energies = properties['dos_energy_grid_tensor']
 ```
 
+### ASE Calculator
+
+`SlaKoNetCalculator` exposes SlaKoNet through the standard ASE
+`Calculator` API. The trained model is **loaded once** and injected into
+the calculator, then reused for every structure and every call (no
+per-call reload). Energy, forces and stress use the usual ASE methods;
+band structure and DOS are dedicated methods.
+
+```python
+from ase.build import bulk
+from slakonet.optim import default_model
+from slakonet.ase_calc import SlaKoNetCalculator
+
+# load the trained model ONCE
+model = default_model().float()
+
+calc = SlaKoNetCalculator(model, kpoints=(3, 3, 3))
+
+si = bulk("Si", "diamond", a=5.43)
+si.calc = calc
+si.get_potential_energy()        # eV
+si.get_forces()                  # eV/Ang, shape (N, 3)
+si.get_stress()                  # eV/Ang^3, Voigt(6)
+
+# band structure (-> PNG) and total DOS, same loaded model
+bs = calc.band_structure(si, path="GXWKGL", npoints=120,
+                         savefig="si_bands.png")
+e, dos = calc.dos(si)
+print(calc.get_bandgap(), calc.get_fermi_level())
+
+# reuse on another structure with NO model reload
+ge = bulk("Ge", "diamond", a=5.66); ge.calc = calc
+ge.get_potential_energy()
+```
+
+Toggles (constructor keywords): `compute_forces`, `compute_stress`,
+`use_scc`, `include_dos`, `kpoints`, `cutoff`, `kT`, `alpha`, `beta`,
+`device`. Setting `compute_forces=False` gives a fast energy-only path
+for high-throughput screening.
+
+Notes: forces are scaled by `beta` (default `0.1`); pass `beta=1.0` for
+physically correct forces. Stress is converted to ASE units
+(eV/Ang^3, Voigt) but should be validated against a numerical-strain
+reference before use in cell relaxation. A full runnable demo is in
+`slakonet/examples/slakonet_calculator_example.py`. See also the ASE docs
+page *Calculators -> SlaKoNet*.
+
 ## Supported Materials
 
 - **Elements**: Z = 1-65
