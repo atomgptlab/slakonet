@@ -631,19 +631,24 @@ def eighb_cpu(h_k, s_k, scheme="chol"):
     # ========================================
     if scheme == "chol":
         try:
-            # S = L·L^T (Cholesky decomposition)
+            # S = L·L^T  →  L^{-1} H L^{-T} via triangular solves
+            # (more accurate and faster than forming L^{-1} explicitly).
             L = torch.linalg.cholesky(s_k)
+            # X = L^{-1} H ⇔ L X = H
+            X = torch.linalg.solve_triangular(L, h_k, upper=False)
+            # h_transformed = X L^{-T} = (L^{-1} (L^{-1} H)^T)^T
+            h_transformed = torch.linalg.solve_triangular(
+                L, X.transpose(-2, -1).conj(), upper=False
+            ).transpose(-2, -1).conj()
 
-            # Transform: L^-1 · H · L^-T
-            L_inv = torch.linalg.inv(L)
-            h_transformed = L_inv @ h_k @ L_inv.transpose(-2, -1)
-
-            # Standard eigenvalue problem
             eigenvals, eigenvecs_transformed = torch.linalg.eigh(h_transformed)
 
-            # Back-transform eigenvectors: ψ = L^-T · ψ'
-            eigenvecs = L_inv.transpose(-2, -1) @ eigenvecs_transformed
-
+            # Back-transform eigenvectors: ψ = L^{-T} ψ'
+            eigenvecs = torch.linalg.solve_triangular(
+                L.transpose(-2, -1).conj(),
+                eigenvecs_transformed,
+                upper=True,
+            )
             return eigenvals, eigenvecs
 
         except RuntimeError as e:
@@ -657,11 +662,24 @@ def eighb_cpu(h_k, s_k, scheme="chol"):
                 raise
 
     # ========================================
-    # Strategy 3: Direct solve (more stable)
+    # Strategy 3: Löwdin orthogonalisation (stable for ill-conditioned S)
     # ========================================
+    # H ψ = E S ψ  ⟺  (S^{-1/2} H S^{-1/2}) ψ' = E ψ',  ψ = S^{-1/2} ψ'
+    # Build S^{-1/2} from the eigendecomposition of S, clamping tiny
+    # eigenvalues to a floor that prevents the inverse-sqrt blow-up that
+    # produces the ±100s-of-eV garbage eigenvalues seen at certain
+    # boundary k-points with the universal SKF set.
     try:
-        # Solve H·ψ = E·S·ψ as (S^-1·H)·ψ = E·ψ
-        eigenvals, eigenvecs = torch.linalg.eigh(torch.linalg.solve(s_k, h_k))
+        s_eig, s_vec = torch.linalg.eigh(s_k)
+        s_eig_safe = torch.clamp(s_eig, min=1e-6)
+        inv_sqrt = 1.0 / torch.sqrt(s_eig_safe)
+        S_invhalf = s_vec @ torch.diag_embed(inv_sqrt.to(s_vec.dtype)) \
+                          @ s_vec.transpose(-2, -1).conj()
+        H_lowdin = S_invhalf @ h_k @ S_invhalf
+        # Symmetrise to defeat round-off non-Hermiticity
+        H_lowdin = 0.5 * (H_lowdin + H_lowdin.transpose(-2, -1).conj())
+        eigenvals, eigvecs_lowdin = torch.linalg.eigh(H_lowdin)
+        eigenvecs = S_invhalf @ eigvecs_lowdin
         return eigenvals, eigenvecs
 
     except RuntimeError as e:
@@ -968,30 +986,103 @@ def eighb_memory_efficient(h_k, s_k, n_electrons=None):
         return eighb(h_k, s_k, scheme="chol")
 
 
+def eighb_vals_only(h_k, s_k, scheme="chol"):
+    """Eigenvalues-only generalised eigh.
+
+    For DOS / bandgap / Fermi search we don't need eigenvectors —
+    `eigvalsh` skips the eigenvector construction (~1.5–2× faster than
+    `eigh` for the same matrix). On Cholesky failure we fall back to
+    Löwdin orthogonalisation with eigenvalues-only.
+    """
+    try:
+        L = torch.linalg.cholesky(s_k)
+        X = torch.linalg.solve_triangular(L, h_k, upper=False)
+        h_transformed = torch.linalg.solve_triangular(
+            L, X.transpose(-2, -1).conj(), upper=False
+        ).transpose(-2, -1).conj()
+        return torch.linalg.eigvalsh(h_transformed)
+    except RuntimeError:
+        s_eig, s_vec = torch.linalg.eigh(s_k)
+        s_eig_safe = torch.clamp(s_eig, min=1e-6)
+        inv_sqrt = (1.0 / torch.sqrt(s_eig_safe)).to(s_vec.dtype)
+        S_invhalf = s_vec @ torch.diag_embed(inv_sqrt) \
+                          @ s_vec.transpose(-2, -1).conj()
+        H_lowdin = S_invhalf @ h_k @ S_invhalf
+        H_lowdin = 0.5 * (H_lowdin + H_lowdin.transpose(-2, -1).conj())
+        return torch.linalg.eigvalsh(H_lowdin)
+
+
 def eighb(h_k, s_k, scheme="chol"):
-    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability."""
-    eps = 1e-8
+    """Solve generalized eigenvalue problem H|ψ⟩ = E·S|ψ⟩ with numerical stability.
+
+    Tries cholesky-regularized solve at progressively larger eps until it
+    succeeds. This handles ill-conditioned overlap matrices (common for
+    transition-metal oxides like SrTiO3 with universal SK parameter sets)
+    without falling back to non-Hermitian `eig`, which produces unphysical
+    spectra at the bad k-points.
+    """
     device = h_k.device
     dtype = h_k.dtype
     n = h_k.shape[-1]
-
     eye = torch.eye(n, device=device, dtype=dtype)
-    s_k_reg = s_k + eps * eye  # Optional regularization
 
     if scheme == "chol":
+        # Try the fast batched path first; if any k fails, drop into a
+        # per-k escalation loop so good k-points are not poisoned by bad ones.
         try:
+            s_k_reg = s_k + 1e-6 * eye
             L = torch.linalg.cholesky(s_k_reg)
-            L_inv = torch.linalg.inv(L)
+            I_b = eye.expand_as(L)
+            L_inv = torch.linalg.solve_triangular(L, I_b, upper=False)
             H_tilde = L_inv @ h_k @ L_inv.mH
             eigenvals, eigenvecs_tilde = torch.linalg.eigh(H_tilde)
             eigenvecs = L_inv.mH @ eigenvecs_tilde
-        except RuntimeError as e:
-            print(f"Cholesky failed: {e}, falling back to eig")
-            eigenvals, eigenvecs = torch.linalg.eig(
-                torch.linalg.solve(s_k_reg, h_k)
-            )
-            eigenvals = eigenvals.real
+            return eigenvals, eigenvecs
+        except RuntimeError:
+            pass
+
+        # Per-k fallback: process each matrix in the batch independently.
+        is_batched = h_k.ndim >= 3
+        H_list = h_k.unsqueeze(0) if not is_batched else h_k.reshape(-1, n, n)
+        S_list = s_k.unsqueeze(0) if not is_batched else s_k.reshape(-1, n, n)
+        nb = H_list.shape[0]
+        out_vals = torch.empty(nb, n, device=device,
+                               dtype=torch.real(h_k).dtype)
+        out_vecs = torch.empty(nb, n, n, device=device, dtype=dtype)
+        n_failed = 0
+        eye_single = torch.eye(n, device=device, dtype=dtype)
+        for ib in range(nb):
+            hi, si = H_list[ib], S_list[ib]
+            done = False
+            for eps in (1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
+                try:
+                    L = torch.linalg.cholesky(si + eps * eye_single)
+                    Linv = torch.linalg.solve_triangular(
+                        L, eye_single, upper=False)
+                    Ht = Linv @ hi @ Linv.mH
+                    e, ct = torch.linalg.eigh(Ht)
+                    out_vals[ib] = e
+                    out_vecs[ib] = Linv.mH @ ct
+                    done = True
+                    break
+                except RuntimeError:
+                    continue
+            if not done:
+                # Last-resort: non-Hermitian eig (this k will be filtered later).
+                e, c = torch.linalg.eig(
+                    torch.linalg.solve(si + 1e-6 * eye_single, hi)
+                )
+                out_vals[ib] = e.real
+                out_vecs[ib] = c
+                n_failed += 1
+        if n_failed:
+            print(f"   [eighb] cholesky failed for {n_failed}/{nb} k-points; "
+                  f"used non-Hermitian eig fallback there")
+        if not is_batched:
+            return out_vals[0], out_vecs[0]
+        return out_vals.reshape(*h_k.shape[:-1]), out_vecs.reshape(h_k.shape)
     else:
+        s_k_reg = s_k + 1e-6 * eye
         # Direct method (more stable)
         eigenvals, eigenvecs = torch.linalg.eig(
             torch.linalg.solve(s_k_reg, h_k)
@@ -1372,7 +1463,7 @@ def tetrahedral_root(x: Union[Tensor, Real]) -> Union[Tensor, Real]:
 
 def create_feeds(updated_skfs, shell_dict, integral_type):
     """Create feed for H or S integrals."""
-    from slakonet.interpolation import PolyInterpU
+    from slakonet.interpolation import get_default_interpolator
     from slakonet.skfeed import (
         SkfFeed,
         SkfParamFeed,
@@ -1380,7 +1471,7 @@ def create_feeds(updated_skfs, shell_dict, integral_type):
         _get_onsite_dict,
     )
 
-    interpolator = PolyInterpU
+    interpolator = get_default_interpolator()
     hs_dict = {}
     onsite_hs_dict = {}
 
@@ -1395,10 +1486,46 @@ def create_feeds(updated_skfs, shell_dict, integral_type):
     return SkfFeed(hs_dict, onsite_hs_dict, shell_dict)
 
 
-def generate_shell_dict_upto_Z65():
-    """Generate shell_dict for atomic numbers 1-65."""
+def generate_shell_dict_upto_Z65(model=None):
+    """Generate shell_dict for atomic numbers 1-99.
+
+    If `model` is provided (any slakonet model exposing get_updated_skfs()),
+    shells are derived from the SKF atomic_data.occupations length (one entry
+    per shell in order s, p, d, f), which is the authoritative source.
+    Elements not covered by the model fall back to the hardcoded table below.
+
+    The hardcoded table is a coarse fallback; it can be wrong where the
+    underlying SKF actually carries d-integrals for a main-group element
+    (e.g. Si in Si_only.pt has an spd basis, whereas the hardcoded table
+    lists Si as sp).
+    """
     shell_dict = {}
+
+    # 1) If a model is provided, harvest shells from its SKFs first.
+    if model is not None and hasattr(model, "get_updated_skfs"):
+        try:
+            from jarvis.core.specie import Specie
+            for pair_key, skf in model.get_updated_skfs().items():
+                for sym in pair_key.split("-"):
+                    Z = Specie(sym).Z
+                    if Z in shell_dict:
+                        continue
+                    try:
+                        occ = skf.to_dict().get("atomic_data", {}).get(
+                            "occupations", []
+                        )
+                    except Exception:
+                        occ = []
+                    if occ:
+                        shell_dict[Z] = list(range(min(len(occ), 4)))
+        except Exception:
+            # Any SKF introspection failure -> fall through to hardcoded table
+            pass
+
+    # 2) Hardcoded fallback for Z's not resolved above.
     for Z in range(1, 100):
+        if Z in shell_dict:
+            continue
         if Z <= 2:  # H, He
             shell_dict[Z] = [0]
         elif Z <= 10:  # Li to Ne
@@ -1409,15 +1536,14 @@ def generate_shell_dict_upto_Z65():
             shell_dict[Z] = [0, 1, 2]
         elif Z <= 36:  # Ga to Kr
             shell_dict[Z] = [0, 1]
-        elif Z <= 48:  # transition metals
+        elif Z <= 48:
             shell_dict[Z] = [0, 1, 2]
         elif Z <= 54:  # In to Xe
             shell_dict[Z] = [0, 1]
         elif Z <= 57:  # Cs, Ba, La
             shell_dict[Z] = [0, 1, 2]
-        else:  # lanthanides
+        else:
             shell_dict[Z] = [0, 1, 2]
-            # shell_dict[Z] = [0, 1, 2, 3]
     return shell_dict
 
 

@@ -331,13 +331,25 @@ class SkfFeed(_SkFeed):
             shell_pair_tuple = combo[2:].tolist()
             key = (*atom_pair_tuple, *shell_pair_tuple)
 
-            splines = self.off_site_dict[key]
+            splines = self.off_site_dict.get(key)
 
-            # Evaluate spline for all distances with this combo
-            integrals = splines(combo_distances)
-
-            if isinstance(integrals, np.ndarray):
-                integrals = torch.from_numpy(integrals)
+            if splines is None:
+                # SKF table doesn't tabulate this shell-pair (e.g. d on a
+                # light element). The Slater-Koster integral is zero by
+                # convention; the number of SK integrals for shell pair
+                # (l1, l2) is min(l1, l2) + 1  (σ, π, δ, ...).
+                l1, l2 = int(shell_pair_tuple[0]), int(shell_pair_tuple[1])
+                n_int = min(l1, l2) + 1
+                integrals = torch.zeros(
+                    combo_distances.shape[0], n_int,
+                    dtype=combo_distances.dtype,
+                    device=combo_distances.device,
+                )
+            else:
+                # Evaluate spline for all distances with this combo
+                integrals = splines(combo_distances)
+                if isinstance(integrals, np.ndarray):
+                    integrals = torch.from_numpy(integrals)
 
             all_results.append((mask, integrals))
 
@@ -350,7 +362,7 @@ class SkfFeed(_SkFeed):
         )
 
         for mask, integrals in all_results:
-            output[mask] = integrals
+            output[mask] = integrals.to(dtype=output.dtype, device=output.device)
 
         return output
 
@@ -782,20 +794,38 @@ def _get_onsite_dict(
     else:
         orb_index = [1] * (max_l + 1)
 
+    # `shell_dict` (derived from atomic_data.occupations) may declare more
+    # shells than the SKF tabulates on-site energies for -- e.g. carbon has
+    # an empty d polarization shell: occupations=[2,2,0] -> 3 shells, but
+    # on_sites=[s,p] only. Pad the missing trailing shells with 0.0 (an
+    # untabulated/empty shell has no on-site energy shift) so the H on-site
+    # length stays consistent with shell_dict and the S path.
+    _os = skf.on_sites
+    _zero = torch.zeros(
+        (),
+        dtype=_os[0].dtype if len(_os) else torch.get_default_dtype(),
+        device=_os[0].device if len(_os) else None,
+    )
+    on_sites_padded = [
+        _os[i] if i < len(_os) else _zero for i in range(max_l + 1)
+    ]
+
     # flip make sure the order is along s, p ...
     if integral_type == "H" and not orbital_resolve:
         onsite_hs_dict[(skf.atom_pair[0].tolist())] = torch.cat(
             [
-                isk.repeat(ioi)
-                for ioi, isk in zip(orb_index, skf.on_sites[: max_l + 1])
+                isk.reshape(-1).repeat(ioi)
+                for ioi, isk in zip(orb_index, on_sites_padded)
             ]
         )
 
     elif integral_type == "H" and orbital_resolve:
         for il, isk, ioi in zip(
-            range(max_l + 1), skf.on_sites[: max_l + 1], orb_index
+            range(max_l + 1), on_sites_padded, orb_index
         ):
-            onsite_hs_dict[(skf.atom_pair[0].tolist(), il)] = isk.repeat(ioi)
+            onsite_hs_dict[(skf.atom_pair[0].tolist(), il)] = isk.reshape(
+                -1
+            ).repeat(ioi)
 
     elif integral_type == "S" and not orbital_resolve:
         onsite_hs_dict[(skf.atom_pair[0].tolist())] = torch.cat(

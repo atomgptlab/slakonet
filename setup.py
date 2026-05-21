@@ -8,7 +8,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="slakonet",
-    version="2026.4.1",
+    version="5.20.2026",
     author="Kamal Choudhary",
     author_email="kchoudh2@jhu.edu",
     description="slakonet",
@@ -17,6 +17,8 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/atomgptlab/slakonet",
     packages=setuptools.find_packages(),
+    include_package_data=True,
+    package_data={"slakonet.data": ["*.json"]},
     entry_points={
         "console_scripts": [
             "predict_slakonet=slakonet.predict_slakonet:main",

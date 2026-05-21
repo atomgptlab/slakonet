@@ -1,0 +1,107 @@
+site_name: SlaKoNet
+site_description: >-
+  Differentiable Slater-Koster tight binding for fast, accurate electronic
+  structure across the periodic table.
+site_url: https://atomgptlab.github.io/slakonet/
+repo_url: https://github.com/atomgptlab/slakonet
+repo_name: atomgptlab/slakonet
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; SlaKoNet contributors
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - navigation.indexes
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: JetBrains Mono
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/atomgptlab/slakonet
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/slakonet/
+  generator: false
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - footnotes
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.min.js
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Get started:
+      - Installation: installation.md
+      - Quickstart: getting-started.md
+      - Examples & Colab: examples.md
+  - User guide:
+      - ASE calculator: guide/ase-calculator.md
+      - Band structure: guide/band-structure.md
+      - Density of states: guide/dos.md
+      - Fermi surfaces: guide/fermi-surface.md
+      - Band-gap screening: guide/bandgap-screening.md
+      - Formation energies: guide/formation-energy.md
+  - Reference:
+      - How it works: methodology.md
+      - Performance: performance.md
+      - API reference: api-reference.md
+      - FAQ: faq.md
+  - Contributing: contributing.md

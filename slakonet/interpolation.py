@@ -268,6 +268,171 @@ def poly5_zero(
     return yy
 
 
+class CubicSplineInterpU:
+    """C2-continuous natural cubic spline on a uniform grid.
+
+    Drop-in replacement for ``PolyInterpU`` with the same call signature.
+    Eliminates the discontinuous polynomial-window shifts of ``PolyInterpU``
+    that show up as zigzag noise (~0.1-1 eV) in geometry-scan total energies
+    and equation-of-state curves.
+
+    The interior region [xx[0], xx[-1]] is evaluated with a natural cubic
+    spline. The tail region (xx[-1], xx[-1] + tail) decays smoothly to zero
+    via :func:`poly5_zero`, matching :class:`PolyInterpU`'s convention so
+    integrals tabulated to small SK-grid endings still go to zero smoothly.
+
+    Coefficients are precomputed once at construction with
+    ``scipy.interpolate.CubicSpline`` (no autograd through the table) and
+    evaluated in pure torch so gradients flow through the query distances.
+
+    Arguments:
+        xx: Uniform grid points, 1D Tensor.
+        yy: Tabulated values. Supports ``yy.dim()`` in {1, 2, 3, 4}; the
+            leading axis must match ``xx``.
+        tail: Distance over which to smooth values past the last grid point
+            to zero (Bohr).
+        delta_r: Step used to estimate first/second derivatives at the last
+            grid point for the tail decay.
+
+    Notes:
+        - At grid points the values are identical to ``yy``.
+        - Both first and second derivatives are continuous everywhere, which
+          is what removes the EOS zigzag.
+        - For SKF tables the natural BC (y'' = 0 at endpoints) is fine
+          because the H/S integrals are tabulated well beyond their physical
+          support; the endpoint values are already small.
+    """
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"xx.shape={tuple(self.xx.shape)}, "
+            f"yy.shape={tuple(self.yy.shape)}, "
+            f"tail={self.tail}, "
+            f"grid_step={self.grid_step.item():.3e}, "
+            f"device={self._device})"
+        )
+
+    def __init__(
+        self,
+        xx: Tensor,
+        yy: Tensor,
+        tail: Real = 1.0,
+        delta_r: Real = 1e-5,
+        n_interp: int = 8,        # accepted for signature compat; unused
+        n_interp_r: int = 4,      # accepted for signature compat; unused
+    ):
+        from scipy.interpolate import CubicSpline
+
+        self.xx = xx
+        self.yy = yy
+        self.tail = tail
+        self.delta_r = delta_r
+        self.n_interp = n_interp
+        self.n_interp_r = n_interp_r
+        self.grid_step = xx[1] - xx[0]
+        self._device = xx.device
+
+        dxs = xx[1:] - xx[:-1]
+        assert torch.allclose(
+            dxs, torch.full_like(dxs, self.grid_step), atol=1e-6, rtol=1e-5
+        ), "Grid points xx are not uniform"
+        if len(xx) < 4:
+            raise ValueError(
+                f"Cubic spline needs >= 4 grid points, got {len(xx)}"
+            )
+
+        x_np = xx.detach().cpu().numpy().astype(np.float64)
+        y_np = yy.detach().cpu().numpy().astype(np.float64)
+        cs = CubicSpline(x_np, y_np, bc_type="natural", axis=0)
+        # cs.c has shape (4, N-1, *yy.shape[1:]); index 0 is highest power.
+        coef = torch.from_numpy(np.ascontiguousarray(cs.c))
+        coef = coef.to(device=self._device, dtype=yy.dtype)
+        self._coef_a = coef[0]   # (rr-x_i)^3
+        self._coef_b = coef[1]   # (rr-x_i)^2
+        self._coef_c = coef[2]   # (rr-x_i)^1
+        self._coef_d = coef[3]   # constant
+
+    def __call__(self, rr: Tensor) -> Tensor:
+        device = self._device
+        dtype = self.yy.dtype
+        xx = self.xx
+        n_grid = xx.shape[0]
+        x_max = xx[-1]
+        r_max = x_max + self.tail
+
+        out_shape = (rr.shape[0],) + tuple(self.yy.shape[1:])
+        result = torch.zeros(out_shape, device=device, dtype=dtype)
+
+        # Region 1: rr <= x_max  -> cubic spline
+        mask_in = rr <= x_max
+        if mask_in.any():
+            r_in = rr[mask_in]
+            idx = torch.bucketize(r_in.detach(), xx) - 1
+            idx = torch.clamp(idx, 0, n_grid - 2)
+            x_lo = xx[idx]
+            dx = (r_in - x_lo).to(dtype)
+
+            a = self._coef_a[idx]
+            b = self._coef_b[idx]
+            c = self._coef_c[idx]
+            d = self._coef_d[idx]
+
+            # broadcast dx against trailing dims of a/b/c/d
+            while dx.dim() < a.dim():
+                dx = dx.unsqueeze(-1)
+
+            result[mask_in] = d + dx * (c + dx * (b + dx * a))
+
+        # Region 2: x_max < rr < r_max  -> 5th-order smooth-to-zero tail
+        mask_tail = (rr > x_max) & (rr < r_max)
+        if mask_tail.any():
+            # values & derivatives at x_max, taken from the spline itself
+            # to guarantee continuity at the seam
+            d_lo = xx[-1] - xx[-2]
+            a_end = self._coef_a[-1]
+            b_end = self._coef_b[-1]
+            c_end = self._coef_c[-1]
+            d_end = self._coef_d[-1]
+            y_end = d_end + d_lo * (c_end + d_lo * (b_end + d_lo * a_end))
+            yp_end = c_end + d_lo * (2 * b_end + d_lo * 3 * a_end)
+            ypp_end = 2 * b_end + 6 * a_end * d_lo
+
+            r_t = rr[mask_tail]
+            dr = (r_t - x_max).to(dtype)
+            # broadcast dr to trailing dims
+            while dr.dim() < y_end.dim() + 1:
+                dr = dr.unsqueeze(-1)
+            # poly5_zero expects scalar dx (= -tail) as anchor distance
+            tail_val = poly5_zero(
+                y_end.unsqueeze(0).expand(r_t.shape[0], *y_end.shape),
+                yp_end.unsqueeze(0).expand(r_t.shape[0], *yp_end.shape),
+                ypp_end.unsqueeze(0).expand(r_t.shape[0], *ypp_end.shape),
+                dr,
+                torch.tensor(-float(self.tail), dtype=dtype, device=device),
+            )
+            result[mask_tail] = tail_val
+
+        # Region 3: rr >= r_max -> already zero
+        return result
+
+
+def get_default_interpolator():
+    """Return the default SK interpolator class.
+
+    Set ``SLAKONET_INTERPOLATOR=poly`` to keep the legacy
+    :class:`PolyInterpU`. Default is the C2-continuous
+    :class:`CubicSplineInterpU`, which removes the EOS/strain zigzag caused
+    by polynomial-window shifts at SKF grid boundaries.
+    """
+    import os
+
+    name = os.environ.get("SLAKONET_INTERPOLATOR", "spline").lower()
+    if name in ("poly", "polyinterpu"):
+        return PolyInterpU
+    return CubicSplineInterpU
+
+
 def poly_interp(xp: Tensor, yp: Tensor, rr: Tensor) -> Tensor:
     """Interpolation with given uniform grid points.
     Arguments:
