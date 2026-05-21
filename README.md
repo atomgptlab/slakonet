@@ -128,7 +128,7 @@ si.get_forces()                  # eV/Ang, shape (N, 3)
 si.get_stress()                  # eV/Ang^3, Voigt(6)
 
 # band structure (-> PNG) and total DOS, same loaded model
-bs = calc.band_structure(si, path="GXWKGL", npoints=120,
+bs = calc.band_structure(si, path="GXWKGL", npoints=20,
                          savefig="si_bands.png")
 e, dos = calc.dos(si)
 print(calc.get_bandgap(), calc.get_fermi_level())
