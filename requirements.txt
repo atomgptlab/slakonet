@@ -1,0 +1,9 @@
+numpy
+scipy
+torch
+matplotlib
+ase
+jarvis-tools
+h5py
+spglib
+pydantic
