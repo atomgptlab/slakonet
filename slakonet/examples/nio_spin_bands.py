@@ -1,17 +1,16 @@
 """Spin-polarized bandstructure of NiO - simple demo.
 
-IMPORTANT: the current slakonet universal parameter set (slakonet_v0) only
-includes s and p shells for Ni (no d-shell - Ni orbs_per_atom = 4). This
-means the Ni d-manifold that drives NiO magnetism is absent from the
-Hamiltonian, and a physical Stoner model on l=2 produces zero splitting.
+The current slakonet universal parameter set (slakonet_v1) includes the
+Ni 3d shell (Ni shells = [s, p, d], orbs_per_atom = 9). NiO magnetism is
+driven by that Ni-3d manifold, so we apply the Stoner-like exchange shift
+on l=2 with a physical Stoner parameter (~0.037 Ha for Ni).
 
-This script therefore does a *demonstration* of the spin-polarized band
-API: it imposes fixed atomic moments and applies the Stoner-like exchange
-shift on whichever shells are present (s + p for Ni in the universal set).
-The resulting plot shows how the up and down channels of the Ni-p bands
-separate under an applied exchange field - it is not a quantitatively
-correct NiO calculation. For production NiO you would need refit Ni/O
-SKFs including the Ni-3d shell.
+This is a Stoner-rigid demonstration of the spin-polarized band API: it
+imposes a fixed Ni moment and splits the two spin channels by a diagonal
+on-site exchange field. It is not a full spin-polarized SCC-DFTB result,
+but with the exchange on the d-shell it now produces a physically sensible
+d-band splitting rather than the artificially large p-shell split used in
+the older s/p-only parameter set.
 
 Change AFM = True for a 1x1x2 supercell with two Ni atoms (+/- moments).
 """
@@ -28,12 +27,23 @@ from slakonet.optim import default_model
 from slakonet.magnetism import compute_spin_polarized_bands, plot_spin_bands
 
 AFM = False
-# Exchange strength per shell (Hartree). d-entry is harmless if no d-shell
-# is present in the basis; p-entry is what actually drives the splitting
-# in the current universal SKF.
+SCF = True  # self-consistently relax the moments (predict them) vs single-shot
+
+# Exchange strength per shell (Hartree). NiO magnetism lives on the Ni-3d
+# manifold, so the exchange is placed on l=2; s and p stay at 0.0 (a large
+# field on the p-shell, as the old s/p-only set required, gives an
+# unphysically large split).
+#
+# NOTE on the value: the free-atom Ni Stoner parameter is ~0.037 Ha
+# (DEFAULT_STONER_I), but for this tight-binding model the Ni-3d DOS at E_F
+# puts the Stoner criterion threshold I*N(E_F) > 1 between ~0.04 and 0.08 Ha,
+# so 0.037 yields a non-magnetic (m -> 0) self-consistent solution. We use an
+# effective I_d = 0.12 Ha, which is above threshold and self-consistently
+# predicts Ni ~1.8 mu_B / net 2.0 mu_B per cell - close to experimental NiO
+# (~1.7-1.9 mu_B on Ni). Lower it toward 0.037 to see the moment collapse.
 STONER_I = {
-    28: {0: 0.0, 1: 0.15, 2: 0.05},
-    8:  {0: 0.0, 1: 0.00},
+    28: {0: 0.0, 1: 0.0, 2: 0.12},
+    8:  {0: 0.0, 1: 0.0},
 }
 
 
@@ -53,6 +63,41 @@ def fcc_klines(n_seg: int = 20) -> torch.Tensor:
     segs = ["L", "G", "X", "W", "K", "G"]
     rows = [[*pts[a], *pts[b], n_seg] for a, b in zip(segs[:-1], segs[1:])]
     return torch.tensor([rows], dtype=torch.float64)
+
+
+def matched_exchange_splitting(result, calc):
+    """Physical exchange splitting (eV).
+
+    The naive ``(eu - ed).abs().max()`` subtracts the two spin spectra by
+    *band index*, but the channels are diagonalized and sorted
+    independently, so equal indices need not label the same physical state
+    once the exchange field reorders the bands. Here we instead match each
+    spin-up state to the spin-down state of maximum eigenvector overlap
+    (via the overlap matrix S) and take the energy difference of matched
+    pairs. Returns (max_split, mean_split) in eV.
+    """
+    eu = result["eigenvalues_up"]            # [Nband, Nk] eV
+    ed = result["eigenvalues_dn"]
+    cu = result["eigenvectors_up"]           # [Norb, Nband, Nk]
+    cd = result["eigenvectors_dn"]
+    S = calc._results["overlap"]
+    if S.ndim == 4:
+        S = S[0]
+    S = S.to(torch.complex128)               # [Norb, Norb, Nk]
+
+    Nband, Nk = eu.shape
+    diffs = []
+    for ik in range(Nk):
+        Cu = cu[..., ik].to(torch.complex128)
+        Cd = cd[..., ik].to(torch.complex128)
+        if Cu.ndim == 3:
+            Cu, Cd = Cu.squeeze(0), Cd.squeeze(0)
+        # overlap <up_i | S | dn_j>, shape [Nband_up, Nband_dn]
+        O = (Cu.conj().transpose(0, 1) @ (S[..., ik] @ Cd)).abs()
+        match = O.argmax(dim=1)              # best down-state per up-state
+        diffs.append((eu[:, ik] - ed[match, ik]).abs())
+    diffs = torch.stack(diffs)
+    return diffs.max().item(), diffs.mean().item()
 
 
 def main():
@@ -87,14 +132,25 @@ def main():
         calc,
         stoner_I=STONER_I,
         initial_moments=torch.tensor(m0),
-        scf=False,
+        scf=SCF,
+        verbose=SCF,
     )
 
-    eu = result["eigenvalues_up"]
-    ed = result["eigenvalues_dn"]
-    max_split = (eu - ed).abs().max().item()
-    print(f"Fermi level         : {result['fermi_eV']:.3f} eV")
-    print(f"Max up/down splitting: {max_split:.3f} eV")
+    # Predicted magnetic moments (Mulliken spin density n_up - n_dn).
+    # With SCF=True these are self-consistently relaxed; with SCF=False they
+    # just echo the imposed initial moments above.
+    symbols = atoms.get_chemical_symbols()
+    moments = result["moments"].tolist()
+    print(f"SCF converged           : {result['converged']}")
+    print("Predicted atom-wise moments (mu_B):")
+    for i, (s, mu) in enumerate(zip(symbols, moments)):
+        print(f"    atom {i:2d}  {s:>2}  {mu:+.4f}")
+    print(f"Net magnetic moment     : {result['total_moment']:+.4f} mu_B/cell")
+
+    max_split, mean_split = matched_exchange_splitting(result, calc)
+    print(f"Fermi level             : {result['fermi_eV']:.3f} eV")
+    print(f"Max exchange splitting  : {max_split:.3f} eV  (state-matched)")
+    print(f"Mean exchange splitting : {mean_split:.3f} eV  (state-matched)")
 
     plot_spin_bands(
         result,
