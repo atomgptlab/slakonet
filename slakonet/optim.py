@@ -54,16 +54,36 @@ try:
     xm.set_rng_state(random_seed)
 except ImportError:
     pass
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 os.environ["PYTHONHASHSEED"] = str(random_seed)
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(":4096:8")
-torch.use_deterministic_algorithms(True)
 
-torch.autograd.set_detect_anomaly(True)
 
-# Optional: Make it raise errors immediately
-torch.set_anomaly_enabled(True)
+def set_debug_mode(deterministic=True, detect_anomaly=True):
+    """Opt in to bit-reproducible + anomaly-checked execution.
+
+    These are process-global torch settings and both are expensive, so
+    they are no longer enabled on import:
+
+    * ``detect_anomaly`` records a Python stack trace for every autograd
+      node. It made a Si energy+force evaluation ~2.3x slower.
+    * ``deterministic`` makes torch raise on any op without a
+      deterministic kernel. SlakoNet's own backward uses such CuBLAS
+      routines, so it broke force evaluation outright - and, because it
+      is global, it broke unrelated calculators (e.g. alignn) sharing
+      the process.
+
+    CUBLAS_WORKSPACE_CONFIG must be set in the environment *before*
+    Python starts for the deterministic path to work at all.
+    """
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(deterministic)
+    torch.autograd.set_detect_anomaly(detect_anomaly)
+
+
+if os.environ.get("SLAKONET_DEBUG"):
+    set_debug_mode()
 
 
 def get_atoms(jid="", dataset=None, id_tag="jid"):
