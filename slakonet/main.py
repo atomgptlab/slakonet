@@ -18,6 +18,8 @@ from jarvis.core.atoms import ase_to_atoms
 from slakonet.slaterkoster import fermi, hs_matrix
 from jarvis.core.atoms import Atoms
 from slakonet.utils import eighb, pack
+import contextlib
+import functools
 import matplotlib.pyplot as plt
 from jarvis.core.specie import atomic_numbers_to_symbols
 
@@ -50,6 +52,37 @@ H2E = 27.211
 BOHR_TO_ANGSTROM = 0.5291772109
 
 
+def nondeterministic_ok(fn):
+    """Run `fn` with the deterministic-algorithms requirement lifted."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with allow_nondeterministic():
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@contextlib.contextmanager
+def allow_nondeterministic():
+    """Temporarily lift torch's deterministic-algorithms requirement.
+
+    The force/stress backward pass goes through CuBLAS routines that have
+    no deterministic kernel, so it raises outright if another library in
+    the same process called torch.use_deterministic_algorithms(True)
+    (alignn does this when configured deterministic). Relax it just for
+    the gradient evaluation and restore the caller's setting afterwards.
+    """
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    if was_enabled:
+        torch.use_deterministic_algorithms(False)
+    try:
+        yield
+    finally:
+        if was_enabled:
+            torch.use_deterministic_algorithms(True)
+
+
 class SimpleDftb:
     """Enhanced DFTB calculator for periodic systems with analysis tools."""
 
@@ -68,6 +101,11 @@ class SimpleDftb:
         kT=0.025,  # eV for Fermi smearing
         H2E=27.211,  # Hartree to eV
         compute_forces=True,
+        # Build a differentiable graph through the force/stress gradients.
+        # Only needed to backpropagate *through* forces (e.g. force-matching
+        # training); it makes plain energy+force evaluation ~2x slower
+        # because torch records an fx stack trace per autograd node.
+        create_graph=False,
         include_dos_data=True,
         include_HS=True,
         use_float32=True,
@@ -100,6 +138,7 @@ class SimpleDftb:
         self.kT = kT
         self.H2E = H2E
         self.compute_forces = compute_forces
+        self.create_graph = create_graph
         self.include_dos_data = include_dos_data
         self.include_HS = include_HS
         # Setup basis and feeds
@@ -2257,6 +2296,7 @@ class SimpleDftb:
 
         return hybridization(self, omegas, correlated_subspace, **kw)
 
+    @nondeterministic_ok
     def calculate(self):
         """Main calculation method."""
         compute_forces = self.compute_forces
@@ -2460,7 +2500,7 @@ class SimpleDftb:
                 grad_outputs = torch.autograd.grad(
                     total_energy,
                     self.geometry.positions,
-                    create_graph=True,
+                    create_graph=self.create_graph,
                     retain_graph=True,
                     allow_unused=False,
                 )
@@ -2474,7 +2514,7 @@ class SimpleDftb:
                     total_energy,
                     self.geometry.cell,
                     retain_graph=True,
-                    create_graph=True,
+                    create_graph=self.create_graph,
                 )[0]
                 cell = self.geometry.cell[0]                 # Bohr
                 volume = torch.abs(torch.det(cell))          # Bohr^3
@@ -2509,11 +2549,22 @@ class SimpleDftb:
                 )
 
             except RuntimeError as e:
-                print(f"❌ Error computing forces: {e}")
-                print(
-                    "⚠️  Forces set to zero - positions may not be in computation graph"
-                )
-                forces = torch.zeros_like(self.geometry.positions)
+                # Never substitute zeros here. Silently returning zero
+                # forces makes an optimizer report immediate convergence
+                # while nothing has moved, and the caller has no way to
+                # tell. One way to hit this: another library in the same
+                # process enables torch.use_deterministic_algorithms(True)
+                # (alignn does when configured deterministic), which makes
+                # the CuBLAS-backed backward pass raise.
+                raise RuntimeError(
+                    f"SlakoNet failed to compute forces/stress: {e}\n"
+                    "If this mentions deterministic algorithms, another "
+                    "library in this process enabled them; set "
+                    "CUBLAS_WORKSPACE_CONFIG=:4096:8 before starting "
+                    "Python, or run the calculators in separate "
+                    "processes. Pass compute_forces=False if you only "
+                    "need energies."
+                ) from e
         # print('forces',forces)
         self._results = {
             "energy": total_energy,
