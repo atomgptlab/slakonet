@@ -46,6 +46,8 @@ except Exception:
 # torch.set_default_dtype(torch.float64)
 # torch.set_default_dtype(torch.float32)
 H2E = 27.211
+# Geometry stores lengths in Bohr; ASE and jarvis work in Angstrom.
+BOHR_TO_ANGSTROM = 0.5291772109
 
 
 class SimpleDftb:
@@ -69,8 +71,11 @@ class SimpleDftb:
         include_dos_data=True,
         include_HS=True,
         use_float32=True,
-        alpha=0.1,
-        beta=0.1,
+        # alpha scales the band-structure energy and beta the forces.
+        # Both are 1.0 for the standard DFTB total energy
+        # E = E_band + E_rep and its exact gradient.
+        alpha=1.0,
+        beta=1.0,
         updated_skfs=None,
         fermi_surface=False,
         use_scc=False,
@@ -2460,55 +2465,45 @@ class SimpleDftb:
                     allow_unused=False,
                 )
 
-                # UNIT NOTE: slakonet stores geometry.positions and
-                # geometry.cell in Bohr, while the total energy is in eV.
-                # torch.autograd.grad therefore yields eV/Bohr; the
-                # downstream stress/virial formula is then in eV/Bohr^3.
-                # ASE expects forces in eV/Ang and stress in eV/Ang^3
-                # (then * 160.21766208 -> GPa). Multiply by 1/_BOHR_TO_ANG
-                # and 1/_BOHR_TO_ANG**3 respectively to convert. The
-                # virial uses the *Bohr-units* forces with Bohr-units
-                # positions so the (eV/Bohr * Bohr -> eV) bookkeeping
-                # stays self-consistent; the conversion is applied once
-                # at the end.
-                _BOHR_TO_ANG = 0.52917721092
+                # Geometry stores positions and cell in Bohr, so autograd
+                # returns dE/dR in eV/Bohr. Convert to eV/Angstrom.
+                grad_pos = grad_outputs[0]
+                forces = -self.beta * grad_pos / BOHR_TO_ANGSTROM
 
-                forces_Bohr = -self.beta * grad_outputs[0]   # eV/Bohr
                 dE_dh = torch.autograd.grad(
                     total_energy,
                     self.geometry.cell,
                     retain_graph=True,
                     create_graph=True,
-                )[0]                                           # eV/Bohr
-                cell = self.geometry.cell[0]                  # Bohr
-                volume = torch.abs(torch.det(cell))           # Bohr^3
-                positions = self.geometry.positions[0]        # Bohr
+                )[0]
+                cell = self.geometry.cell[0]                 # Bohr
+                volume = torch.abs(torch.det(cell))          # Bohr^3
+                positions = self.geometry.positions[0]       # Bohr
                 mask = self.geometry.atomic_numbers[0] > 0
 
-                # virial in eV/Bohr^3 (Bohr-units throughout)
-                stress_virial = torch.einsum(
-                    "ia,ib->ab", forces_Bohr[0][mask], positions[mask]
+                # Under a homogeneous strain eps, R -> (1+eps)R and
+                # h -> (1+eps)h, so
+                #   dE/d(eps_ab) = sum_i dE/dR_ia * R_ib
+                #                + sum_c dE/dh_ca * h_cb
+                # and the (ASE-convention) stress is that divided by V.
+                virial = torch.einsum(
+                    "ia,ib->ab", grad_pos[0][mask], positions[mask]
                 )
-                stress_tensor = (
-                    stress_virial - dE_dh[0] @ cell.T
-                ) / volume                                     # eV/Bohr^3
+                cell_term = dE_dh[0].transpose(0, 1) @ cell
+                stress_tensor = (virial + cell_term) / volume   # eV/Bohr^3
 
-                # --- convert to ASE/SI units ---
-                forces = forces_Bohr / _BOHR_TO_ANG            # eV/Ang
-                stress_eVperA3 = stress_tensor / (_BOHR_TO_ANG ** 3)
-
-                # Voigt + GPa
+                # eV/Bohr^3 -> eV/Angstrom^3 -> GPa
+                stress_tensor = stress_tensor / BOHR_TO_ANGSTROM**3
                 stress = (
-                    torch.tensor(
+                    torch.stack(
                         [
-                            stress_eVperA3[0, 0],
-                            stress_eVperA3[1, 1],
-                            stress_eVperA3[2, 2],
-                            stress_eVperA3[1, 2],
-                            stress_eVperA3[0, 2],
-                            stress_eVperA3[0, 1],
-                        ],
-                        device=self.device,
+                            stress_tensor[0, 0],
+                            stress_tensor[1, 1],
+                            stress_tensor[2, 2],
+                            stress_tensor[1, 2],
+                            stress_tensor[0, 2],
+                            stress_tensor[0, 1],
+                        ]
                     )
                     * 160.21766208
                 )
@@ -2668,8 +2663,8 @@ def run_calc(
     kpoints_array=[1, 1, 1],
     device="cuda",
     compute_forces=True,
-    alpha=0.1,
-    beta=0.1,
+    alpha=1.0,
+    beta=1.0,
     elements_needed=None,
     updated_skfs=None,  # NEW
     with_eigenvectors=False,
@@ -2773,8 +2768,11 @@ class SlakoNetCalculator(Calculator):
         model_path=None,
         kpoints_array=[1, 1, 1],
         device="cuda",
-        alpha=0.1,
-        beta=0.1,
+        # alpha scales the band-structure energy and beta the forces.
+        # Both are 1.0 for the standard DFTB total energy
+        # E = E_band + E_rep and its exact gradient.
+        alpha=1.0,
+        beta=1.0,
         compute_forces=True,
         elements_needed=None,
         use_cached_model=False,
@@ -2927,8 +2925,10 @@ class SlakoNetCalculator(Calculator):
             self.results["forces"] = forces.reshape(-1, 3)
 
         if "stress" in properties and result.get("stress") is not None:
-            stress = result["stress"].detach().cpu().numpy()
-            self.results["stress"] = stress.reshape(-1, 3)
+            # SimpleDftb returns the Voigt stress (xx, yy, zz, yz, xz, xy)
+            # in GPa; ASE expects a 6-vector in eV/Angstrom^3.
+            stress = result["stress"].detach().cpu().numpy().reshape(-1)
+            self.results["stress"] = stress / 160.21766208
 
         if "fermi_energy" in result:
             self.results["fermi_energy"] = (

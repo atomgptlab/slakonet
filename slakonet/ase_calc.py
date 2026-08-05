@@ -52,8 +52,11 @@ class SlaKoNetConfig(BaseModel):
     kpoints: List[int] = [3, 3, 3]   # Monkhorst-Pack grid
     cutoff: float = 10.0             # Bohr
     kT: float = 0.025               # Fermi smearing (eV)
-    alpha: float = 0.1              # charge mixing
-    beta: float = 0.1              # force scaling: F = -beta * dE/dx
+    # alpha scales the band-structure energy and beta the forces. Both are
+    # 1.0 for the standard DFTB total energy E = E_band + E_rep and its
+    # exact gradient; changing them breaks energy/force consistency.
+    alpha: float = 1.0
+    beta: float = 1.0
     use_scc: bool = False
     compute_forces: bool = True
     compute_stress: bool = True     # needs compute_forces + periodic

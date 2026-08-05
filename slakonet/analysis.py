@@ -476,10 +476,200 @@ def compute_fermi_surface_3d(
     }
 
 
+# ---------------------------------------------------------------------------
+# 6) Site- and layer-resolved DOS (surfaces, defects, interfaces)
+# ---------------------------------------------------------------------------
+def compute_site_projected_dos(
+    atoms,
+    model=None,
+    kmesh=(4, 4, 1),
+    energy_range: Tuple[float, float] = (-10.0, 10.0),
+    sigma: float = 0.1,
+    n_points: int = 1000,
+    cutoff: float = 10.0,
+    device: Optional[str] = None,
+) -> dict:
+    """Per-atom (site) projected DOS on a Monkhorst-Pack mesh.
+
+    Unlike :func:`compute_bandstructure`, which projects onto *element
+    types*, this resolves every individual atom index. That is what is
+    needed to tell a surface layer from a bulk-like layer, a defect site
+    from its host, or the two sides of an interface apart.
+
+    Parameters
+    ----------
+    atoms : jarvis.core.atoms.Atoms
+    model : trained slakonet model (defaults to default_model())
+    kmesh : Monkhorst-Pack divisions. Use 1 along a vacuum/non-periodic
+        direction (e.g. (4, 4, 1) for a slab stacked along c).
+    energy_range : window in eV relative to the Fermi level
+    sigma : Gaussian broadening in eV
+
+    Returns
+    -------
+    dict with keys:
+        energies       : ndarray [n_points], eV relative to E_F
+        site_dos       : ndarray [n_atoms, n_points]
+        total_dos      : ndarray [n_points]
+        elements       : list[str] per atom index
+        bandgap, vbm, cbm, fermi_energy : floats (eV)
+        eigenvalues    : ndarray [nk, nbands], Fermi-referenced
+    """
+    from slakonet.atoms import Geometry
+    from slakonet.main import generate_shell_dict_upto_Z65
+
+    model = _resolve_model(model)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
+    shell_dict = generate_shell_dict_upto_Z65(model=model)
+    kpts = torch.tensor([list(kmesh)], dtype=torch.int32)
+
+    with torch.no_grad():
+        properties, success = model.compute_multi_element_properties(
+            geometry=geometry,
+            shell_dict=shell_dict,
+            kpoints=kpts,
+            get_fermi=True,
+            with_eigenvectors=True,
+            device=device,
+            cutoff=cutoff,
+        )
+    if not success:
+        raise RuntimeError("SlakoNet failed to compute properties")
+
+    eigenvalues = properties["eigenvalues"]     # [1, nk, nb], E_F-shifted
+    eigenvectors = properties["eigenvectors"]   # [1, nk, nb, norb]
+
+    basis = properties["basis"]
+    on_atoms = basis.on_atoms
+    if on_atoms.ndim == 2:
+        on_atoms = on_atoms[0]
+    on_atoms_np = on_atoms.cpu().numpy()
+
+    n_atoms = atoms.num_atoms
+    # Orbital index list per atom index (padding atoms carry -1).
+    site_orbitals = [[] for _ in range(n_atoms)]
+    for orb_idx, a_idx in enumerate(on_atoms_np):
+        a_idx = int(a_idx)
+        if 0 <= a_idx < n_atoms:
+            site_orbitals[a_idx].append(orb_idx)
+
+    grid = torch.linspace(
+        energy_range[0], energy_range[1], n_points, device=eigenvalues.device
+    )
+    site_dos = torch.zeros(n_atoms, n_points, device=eigenvalues.device)
+    norm = 1.0 / (sigma * np.sqrt(2.0 * np.pi))
+    _, n_k, n_b = eigenvalues.shape
+
+    for k in range(n_k):
+        for b in range(n_b):
+            e = eigenvalues[0, k, b]
+            if not (energy_range[0] - 6 * sigma <= e <= energy_range[1] + 6 * sigma):
+                continue
+            psi = eigenvectors[0, k, b, :]
+            w = (psi.conj() * psi).real if psi.is_complex() else psi * psi
+            # Normalize so each band contributes exactly one state, which
+            # makes per-site weights interpretable as fractions.
+            tot = w.sum()
+            if tot > 0:
+                w = w / tot
+            gauss = norm * torch.exp(-0.5 * ((grid - e) / sigma) ** 2)
+            for a in range(n_atoms):
+                idx = site_orbitals[a]
+                if idx:
+                    site_dos[a] += w[idx].sum() * gauss
+
+    site_dos = site_dos / n_k
+    site_dos_np = site_dos.detach().cpu().numpy()
+
+    def _f(key):
+        v = properties.get(key)
+        if v is None:
+            return None
+        return float(np.asarray(v.detach().cpu().numpy()).flatten()[0])
+
+    return {
+        "energies": grid.detach().cpu().numpy(),
+        "site_dos": site_dos_np,
+        "total_dos": site_dos_np.sum(axis=0),
+        "elements": list(atoms.elements),
+        "bandgap": _f("bandgap"),
+        "vbm": _f("vbm"),
+        "cbm": _f("cbm"),
+        "fermi_energy": _f("fermi_energy"),
+        "eigenvalues": eigenvalues[0].detach().cpu().numpy(),
+        "kmesh": list(kmesh),
+    }
+
+
+def layer_resolved_dos(atoms, site_dos, axis: int = 2, tol: float = 0.35):
+    """Bin per-site DOS into layers along a lattice direction.
+
+    Parameters
+    ----------
+    atoms : jarvis.core.atoms.Atoms (same ordering used for `site_dos`)
+    site_dos : ndarray [n_atoms, n_points] from compute_site_projected_dos
+    axis : lattice vector index defining the stacking direction
+    tol : layer merge tolerance in Angstrom
+
+    Returns
+    -------
+    (layer_positions, layer_dos, layer_members)
+        layer_positions : ndarray [n_layers], Cartesian coordinate (Ang)
+        layer_dos       : ndarray [n_layers, n_points]
+        layer_members   : list[list[int]] atom indices per layer
+    """
+    coords = np.asarray(atoms.cart_coords)[:, axis]
+    order = np.argsort(coords)
+
+    layer_members = []
+    current = [int(order[0])]
+    for i in order[1:]:
+        if abs(coords[i] - coords[current[-1]]) <= tol:
+            current.append(int(i))
+        else:
+            layer_members.append(current)
+            current = [int(i)]
+    layer_members.append(current)
+
+    layer_positions = np.array(
+        [float(np.mean(coords[m])) for m in layer_members]
+    )
+    layer_dos = np.array(
+        [np.asarray(site_dos)[m].sum(axis=0) for m in layer_members]
+    )
+    return layer_positions, layer_dos, layer_members
+
+
+def gap_states_metric(energies, dos, vbm_rel, cbm_rel, margin: float = 0.15):
+    """Integrated DOS strictly inside a reference gap window.
+
+    Used to quantify surface / defect / interface states: a bulk-like
+    region gives ~0, a region carrying in-gap states gives a finite value.
+
+    `vbm_rel` / `cbm_rel` are gap edges in the same (Fermi-referenced)
+    energy scale as `energies`; `margin` shrinks the window to avoid
+    picking up broadening tails from the band edges.
+    """
+    energies = np.asarray(energies)
+    lo, hi = vbm_rel + margin, cbm_rel - margin
+    if hi <= lo:
+        return 0.0
+    mask = (energies >= lo) & (energies <= hi)
+    if not mask.any():
+        return 0.0
+    return float(np.trapz(np.asarray(dos)[mask], energies[mask]))
+
+
 __all__ = [
     "compute_bandstructure",
     "compute_bandstructure_3d",
     "compute_fermi_surface_2d",
     "compute_fermi_surface_3d",
     "compute_kmesh_2d",
+    "compute_site_projected_dos",
+    "layer_resolved_dos",
+    "gap_states_metric",
 ]

@@ -1,3 +1,4 @@
+import os
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.gridspec import GridSpec
@@ -77,12 +78,25 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def load_trained_model(model_path, method="compact", elements=None, prefer=None):
     """Load a SlakoNet model.
 
+    `model_path` may be the name of a published parameter set (e.g.
+    "slakonet_v0", "slakonet_v1a"), in which case it is fetched/cached from
+    Figshare, or a path to a local checkpoint stem.
+
     Prefers the safetensors layout (lazy, mmap) when available next to
     `model_path`. Set `prefer="pt"` (or env SLAKONET_LOADER=pt) to force the
     legacy torch.load path. Pass `elements={"Si","C"}` to materialize only
     the relevant SKF pairs.
     """
-    from slakonet.optim import _smart_load_slakonet_model
+    from slakonet.optim import _smart_load_slakonet_model, SLAKONET_MODELS
+
+    # A bare registry name (no local file beside it) -> download/cache path.
+    if model_path in SLAKONET_MODELS and not os.path.exists(
+        f"{model_path}.pt"
+    ):
+        return default_model(
+            model_name=model_path, elements=elements, prefer=prefer
+        )
+
     model = _smart_load_slakonet_model(
         model_path, elements=elements, prefer=prefer
     )
@@ -682,7 +696,7 @@ def plot_band_dos_atoms(
     jid=None,
     atoms=None,
     model=None,
-    model_path="slakonet_v0",
+    model_path=None,
     energy_range=(-10, 10),
     filename=None,
     cutoff=10.0,
@@ -692,6 +706,10 @@ def plot_band_dos_atoms(
     alpha=0.1,
 ):
     if not model:
+        if model_path is None:
+            from slakonet.optim import DEFAULT_MODEL_NAME
+
+            model_path = DEFAULT_MODEL_NAME
         elements_hint = None
         if atoms is not None:
             try:

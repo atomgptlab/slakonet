@@ -64,6 +64,33 @@ python slakonet/predict_slakonet.py  --file_path slakonet/examples/POSCAR-JVASP-
 
 ![SlakoNet output](https://github.com/atomgptlab/slakonet/blob/main/slakonet/examples/slakonet_bands_dos.png)
 
+### Available Parameter Sets
+
+Parameter sets are downloaded from
+[Figshare](https://figshare.com/articles/dataset/SlakoNet_parameters/30122215)
+on first use and cached under `~/.cache/atomgptlab/slakonet/`.
+
+| Name | Description |
+| --- | --- |
+| `slakonet_v0` | Original universal parameter set (paper v1) |
+| `slakonet_v1` | Second-generation universal parameter set |
+| `slakonet_v1a` | Refined v1 parameter set |
+
+```python
+from slakonet.optim import default_model
+
+model = default_model(model_name="slakonet_v1a")
+```
+
+`default_model()` with no arguments uses `slakonet_v1`; set the
+`SLAKONET_MODEL` environment variable to change the default globally, and
+`--model_path slakonet_v1a` selects a set from the command line:
+
+```bash
+SLAKONET_MODEL=slakonet_v1a python slakonet/predict_slakonet.py --jid JVASP-107
+python slakonet/predict_slakonet.py --model_path slakonet_v1a --jid JVASP-107
+```
+
 ### Using Pretrained Models in Python
 
 ```python
@@ -143,10 +170,12 @@ Toggles (constructor keywords): `compute_forces`, `compute_stress`,
 `device`. Setting `compute_forces=False` gives a fast energy-only path
 for high-throughput screening.
 
-Notes: forces are scaled by `beta` (default `0.1`); pass `beta=1.0` for
-physically correct forces. Stress is converted to ASE units
-(eV/Ang^3, Voigt) but should be validated against a numerical-strain
-reference before use in cell relaxation. A full runnable demo is in
+Notes: `alpha` scales the band-structure energy and `beta` the forces;
+both default to `1.0`, which gives the standard DFTB total energy
+`E = E_band + E_rep` together with its exact gradient. Energy, forces
+and stress have been checked against finite differences (agreement
+better than 0.5% for bulk Si and SiC), so cell relaxation with
+`ExpCellFilter` is supported. A full runnable demo is in
 `slakonet/examples/slakonet_calculator_example.py`. See also the ASE docs
 page *Calculators -> SlaKoNet*.
 
