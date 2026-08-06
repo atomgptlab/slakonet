@@ -400,7 +400,59 @@ class SlaKoNetCalculator(Calculator):
             dos.detach().cpu().numpy(),
         )
 
+    def get_HS(self, atoms=None, kpoints=None):
+        """k-resolved Hamiltonian and overlap matrices.
+
+        Returns ``(H, S)`` as numpy arrays of shape
+        ``(n_kpoints, n_orbitals, n_orbitals)``. H is in **Hartree** (the
+        SKF native unit) and the basis is non-orthogonal, so band energies
+        come from the generalized problem ``H c = e S c``:
+
+            w = scipy.linalg.eigh(H[k], S[k], eigvals_only=True)
+            eigenvalues_eV = w * 27.211 - calc.get_fermi_level()
+
+        The matrices are complex in general and Hermitian at every k.
+
+        `kpoints` overrides the calculator's Monkhorst-Pack mesh for this
+        call only, e.g. ``get_HS(kpoints=(1, 1, 1))`` for Gamma only.
+        """
+        atoms = atoms if atoms is not None else self.atoms
+        mesh = list(kpoints) if kpoints is not None else list(self.kpoints)
+        geo = Geometry.from_ase_atoms([atoms])
+        sim = SimpleDftb(
+            geo,
+            self.model,
+            kpoints=torch.tensor(mesh),
+            device=self.device,
+            with_eigenvectors=False,
+            compute_forces=False,
+            include_dos_data=False,
+            include_HS=True,
+            repulsive=True,
+            alpha=self.alpha,
+            beta=self.beta,
+            kT=self.kT,
+            use_scc=self.use_scc,
+        )
+        sim.calculate()
+        # SimpleDftb stores these as (batch, n_orb, n_orb, n_k); move the
+        # k axis to the front so H[k] is a matrix.
+        H = sim._results["hamiltonian"][0].permute(2, 0, 1)
+        S = sim._results["overlap"][0].permute(2, 0, 1)
+        return (
+            H.detach().cpu().numpy(),
+            S.detach().cpu().numpy(),
+        )
+
     # ---- convenience -----------------------------------------------------
+    def get_bandstructure(self, atoms=None, **kwargs):
+        """Alias for :meth:`band_structure`."""
+        return self.band_structure(atoms=atoms, **kwargs)
+
+    def get_dos(self, atoms=None, **kwargs):
+        """Alias for :meth:`dos`."""
+        return self.dos(atoms=atoms, **kwargs)
+
     def get_bandgap(self, atoms=None):
         if "bandgap" not in self.results:
             self.get_potential_energy(atoms)

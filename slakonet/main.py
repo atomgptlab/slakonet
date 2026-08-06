@@ -63,6 +63,25 @@ def nondeterministic_ok(fn):
     return wrapper
 
 
+class _FilteredModel:
+    """Model stand-in exposing only the SKF pairs a structure needs."""
+
+    def __init__(self, filtered_skfs):
+        self.filtered_skfs = filtered_skfs
+
+    def get_updated_skfs(self):
+        return self.filtered_skfs
+
+    def to(self, device):
+        return self
+
+    def float(self):
+        return self
+
+    def eval(self):
+        return self
+
+
 @contextlib.contextmanager
 def allow_nondeterministic():
     """Temporarily lift torch's deterministic-algorithms requirement.
@@ -3045,27 +3064,110 @@ class SlakoNetCalculator(Calculator):
             raise RuntimeError("Calculation not performed yet")
         return self.results["fermi_energy"]
 
+    def get_bandstructure(
+        self, atoms=None, line_density=20, default_points=2
+    ):
+        """Band structure along the conventional high-symmetry k-path.
+
+        Returns a dict with ``eigenvalues`` (n_kpoints, n_bands, eV and
+        referenced to the Fermi level), ``kpoints``, ``labels``,
+        ``bandgap``, ``vbm`` and ``cbm``.
+        """
+        from jarvis.core.kpoints import Kpoints3D as Kpoints
+        from jarvis.core.atoms import ase_to_atoms
+        from slakonet.optim import kpts_to_klines
+
+        atoms = atoms if atoms is not None else self.atoms
+        j_atoms = ase_to_atoms(atoms)
+        kpoints = Kpoints().kpath(j_atoms, line_density=line_density)
+        klines = kpts_to_klines(kpoints.kpts, default_points=default_points)
+
+        geometry = Geometry.from_ase_atoms([atoms])
+        calc = SimpleDftb(
+            geometry,
+            klines=klines,
+            model=_FilteredModel(self._get_filtered_skfs()),
+            compute_forces=False,
+            include_dos_data=False,
+            alpha=self.alpha,
+            beta=self.beta,
+            device=self.device,
+        )
+        res = calc.calculate()
+        return {
+            "eigenvalues": res["eigenvalues"].detach().cpu().numpy()[0],
+            "kpoints": np.asarray(kpoints.kpts),
+            "labels": list(kpoints.labels),
+            "bandgap": float(res["bandgap"].detach().cpu().numpy().flatten()[0]),
+            "vbm": float(res["vbm"].detach().cpu().numpy().flatten()[0]),
+            "cbm": float(res["cbm"].detach().cpu().numpy().flatten()[0]),
+        }
+
+    def get_dos(
+        self, atoms=None, energy_range=(-10.0, 10.0), num_points=3000,
+        sigma=0.1,
+    ):
+        """Total DOS on the calculator's k-mesh.
+
+        Returns ``(energies_eV, dos)``, energies referenced to E_F.
+        """
+        atoms = atoms if atoms is not None else self.atoms
+        calc = self._make_sim(atoms, include_HS=False)
+        calc.calculate()
+        e_grid, dos = calc.calculate_dos(
+            energy_range=energy_range,
+            num_points=num_points,
+            sigma=sigma,
+            fermi_shift=True,
+        )
+        return (
+            e_grid.detach().cpu().numpy(),
+            dos.detach().cpu().numpy(),
+        )
+
+    def get_HS(self, atoms=None):
+        """k-resolved Hamiltonian and overlap matrices.
+
+        Returns ``(H, S)`` with shape
+        ``(n_kpoints, n_orbitals, n_orbitals)``. H is in **Hartree** (the
+        SKF native unit) and the basis is non-orthogonal, so band energies
+        come from the generalized problem ``H c = e S c``:
+
+            w = scipy.linalg.eigh(H[k], S[k], eigvals_only=True)
+            eigenvalues_eV = w * 27.211 - calc.get_fermi_energy()
+        """
+        atoms = atoms if atoms is not None else self.atoms
+        calc = self._make_sim(atoms, include_HS=True)
+        calc.calculate()
+        # SimpleDftb stores these as (batch, n_orb, n_orb, n_k); move the
+        # k axis to the front so H[k] is a matrix.
+        H = calc._results["hamiltonian"][0].permute(2, 0, 1)
+        S = calc._results["overlap"][0].permute(2, 0, 1)
+        return (
+            H.detach().cpu().numpy(),
+            S.detach().cpu().numpy(),
+        )
+
+    def _make_sim(self, atoms, include_HS=False):
+        """SimpleDftb on this calculator's mesh, without forces."""
+        geometry = Geometry.from_ase_atoms([atoms])
+        self.set_elements(set(atoms.get_chemical_symbols()))
+        return SimpleDftb(
+            geometry,
+            kpoints=torch.tensor(self.kpoints_for(atoms)),
+            model=_FilteredModel(self._get_filtered_skfs()),
+            compute_forces=False,
+            include_dos_data=False,
+            include_HS=include_HS,
+            alpha=self.alpha,
+            beta=self.beta,
+            device=self.device,
+        )
+
     def _run_calc_with_filtered_skfs(self, atoms, filtered_skfs):
         """Run calculation using only filtered SKF pairs"""
         from slakonet.atoms import Geometry
         from slakonet.main import SimpleDftb
-
-        # Create a temporary filtered model wrapper
-        class FilteredModel:
-            def __init__(self, filtered_skfs):
-                self.filtered_skfs = filtered_skfs
-
-            def get_updated_skfs(self):
-                return self.filtered_skfs
-
-            def to(self, device):
-                return self
-
-            def float(self):
-                return self
-
-            def eval(self):
-                return self
 
         # Create geometry
         geometry = Geometry.from_ase_atoms([atoms])
@@ -3073,7 +3175,7 @@ class SlakoNetCalculator(Calculator):
         kpoints = torch.tensor(self.kpoints_for(atoms))
 
         # Use filtered model
-        filtered_model = FilteredModel(filtered_skfs)
+        filtered_model = _FilteredModel(filtered_skfs)
 
         # Run SimpleDftb with filtered model
         calc = SimpleDftb(
