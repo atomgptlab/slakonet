@@ -14,6 +14,7 @@ Public API:
 Lower-level shared helper:
     compute_kmesh_2d(atoms, ...)
 """
+
 from __future__ import annotations
 
 import io
@@ -31,6 +32,7 @@ import torch
 def _resolve_model(model):
     if model is None:
         from slakonet.optim import default_model
+
         model = default_model()
     return model
 
@@ -75,13 +77,14 @@ def compute_bandstructure(
     own_tempfile = filename is None
     tmp = filename or f"_slakonet_{uuid.uuid4().hex}.png"
     try:
-        _fig, properties, atom_pdos, energy_grid, orbital_pdos, _plotly = \
+        _fig, properties, atom_pdos, energy_grid, orbital_pdos, _plotly = (
             plot_band_dos_atoms(
                 atoms=atoms,
                 model=model,
                 energy_range=list(energy_range),
                 filename=tmp,
             )
+        )
         buf = io.BytesIO()
         with open(tmp, "rb") as f:
             buf.write(f.read())
@@ -93,24 +96,36 @@ def compute_bandstructure(
     band_gap = properties["bandgap"].detach().cpu().numpy().flatten().tolist()
     eigenvalues = properties["eigenvalues"].detach().cpu().numpy()
     dos_energies = (
-        properties["dos_energy_grid_tensor"].detach().cpu().numpy().flatten().tolist()
+        properties["dos_energy_grid_tensor"]
+        .detach()
+        .cpu()
+        .numpy()
+        .flatten()
+        .tolist()
     )
     dos_values = (
-        properties["dos_values_tensor"].detach().cpu().numpy().flatten().tolist()
+        properties["dos_values_tensor"]
+        .detach()
+        .cpu()
+        .numpy()
+        .flatten()
+        .tolist()
     )
 
     band_data = {
         "formula": atoms.composition.reduced_formula,
         "num_atoms": atoms.num_atoms,
         "elements": atoms.elements,
-        "bandgap": float(band_gap[0] if isinstance(band_gap, list) else band_gap),
+        "bandgap": float(
+            band_gap[0] if isinstance(band_gap, list) else band_gap
+        ),
         "vbm": (
-            float(properties["vbm"].detach().cpu().numpy())
+            float(properties["vbm"].detach().cpu().reshape(-1)[0])
             if "vbm" in properties
             else None
         ),
         "cbm": (
-            float(properties["cbm"].detach().cpu().numpy())
+            float(properties["cbm"].detach().cpu().reshape(-1)[0])
             if "cbm" in properties
             else None
         ),
@@ -215,12 +230,16 @@ def compute_kmesh_2d(atoms, model=None, nk_per_dim: int = 30) -> dict:
         "bz_x": bz_x,
         "bz_y": bz_y,
         "k0": k0,
-        "bandgap": float(props["bandgap"].detach().cpu().numpy()),
+        "bandgap": float(props["bandgap"].detach().cpu().reshape(-1)[0]),
         "vbm": (
-            float(props["vbm"].detach().cpu().numpy()) if "vbm" in props else None
+            float(props["vbm"].detach().cpu().reshape(-1)[0])
+            if "vbm" in props
+            else None
         ),
         "cbm": (
-            float(props["cbm"].detach().cpu().numpy()) if "cbm" in props else None
+            float(props["cbm"].detach().cpu().reshape(-1)[0])
+            if "cbm" in props
+            else None
         ),
     }
 
@@ -274,7 +293,8 @@ def compute_fermi_surface_2d(
 
     if not fermi_bands:
         dists = [
-            (min(abs(bi["min"]), abs(bi["max"])), bi["index"]) for bi in band_info
+            (min(abs(bi["min"]), abs(bi["max"])), bi["index"])
+            for bi in band_info
         ]
         dists.sort()
         fermi_bands = [d[1] for d in dists[:2]]
@@ -361,9 +381,7 @@ def compute_fermi_surface_3d(
     ky_1d = np.linspace(-ky_max, ky_max, nk_per_dim)
     kz_1d = np.linspace(-kz_max, kz_max, nk_per_dim)
     kx_g, ky_g, kz_g = np.meshgrid(kx_1d, ky_1d, kz_1d, indexing="ij")
-    kpoints_cart = np.column_stack(
-        [kx_g.ravel(), ky_g.ravel(), kz_g.ravel()]
-    )
+    kpoints_cart = np.column_stack([kx_g.ravel(), ky_g.ravel(), kz_g.ravel()])
     nk_total = kpoints_cart.shape[0]
 
     geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
@@ -385,12 +403,16 @@ def compute_fermi_surface_3d(
     nk_sk, nb = eigenvalues_raw.shape
     eigenvalues = eigenvalues_raw
 
-    bandgap = float(props["bandgap"].detach().cpu().numpy())
+    bandgap = float(props["bandgap"].detach().cpu().reshape(-1)[0])
     vbm = (
-        float(props["vbm"].detach().cpu().numpy()) if "vbm" in props else None
+        float(props["vbm"].detach().cpu().reshape(-1)[0])
+        if "vbm" in props
+        else None
     )
     cbm = (
-        float(props["cbm"].detach().cpu().numpy()) if "cbm" in props else None
+        float(props["cbm"].detach().cpu().reshape(-1)[0])
+        if "cbm" in props
+        else None
     )
 
     nk_use = min(nk_sk, nk_total)
@@ -401,9 +423,7 @@ def compute_fermi_surface_3d(
 
     dx = (2 * kx_max) / (nk3 - 1) if nk3 > 1 else 1.0
     dy = (2 * ky_max) / (nk3 - 1) if nk3 > 1 else 1.0
-    dz = (
-        (2 * kz_max) / (nkz_actual - 1) if nkz_actual > 1 else 1.0
-    )
+    dz = (2 * kz_max) / (nkz_actual - 1) if nkz_actual > 1 else 1.0
 
     fermi_bands = []
     band_info = []
@@ -444,7 +464,8 @@ def compute_fermi_surface_3d(
 
     if not fermi_bands:
         dists = [
-            (min(abs(bi["min"]), abs(bi["max"])), bi["index"]) for bi in band_info
+            (min(abs(bi["min"]), abs(bi["max"])), bi["index"])
+            for bi in band_info
         ]
         dists.sort()
         fermi_bands = [d[1] for d in dists[:2]]
@@ -539,8 +560,8 @@ def compute_site_projected_dos(
     if not success:
         raise RuntimeError("SlakoNet failed to compute properties")
 
-    eigenvalues = properties["eigenvalues"]     # [1, nk, nb], E_F-shifted
-    eigenvectors = properties["eigenvectors"]   # [1, nk, nb, norb]
+    eigenvalues = properties["eigenvalues"]  # [1, nk, nb], E_F-shifted
+    eigenvectors = properties["eigenvectors"]  # [1, nk, nb, norb]
 
     basis = properties["basis"]
     on_atoms = basis.on_atoms
@@ -566,7 +587,9 @@ def compute_site_projected_dos(
     for k in range(n_k):
         for b in range(n_b):
             e = eigenvalues[0, k, b]
-            if not (energy_range[0] - 6 * sigma <= e <= energy_range[1] + 6 * sigma):
+            if not (
+                energy_range[0] - 6 * sigma <= e <= energy_range[1] + 6 * sigma
+            ):
                 continue
             psi = eigenvectors[0, k, b, :]
             w = (psi.conj() * psi).real if psi.is_complex() else psi * psi

@@ -60,22 +60,28 @@ parser.add_argument(
     help="Pairwise cutoff",
 )
 parser.add_argument(
-    "--use_scc", action="store_true",
+    "--use_scc",
+    action="store_true",
     help="Enable self-consistent charges. Recommended for ionic compounds "
-         "(oxides, halides, perovskites). Slower but correct band edges.",
+    "(oxides, halides, perovskites). Slower but correct band edges.",
 )
 parser.add_argument(
-    "--kT", default="0.025", help="Fermi smearing kT in eV",
+    "--kT",
+    default="0.025",
+    help="Fermi smearing kT in eV",
 )
 parser.add_argument(
-    "--alpha", default="0.1",
+    "--alpha",
+    default="0.1",
     help="Electronic-energy weighting alpha (use 1.0 for total energy / EOS)",
 )
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def load_trained_model(model_path, method="compact", elements=None, prefer=None):
+def load_trained_model(
+    model_path, method="compact", elements=None, prefer=None
+):
     """Load a SlakoNet model.
 
     `model_path` may be the name of a published parameter set (e.g.
@@ -104,8 +110,16 @@ def load_trained_model(model_path, method="compact", elements=None, prefer=None)
     return model
 
 
-def get_properties(jid="", model=None, atoms=None, dataset=None, cutoff=None,
-                   use_scc=False, kT=0.025, alpha=0.1):
+def get_properties(
+    jid="",
+    model=None,
+    atoms=None,
+    dataset=None,
+    cutoff=None,
+    use_scc=False,
+    kT=0.025,
+    alpha=0.1,
+):
     if atoms is None:
         atoms, opt_gap, mbj_gap = get_atoms(jid=jid, dataset=dataset)
     if model is None:
@@ -184,6 +198,7 @@ def _format_kpath_ticks(labels):
     into a single ``L|R`` tick rendered at the midpoint so they don't
     visually overlap.
     """
+
     def _render(lbl):
         if lbl in ("G", r"\Gamma", "Γ"):
             return r"$\Gamma$"
@@ -492,8 +507,8 @@ def compute_atom_and_orbital_pdos(
     orbital_pdos_np: {atom_type: {'s':..., 'p':..., 'd':..., 'f':...}}
     unique_atoms   : list[str]  (preserves first-occurrence order)
     """
-    eigenvalues = properties["eigenvalues"]   # [1, nk, nb]
-    eigenvectors = properties["eigenvectors"] # [1, nk, nb, norb]
+    eigenvalues = properties["eigenvalues"]  # [1, nk, nb]
+    eigenvectors = properties["eigenvectors"]  # [1, nk, nb, norb]
 
     atom_types = geometry.chemical_symbols[0]
     unique_atoms = list(dict.fromkeys(atom_types))
@@ -539,9 +554,7 @@ def compute_atom_and_orbital_pdos(
         atom: torch.zeros(n_points, device=device) for atom in unique_atoms
     }
     orbital_pdos = {
-        atom: {
-            sh: torch.zeros(n_points, device=device) for sh in shell_names
-        }
+        atom: {sh: torch.zeros(n_points, device=device) for sh in shell_names}
         for atom in unique_atoms
     }
 
@@ -552,8 +565,9 @@ def compute_atom_and_orbital_pdos(
         for b in range(n_bands):
             eigenval = eigenvalues[0, k, b]
             psi = eigenvectors[0, k, b, :]
-            weights = (psi.conj() * psi).real if psi.is_complex() \
-                else psi * psi
+            weights = (
+                (psi.conj() * psi).real if psi.is_complex() else psi * psi
+            )
             diff = energy_grid - eigenval
             gaussian = norm * torch.exp(-0.5 * (diff / sigma) ** 2)
 
@@ -564,7 +578,9 @@ def compute_atom_and_orbital_pdos(
                 for sh in shell_names:
                     sidx = orbital_map[atype][sh]
                     if sidx:
-                        orbital_pdos[atype][sh] += weights[sidx].sum() * gaussian
+                        orbital_pdos[atype][sh] += (
+                            weights[sidx].sum() * gaussian
+                        )
 
     # Average over k-points
     for atype in unique_atoms:
@@ -573,9 +589,7 @@ def compute_atom_and_orbital_pdos(
             orbital_pdos[atype][sh] /= n_kpoints
 
     energy_np = energy_grid.detach().cpu().numpy()
-    atom_pdos_np = {
-        a: p.detach().cpu().numpy() for a, p in atom_pdos.items()
-    }
+    atom_pdos_np = {a: p.detach().cpu().numpy() for a, p in atom_pdos.items()}
     orbital_pdos_np = {
         a: {sh: p.detach().cpu().numpy() for sh, p in d.items()}
         for a, d in orbital_pdos.items()
@@ -606,7 +620,8 @@ def plot_band_dos_plotly(
     from plotly.subplots import make_subplots
 
     fig = make_subplots(
-        rows=1, cols=4,
+        rows=1,
+        cols=4,
         shared_yaxes=True,
         column_widths=[0.4, 0.15, 0.2, 0.25],
         subplot_titles=(
@@ -623,37 +638,63 @@ def plot_band_dos_plotly(
     for ib in range(eigenvalues.shape[-1]):
         fig.add_trace(
             go.Scatter(
-                x=kx, y=eigenvalues[0, :, ib].real,
-                mode="lines", line=dict(width=1, color="steelblue"),
-                showlegend=False, hoverinfo="y",
-            ), row=1, col=1,
+                x=kx,
+                y=eigenvalues[0, :, ib].real,
+                mode="lines",
+                line=dict(width=1, color="steelblue"),
+                showlegend=False,
+                hoverinfo="y",
+            ),
+            row=1,
+            col=1,
         )
-    fig.add_hline(y=0.0, line_dash="dash", line_color="black",
-                  opacity=0.5, row=1, col=1)
+    fig.add_hline(
+        y=0.0, line_dash="dash", line_color="black", opacity=0.5, row=1, col=1
+    )
 
     # (b) Total DOS
     fig.add_trace(
         go.Scatter(
-            x=dos_values, y=dos_energies, mode="lines",
+            x=dos_values,
+            y=dos_energies,
+            mode="lines",
             line=dict(color="steelblue", width=1.5),
-            showlegend=False, name="Total DOS",
-        ), row=1, col=2,
+            showlegend=False,
+            name="Total DOS",
+        ),
+        row=1,
+        col=2,
     )
 
     # (c) Atom PDOS
-    atom_palette = ["tab:blue", "tab:orange", "tab:green",
-                    "tab:red", "tab:purple"]
+    atom_palette = [
+        "tab:blue",
+        "tab:orange",
+        "tab:green",
+        "tab:red",
+        "tab:purple",
+    ]
     for i, atype in enumerate(unique_atoms):
         fig.add_trace(
             go.Scatter(
-                x=atom_pdos[atype], y=energy_grid, mode="lines",
-                line=dict(width=1.5), name=atype, legendgroup=atype,
-            ), row=1, col=3,
+                x=atom_pdos[atype],
+                y=energy_grid,
+                mode="lines",
+                line=dict(width=1.5),
+                name=atype,
+                legendgroup=atype,
+            ),
+            row=1,
+            col=3,
         )
 
     # (d) Orbital PDOS
-    shell_colors = {"s": "#1f77b4", "p": "#d62728",
-                    "d": "#2ca02c", "f": "#9467bd"}
+    shell_colors = {
+        "s": "#1f77b4",
+        "p": "#d62728",
+        "d": "#2ca02c",
+        "f": "#9467bd",
+    }
     dash_per_atom = ["solid", "dash", "dot", "dashdot"]
     for iat, atype in enumerate(unique_atoms):
         dash = dash_per_atom[iat % len(dash_per_atom)]
@@ -663,28 +704,39 @@ def plot_band_dos_plotly(
                 continue
             fig.add_trace(
                 go.Scatter(
-                    x=pdos, y=energy_grid, mode="lines",
+                    x=pdos,
+                    y=energy_grid,
+                    mode="lines",
                     line=dict(color=shell_colors[sh], width=1.5, dash=dash),
                     name=f"{atype}-{sh}",
                     legendgroup=f"{atype}-{sh}",
-                ), row=1, col=4,
+                ),
+                row=1,
+                col=4,
             )
 
     # axis labels + k-ticks
     fig.update_xaxes(
-        tickmode="array", tickvals=xticks, ticktext=xtick_labels,
-        row=1, col=1, title_text="k-point",
+        tickmode="array",
+        tickvals=xticks,
+        ticktext=xtick_labels,
+        row=1,
+        col=1,
+        title_text="k-point",
     )
     fig.update_xaxes(title_text="DOS", row=1, col=2)
     fig.update_xaxes(title_text="Atom PDOS", row=1, col=3)
     fig.update_xaxes(title_text="Orbital PDOS", row=1, col=4)
-    fig.update_yaxes(title_text="Energy (eV)", row=1, col=1,
-                     range=list(energy_range))
+    fig.update_yaxes(
+        title_text="Energy (eV)", row=1, col=1, range=list(energy_range)
+    )
     for c in (2, 3, 4):
         fig.update_yaxes(range=list(energy_range), row=1, col=c)
     fig.update_layout(
-        height=480, width=1300,
-        template="plotly_white", font=dict(size=12),
+        height=480,
+        width=1300,
+        template="plotly_white",
+        font=dict(size=12),
         legend=dict(orientation="v", x=1.02, y=1.0),
         margin=dict(l=60, r=60, t=50, b=60),
     )
@@ -723,8 +775,13 @@ def plot_band_dos_atoms(
         model = model.float()
     # print("MODEL PATHHHHH", model_path)
     properties, atoms, kpoints = get_properties(
-        jid=jid, model=model, atoms=atoms, cutoff=cutoff,
-        use_scc=use_scc, kT=kT, alpha=alpha,
+        jid=jid,
+        model=model,
+        atoms=atoms,
+        cutoff=cutoff,
+        use_scc=use_scc,
+        kT=kT,
+        alpha=alpha,
     )
     properties["model"] = model
     info = {}
@@ -744,11 +801,11 @@ def plot_band_dos_atoms(
     fermi_eV = 0.0  # Already subtracted in the eigenvalues
 
     formula = atoms.composition.reduced_formula
-    bandgap = float(properties["bandgap"].detach().cpu().numpy())
+    bandgap = float(properties["bandgap"].detach().cpu().reshape(-1)[0])
     print(f"Bandgap: {bandgap:.3f} eV")
-    cbm = float(properties["cbm"].detach().cpu().numpy())
+    cbm = float(properties["cbm"].detach().cpu().reshape(-1)[0])
     print(f"CBM: {cbm:.3f} eV")
-    vbm = float(properties["vbm"].detach().cpu().numpy())
+    vbm = float(properties["vbm"].detach().cpu().reshape(-1)[0])
     print(f"VBM: {vbm:.3f} eV")
     info["cbm"] = cbm
     info["vbm"] = vbm
@@ -759,10 +816,11 @@ def plot_band_dos_atoms(
     geometry = properties["geometry"]
 
     # Compute atom- and orbital-projected DOS in one pass
-    energy_grid, atom_pdos, orbital_pdos, unique_atoms = \
+    energy_grid, atom_pdos, orbital_pdos, unique_atoms = (
         compute_atom_and_orbital_pdos(
             properties, geometry, energy_range=energy_range
         )
+    )
     info["orbital_pdos"] = {
         a: {sh: p.tolist() for sh, p in d.items()}
         for a, d in orbital_pdos.items()
@@ -801,7 +859,7 @@ def plot_band_dos_atoms(
     eigs_sorted = np.sort(eigs_for_plot, axis=-1)
 
     # Break lines where the per-k jump is implausible
-    diffs = np.abs(np.diff(eigs_sorted, axis=-2))   # [batch, nk-1, nb]
+    diffs = np.abs(np.diff(eigs_sorted, axis=-2))  # [batch, nk-1, nb]
     big_jump = diffs > JUMP_EV
     # Insert NaN at the latter k-point of each jump so the polyline breaks
     # (replicate to match shape: jump[k-1] → NaN at k for the affected band)
@@ -869,8 +927,12 @@ def plot_band_dos_atoms(
     ax3.legend(loc="upper right")
 
     # Orbital-resolved PDOS per atom type
-    shell_colors = {"s": "tab:blue", "p": "tab:red",
-                    "d": "tab:green", "f": "tab:purple"}
+    shell_colors = {
+        "s": "tab:blue",
+        "p": "tab:red",
+        "d": "tab:green",
+        "f": "tab:purple",
+    }
     linestyles = ["-", "--", ":", "-."]
     for iat, atype in enumerate(unique_atoms):
         ls = linestyles[iat % len(linestyles)]
@@ -879,8 +941,10 @@ def plot_band_dos_atoms(
             if pdos.max() < 1e-6:
                 continue
             ax4.plot(
-                pdos, energy_grid,
-                linewidth=1.3, linestyle=ls,
+                pdos,
+                energy_grid,
+                linewidth=1.3,
+                linestyle=ls,
                 color=shell_colors[sh],
                 label=f"{atype}-{sh}",
             )
@@ -966,17 +1030,19 @@ if __name__ == "__main__":
 
     # fig, properties, atom_pdos, energy_grid = plot_band_dos_atoms(jid='JVASP-107')
     t1 = time.time()
-    fig, properties, atom_pdos, energy_grid, orbital_pdos, _plotly = plot_band_dos_atoms(
-        atoms=atoms,
-        model_path=model_path,
-        model=model,
-        jid=jid,
-        energy_range=energy_range,
-        filename=output_filename,
-        cutoff=cutoff,
-        use_scc=args.use_scc,
-        kT=float(args.kT),
-        alpha=float(args.alpha),
+    fig, properties, atom_pdos, energy_grid, orbital_pdos, _plotly = (
+        plot_band_dos_atoms(
+            atoms=atoms,
+            model_path=model_path,
+            model=model,
+            jid=jid,
+            energy_range=energy_range,
+            filename=output_filename,
+            cutoff=cutoff,
+            use_scc=args.use_scc,
+            kT=float(args.kT),
+            alpha=float(args.alpha),
+        )
     )
     t2 = time.time()
     print("Time(s)", t2 - t1)
