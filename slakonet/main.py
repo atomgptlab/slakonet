@@ -2535,9 +2535,9 @@ class SimpleDftb:
                     retain_graph=True,
                     create_graph=self.create_graph,
                 )[0]
-                cell = self.geometry.cell[0]                 # Bohr
-                volume = torch.abs(torch.det(cell))          # Bohr^3
-                positions = self.geometry.positions[0]       # Bohr
+                cell = self.geometry.cell[0]  # Bohr
+                volume = torch.abs(torch.det(cell))  # Bohr^3
+                positions = self.geometry.positions[0]  # Bohr
                 mask = self.geometry.atomic_numbers[0] > 0
 
                 # Under a homogeneous strain eps, R -> (1+eps)R and
@@ -2549,7 +2549,7 @@ class SimpleDftb:
                     "ia,ib->ab", grad_pos[0][mask], positions[mask]
                 )
                 cell_term = dE_dh[0].transpose(0, 1) @ cell
-                stress_tensor = (virial + cell_term) / volume   # eV/Bohr^3
+                stress_tensor = (virial + cell_term) / volume  # eV/Bohr^3
 
                 # eV/Bohr^3 -> eV/Angstrom^3 -> GPa
                 stress_tensor = stress_tensor / BOHR_TO_ANGSTROM**3
@@ -3064,9 +3064,7 @@ class SlakoNetCalculator(Calculator):
             raise RuntimeError("Calculation not performed yet")
         return self.results["fermi_energy"]
 
-    def get_bandstructure(
-        self, atoms=None, line_density=20, default_points=2
-    ):
+    def get_bandstructure(self, atoms=None, line_density=20, default_points=2):
         """Band structure along the conventional high-symmetry k-path.
 
         Returns a dict with ``eigenvalues`` (n_kpoints, n_bands, eV and
@@ -3098,13 +3096,18 @@ class SlakoNetCalculator(Calculator):
             "eigenvalues": res["eigenvalues"].detach().cpu().numpy()[0],
             "kpoints": np.asarray(kpoints.kpts),
             "labels": list(kpoints.labels),
-            "bandgap": float(res["bandgap"].detach().cpu().numpy().flatten()[0]),
+            "bandgap": float(
+                res["bandgap"].detach().cpu().numpy().flatten()[0]
+            ),
             "vbm": float(res["vbm"].detach().cpu().numpy().flatten()[0]),
             "cbm": float(res["cbm"].detach().cpu().numpy().flatten()[0]),
         }
 
     def get_dos(
-        self, atoms=None, energy_range=(-10.0, 10.0), num_points=3000,
+        self,
+        atoms=None,
+        energy_range=(-10.0, 10.0),
+        num_points=3000,
         sigma=0.1,
     ):
         """Total DOS on the calculator's k-mesh.

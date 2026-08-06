@@ -49,9 +49,9 @@ class SlaKoNetConfig(BaseModel):
     run can be fully described by a JSON file.
     """
 
-    kpoints: List[int] = [3, 3, 3]   # Monkhorst-Pack grid
-    cutoff: float = 10.0             # Bohr
-    kT: float = 0.025               # Fermi smearing (eV)
+    kpoints: List[int] = [3, 3, 3]  # Monkhorst-Pack grid
+    cutoff: float = 10.0  # Bohr
+    kT: float = 0.025  # Fermi smearing (eV)
     # alpha scales the band-structure energy and beta the forces. Both are
     # 1.0 for the standard DFTB total energy E = E_band + E_rep and its
     # exact gradient; changing them breaks energy/force consistency.
@@ -59,7 +59,7 @@ class SlaKoNetConfig(BaseModel):
     beta: float = 1.0
     use_scc: bool = False
     compute_forces: bool = True
-    compute_stress: bool = True     # needs compute_forces + periodic
+    compute_stress: bool = True  # needs compute_forces + periodic
     include_dos: bool = False
     device: Optional[str] = None
 
@@ -262,9 +262,7 @@ class SlaKoNetCalculator(Calculator):
         labels = [""] * len(kpts_frac)
         for name, pt in bp.special_points.items():
             i = int(
-                np.argmin(
-                    np.linalg.norm(kpts_frac - np.asarray(pt), axis=1)
-                )
+                np.argmin(np.linalg.norm(kpts_frac - np.asarray(pt), axis=1))
             )
             labels[i] = (labels[i] + "|" + name) if labels[i] else name
 
@@ -312,8 +310,15 @@ class SlaKoNetCalculator(Calculator):
 
         if savefig:
             self._plot_bands(
-                eigenvalues, labels, mid, gap, atoms,
-                emin, emax, mask_ev, savefig,
+                eigenvalues,
+                labels,
+                mid,
+                gap,
+                atoms,
+                emin,
+                emax,
+                mask_ev,
+                savefig,
             )
         return out
 
@@ -339,9 +344,7 @@ class SlaKoNetCalculator(Calculator):
         ep = np.sort(ep, axis=-1)
         if ep.shape[0] > 1:
             big = np.abs(np.diff(ep, axis=0)) > 2.0
-            nm = np.concatenate(
-                [np.zeros_like(big[:1]), big], 0
-            ).astype(bool)
+            nm = np.concatenate([np.zeros_like(big[:1]), big], 0).astype(bool)
             ep[nm] = np.nan
 
         fig, ax = plt.subplots(figsize=(8, 5))

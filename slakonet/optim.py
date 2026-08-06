@@ -3450,8 +3450,7 @@ def model_download_url(model_name):
     return f"https://ndownloader.figshare.com/files/{file_id}"
 
 
-def default_model(dir_path=None, model_name=None, elements=None,
-                  prefer=None):
+def default_model(dir_path=None, model_name=None, elements=None, prefer=None):
     """
     Load or download the SlakoNet model with proper Figshare handling.
 

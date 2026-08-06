@@ -1,31 +1,38 @@
 # SlakoNet
 
-Accurate and efficient prediction of electronic band structures is essential for designing materials with targeted properties. However, existing machine learning models often lack universality and struggle to predict detailed electronic structures, while traditional tight-binding models based on the Slater-Koster (SK) formalism suffer from (i) limited transferability, (ii) the need for manual parameterization, and (iii) training on low-fidelity electronic structure data. To address these challenges, I introduce SlaKoNet, a parameter optimization framework that learns SK-based Hamiltonian matrix elements across 65 elements of the periodic table using automatic differentiation. SlaKoNet is trained on density functional theory data from the JARVIS-DFT database using the Tran-Blaha modified Becke-Johnson (TBmBJ), encompassing over 20000 materials. The framework achieves a mean absolute error (MAE) of 0.74 eV for bandgap predictions against experimental data, representing a reasonable improvement over standard GGA functionals (MAE = 1.14 eV) while preserving the computational advantages and physical interpretability of tight-binding methods. SlaKoNet demonstrates promising scalability with up to 8.4× speedup on GPUs, enabling rapid electronic structure screening for materials discovery.
-
+SlaKoNet learns Slater-Koster tight-binding Hamiltonian matrix elements
+across 65 elements using automatic differentiation, trained on JARVIS-DFT
+data with the Tran-Blaha modified Becke-Johnson (TBmBJ) functional
+(>20,000 materials). It reaches 0.74 eV MAE for band gaps against
+experiment, versus 1.14 eV for standard GGA, while keeping the cost and
+interpretability of tight binding.
 
 ![SlakoNet schematic](https://github.com/atomgptlab/slakonet/blob/main/slakonet/examples/sk_schematic.png)
 
 ## Key Features
 
-- **Universal parameterization**: Works across 65 elements and their combinations
-- **Physics-informed**: Based on Slater-Koster tight-binding formalism
-- **High accuracy**: Mean absolute error of 0.74 eV for band gaps vs experimental values
-- **Scalable**: GPU-accelerated calculations for systems up to 2000 atoms
-- **Comprehensive properties**: Predicts band structures, DOS, band gaps, and orbital projections
+- **Universal parameterization**: 65 elements and their combinations
+- **Physics-informed**: Slater-Koster tight-binding formalism
+- **Accurate**: 0.74 eV MAE for band gaps vs experiment
+- **Scalable**: GPU-accelerated, >10,000 atoms with the sparse solver
+- **Comprehensive**: band structures, DOS, band gaps, orbital projections
+- **ASE-compatible**: energy, forces and stress through a standard calculator
 
 ## Installation
-Install via pip:
+
 ```bash
 pip install slakonet
 ```
 
-Or create a conda environment and install SlaKoNet in editable mode. To do so, first, install miniforge https://github.com/conda-forge/miniforge. For example: 
+Or create a conda environment and install SlaKoNet in editable mode. To
+do so, first install [miniforge](https://github.com/conda-forge/miniforge):
 
 ```
 wget "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
 ```
 
-Based on your system requirements, you'll get a file something like 'Miniforge3-XYZ'.
+Based on your system requirements, you'll get a file something like
+'Miniforge3-XYZ'.
 
 ```
 bash Miniforge3-$(uname)-$(uname -m).sh
@@ -214,32 +221,33 @@ page *Calculators -> SlaKoNet*.
 
 ## Performance Benchmarks
 
-- **Accuracy**: 0.76 eV MAE for band gaps (vs 0.38 eV for reference TB-mBJ DFT)
-- **Speed**: <10 seconds for 1000-atom systems on GPU
-- **Scalability**: Efficient with GPU acceleration
-- **Coverage**: Validated on 50 semiconductor/insulator compounds for experiments
+Accuracy: 0.76 eV MAE for band gaps (vs 0.38 eV for reference TB-mBJ
+DFT), validated on 50 semiconductor/insulator compounds.
+
+### Scaling
+
+Time per diagonalization, with peak GPU memory in brackets (GB). The
+dense `eigh` path is limited to roughly 7,000 orbitals; beyond that the
+sparse solver is the only option.
+
+| atoms | Norb | dense eigh (s) | sparse solve (s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1,152 | 0.15 [2.6] | 0.12 [2.6] |
+| 1,024 | 9,216 | – (Norb > 7k) | 3.71 [3.4] |
+| 3,456 | 31,104 | – | 56.9 [5.3] |
+| 8,192 | 73,728 | – | 403 [10.0] |
+| 11,664 | 104,976 | – | 956 [19.2] |
+| 16,000 | 144,000 | – | > 30 min (timeout) |
 
 ![SlakoNet timing](https://github.com/atomgptlab/slakonet/blob/main/slakonet/examples/timing.png)
 
-
 ## Output Properties
 
-SlakoNet predicts comprehensive electronic properties including:
-
-- Electronic band structures along high-symmetry k-paths
-- Total and projected density of states (DOS)
+- Band structures along high-symmetry k-paths
+- Total, atom-projected and orbital-projected DOS (s/p/d)
 - Band gaps (direct/indirect) and band edges
-- Fermi energy and electronic structure topology
-- Atom-projected and orbital-projected DOS (s/p/d contributions)
-
-## Applications
-
-- High-throughput materials screening
-- Electronic structure prediction without expensive DFT
-- Band structure and DOS calculations for device design
-- Semiconductor and quantum materials discovery
-- Educational tools for solid-state physics
-
+- Fermi energy
+- Hamiltonian and overlap matrices
 
 ## Dataset
 

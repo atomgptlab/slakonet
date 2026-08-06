@@ -5,6 +5,7 @@ Forces and stress are checked against finite differences of the model's
 own energy, which is what catches unit-conversion and sign errors -- the
 class of bug that a "does it run" test sails straight past.
 """
+
 import numpy as np
 import pytest
 import torch
@@ -29,9 +30,7 @@ def _si(displace=0.0):
 
 @pytest.fixture(scope="module")
 def calc():
-    return SlakoNetCalculator(
-        model=model, kpoints_array=KPTS, device=DEVICE
-    )
+    return SlakoNetCalculator(model=model, kpoints_array=KPTS, device=DEVICE)
 
 
 def test_energy_forces_stress_shapes(calc):
