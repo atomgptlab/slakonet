@@ -18,6 +18,8 @@ from jarvis.core.atoms import ase_to_atoms
 from slakonet.slaterkoster import fermi, hs_matrix
 from jarvis.core.atoms import Atoms
 from slakonet.utils import eighb, pack
+import contextlib
+import functools
 import matplotlib.pyplot as plt
 from jarvis.core.specie import atomic_numbers_to_symbols
 
@@ -46,6 +48,58 @@ except Exception:
 # torch.set_default_dtype(torch.float64)
 # torch.set_default_dtype(torch.float32)
 H2E = 27.211
+# Geometry stores lengths in Bohr; ASE and jarvis work in Angstrom.
+BOHR_TO_ANGSTROM = 0.5291772109
+
+
+def nondeterministic_ok(fn):
+    """Run `fn` with the deterministic-algorithms requirement lifted."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with allow_nondeterministic():
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+class _FilteredModel:
+    """Model stand-in exposing only the SKF pairs a structure needs."""
+
+    def __init__(self, filtered_skfs):
+        self.filtered_skfs = filtered_skfs
+
+    def get_updated_skfs(self):
+        return self.filtered_skfs
+
+    def to(self, device):
+        return self
+
+    def float(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+@contextlib.contextmanager
+def allow_nondeterministic():
+    """Temporarily lift torch's deterministic-algorithms requirement.
+
+    The force/stress backward pass goes through CuBLAS routines that have
+    no deterministic kernel, so it raises outright if another library in
+    the same process called torch.use_deterministic_algorithms(True)
+    (alignn does this when configured deterministic). Relax it just for
+    the gradient evaluation and restore the caller's setting afterwards.
+    """
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    if was_enabled:
+        torch.use_deterministic_algorithms(False)
+    try:
+        yield
+    finally:
+        if was_enabled:
+            torch.use_deterministic_algorithms(True)
 
 
 class SimpleDftb:
@@ -66,11 +120,19 @@ class SimpleDftb:
         kT=0.025,  # eV for Fermi smearing
         H2E=27.211,  # Hartree to eV
         compute_forces=True,
+        # Build a differentiable graph through the force/stress gradients.
+        # Only needed to backpropagate *through* forces (e.g. force-matching
+        # training); it makes plain energy+force evaluation ~2x slower
+        # because torch records an fx stack trace per autograd node.
+        create_graph=False,
         include_dos_data=True,
         include_HS=True,
         use_float32=True,
-        alpha=0.1,
-        beta=0.1,
+        # alpha scales the band-structure energy and beta the forces.
+        # Both are 1.0 for the standard DFTB total energy
+        # E = E_band + E_rep and its exact gradient.
+        alpha=1.0,
+        beta=1.0,
         updated_skfs=None,
         fermi_surface=False,
         use_scc=False,
@@ -95,6 +157,7 @@ class SimpleDftb:
         self.kT = kT
         self.H2E = H2E
         self.compute_forces = compute_forces
+        self.create_graph = create_graph
         self.include_dos_data = include_dos_data
         self.include_HS = include_HS
         # Setup basis and feeds
@@ -2252,6 +2315,7 @@ class SimpleDftb:
 
         return hybridization(self, omegas, correlated_subspace, **kw)
 
+    @nondeterministic_ok
     def calculate(self):
         """Main calculation method."""
         compute_forces = self.compute_forces
@@ -2455,70 +2519,71 @@ class SimpleDftb:
                 grad_outputs = torch.autograd.grad(
                     total_energy,
                     self.geometry.positions,
-                    create_graph=True,
+                    create_graph=self.create_graph,
                     retain_graph=True,
                     allow_unused=False,
                 )
 
-                # UNIT NOTE: slakonet stores geometry.positions and
-                # geometry.cell in Bohr, while the total energy is in eV.
-                # torch.autograd.grad therefore yields eV/Bohr; the
-                # downstream stress/virial formula is then in eV/Bohr^3.
-                # ASE expects forces in eV/Ang and stress in eV/Ang^3
-                # (then * 160.21766208 -> GPa). Multiply by 1/_BOHR_TO_ANG
-                # and 1/_BOHR_TO_ANG**3 respectively to convert. The
-                # virial uses the *Bohr-units* forces with Bohr-units
-                # positions so the (eV/Bohr * Bohr -> eV) bookkeeping
-                # stays self-consistent; the conversion is applied once
-                # at the end.
-                _BOHR_TO_ANG = 0.52917721092
+                # Geometry stores positions and cell in Bohr, so autograd
+                # returns dE/dR in eV/Bohr. Convert to eV/Angstrom.
+                grad_pos = grad_outputs[0]
+                forces = -self.beta * grad_pos / BOHR_TO_ANGSTROM
 
-                forces_Bohr = -self.beta * grad_outputs[0]   # eV/Bohr
                 dE_dh = torch.autograd.grad(
                     total_energy,
                     self.geometry.cell,
                     retain_graph=True,
-                    create_graph=True,
-                )[0]                                           # eV/Bohr
-                cell = self.geometry.cell[0]                  # Bohr
-                volume = torch.abs(torch.det(cell))           # Bohr^3
-                positions = self.geometry.positions[0]        # Bohr
+                    create_graph=self.create_graph,
+                )[0]
+                cell = self.geometry.cell[0]  # Bohr
+                volume = torch.abs(torch.det(cell))  # Bohr^3
+                positions = self.geometry.positions[0]  # Bohr
                 mask = self.geometry.atomic_numbers[0] > 0
 
-                # virial in eV/Bohr^3 (Bohr-units throughout)
-                stress_virial = torch.einsum(
-                    "ia,ib->ab", forces_Bohr[0][mask], positions[mask]
+                # Under a homogeneous strain eps, R -> (1+eps)R and
+                # h -> (1+eps)h, so
+                #   dE/d(eps_ab) = sum_i dE/dR_ia * R_ib
+                #                + sum_c dE/dh_ca * h_cb
+                # and the (ASE-convention) stress is that divided by V.
+                virial = torch.einsum(
+                    "ia,ib->ab", grad_pos[0][mask], positions[mask]
                 )
-                stress_tensor = (
-                    stress_virial - dE_dh[0] @ cell.T
-                ) / volume                                     # eV/Bohr^3
+                cell_term = dE_dh[0].transpose(0, 1) @ cell
+                stress_tensor = (virial + cell_term) / volume  # eV/Bohr^3
 
-                # --- convert to ASE/SI units ---
-                forces = forces_Bohr / _BOHR_TO_ANG            # eV/Ang
-                stress_eVperA3 = stress_tensor / (_BOHR_TO_ANG ** 3)
-
-                # Voigt + GPa
+                # eV/Bohr^3 -> eV/Angstrom^3 -> GPa
+                stress_tensor = stress_tensor / BOHR_TO_ANGSTROM**3
                 stress = (
-                    torch.tensor(
+                    torch.stack(
                         [
-                            stress_eVperA3[0, 0],
-                            stress_eVperA3[1, 1],
-                            stress_eVperA3[2, 2],
-                            stress_eVperA3[1, 2],
-                            stress_eVperA3[0, 2],
-                            stress_eVperA3[0, 1],
-                        ],
-                        device=self.device,
+                            stress_tensor[0, 0],
+                            stress_tensor[1, 1],
+                            stress_tensor[2, 2],
+                            stress_tensor[1, 2],
+                            stress_tensor[0, 2],
+                            stress_tensor[0, 1],
+                        ]
                     )
                     * 160.21766208
                 )
 
             except RuntimeError as e:
-                print(f"❌ Error computing forces: {e}")
-                print(
-                    "⚠️  Forces set to zero - positions may not be in computation graph"
-                )
-                forces = torch.zeros_like(self.geometry.positions)
+                # Never substitute zeros here. Silently returning zero
+                # forces makes an optimizer report immediate convergence
+                # while nothing has moved, and the caller has no way to
+                # tell. One way to hit this: another library in the same
+                # process enables torch.use_deterministic_algorithms(True)
+                # (alignn does when configured deterministic), which makes
+                # the CuBLAS-backed backward pass raise.
+                raise RuntimeError(
+                    f"SlakoNet failed to compute forces/stress: {e}\n"
+                    "If this mentions deterministic algorithms, another "
+                    "library in this process enabled them; set "
+                    "CUBLAS_WORKSPACE_CONFIG=:4096:8 before starting "
+                    "Python, or run the calculators in separate "
+                    "processes. Pass compute_forces=False if you only "
+                    "need energies."
+                ) from e
         # print('forces',forces)
         self._results = {
             "energy": total_energy,
@@ -2668,8 +2733,8 @@ def run_calc(
     kpoints_array=[1, 1, 1],
     device="cuda",
     compute_forces=True,
-    alpha=0.1,
-    beta=0.1,
+    alpha=1.0,
+    beta=1.0,
     elements_needed=None,
     updated_skfs=None,  # NEW
     with_eigenvectors=False,
@@ -2772,9 +2837,18 @@ class SlakoNetCalculator(Calculator):
         model=None,
         model_path=None,
         kpoints_array=[1, 1, 1],
+        # Target reciprocal-space sampling in 1/Angstrom. When set, the
+        # Monkhorst-Pack mesh is derived per structure from the cell and
+        # `kpoints_array` is ignored. Strongly preferred when the cell size
+        # varies (bulk vs supercell vs slab): a mesh that is fine for a
+        # 64-atom supercell leaves large spurious forces on a 2-atom cell.
+        kspacing=None,
         device="cuda",
-        alpha=0.1,
-        beta=0.1,
+        # alpha scales the band-structure energy and beta the forces.
+        # Both are 1.0 for the standard DFTB total energy
+        # E = E_band + E_rep and its exact gradient.
+        alpha=1.0,
+        beta=1.0,
         compute_forces=True,
         elements_needed=None,
         use_cached_model=False,
@@ -2826,8 +2900,10 @@ class SlakoNetCalculator(Calculator):
         # Store settings
         self.model_path = model_path
         self.kpoints_array = kpoints_array
+        self.kspacing = kspacing
         self.device = device
         self.compute_forces = compute_forces
+        self._last_kpoints = None
         self.alpha = alpha
         self.beta = beta
         self.with_eigenvectors = with_eigenvectors
@@ -2838,6 +2914,36 @@ class SlakoNetCalculator(Calculator):
 
         if elements_needed:
             self.set_elements(elements_needed)
+
+    def kpoints_for(self, atoms):
+        """Monkhorst-Pack divisions to use for `atoms`.
+
+        With `kspacing` set, the mesh is derived from the reciprocal cell so
+        that every structure is sampled to the same density:
+
+            n_i = ceil(|b_i| / kspacing),   b_i = 2*pi * (cell^-1)^T
+
+        Non-periodic directions get a single k-point. Without `kspacing`
+        the fixed `kpoints_array` is returned unchanged.
+        """
+        if self.kspacing is None:
+            return self.kpoints_array
+
+        cell = np.asarray(atoms.get_cell())
+        if abs(np.linalg.det(cell)) < 1e-8:
+            return self.kpoints_array
+        recip = 2.0 * np.pi * np.linalg.inv(cell).T
+        pbc = np.asarray(atoms.get_pbc())
+        mesh = []
+        for i in range(3):
+            if not pbc[i]:
+                mesh.append(1)
+                continue
+            n = int(np.ceil(np.linalg.norm(recip[i]) / self.kspacing - 1e-8))
+            mesh.append(max(1, n))
+        if mesh != self._last_kpoints:
+            self._last_kpoints = mesh
+        return mesh
 
     def set_elements(self, elements_needed):
         """
@@ -2927,8 +3033,10 @@ class SlakoNetCalculator(Calculator):
             self.results["forces"] = forces.reshape(-1, 3)
 
         if "stress" in properties and result.get("stress") is not None:
-            stress = result["stress"].detach().cpu().numpy()
-            self.results["stress"] = stress.reshape(-1, 3)
+            # SimpleDftb returns the Voigt stress (xx, yy, zz, yz, xz, xy)
+            # in GPa; ASE expects a 6-vector in eV/Angstrom^3.
+            stress = result["stress"].detach().cpu().numpy().reshape(-1)
+            self.results["stress"] = stress / 160.21766208
 
         if "fermi_energy" in result:
             self.results["fermi_energy"] = (
@@ -2956,35 +3064,121 @@ class SlakoNetCalculator(Calculator):
             raise RuntimeError("Calculation not performed yet")
         return self.results["fermi_energy"]
 
+    def get_bandstructure(self, atoms=None, line_density=20, default_points=2):
+        """Band structure along the conventional high-symmetry k-path.
+
+        Returns a dict with ``eigenvalues`` (n_kpoints, n_bands, eV and
+        referenced to the Fermi level), ``kpoints``, ``labels``,
+        ``bandgap``, ``vbm`` and ``cbm``.
+        """
+        from jarvis.core.kpoints import Kpoints3D as Kpoints
+        from jarvis.core.atoms import ase_to_atoms
+        from slakonet.optim import kpts_to_klines
+
+        atoms = atoms if atoms is not None else self.atoms
+        j_atoms = ase_to_atoms(atoms)
+        kpoints = Kpoints().kpath(j_atoms, line_density=line_density)
+        klines = kpts_to_klines(kpoints.kpts, default_points=default_points)
+
+        geometry = Geometry.from_ase_atoms([atoms])
+        calc = SimpleDftb(
+            geometry,
+            klines=klines,
+            model=_FilteredModel(self._get_filtered_skfs()),
+            compute_forces=False,
+            include_dos_data=False,
+            alpha=self.alpha,
+            beta=self.beta,
+            device=self.device,
+        )
+        res = calc.calculate()
+        return {
+            "eigenvalues": res["eigenvalues"].detach().cpu().numpy()[0],
+            "kpoints": np.asarray(kpoints.kpts),
+            "labels": list(kpoints.labels),
+            "bandgap": float(
+                res["bandgap"].detach().cpu().numpy().flatten()[0]
+            ),
+            "vbm": float(res["vbm"].detach().cpu().numpy().flatten()[0]),
+            "cbm": float(res["cbm"].detach().cpu().numpy().flatten()[0]),
+        }
+
+    def get_dos(
+        self,
+        atoms=None,
+        energy_range=(-10.0, 10.0),
+        num_points=3000,
+        sigma=0.1,
+    ):
+        """Total DOS on the calculator's k-mesh.
+
+        Returns ``(energies_eV, dos)``, energies referenced to E_F.
+        """
+        atoms = atoms if atoms is not None else self.atoms
+        calc = self._make_sim(atoms, include_HS=False)
+        calc.calculate()
+        e_grid, dos = calc.calculate_dos(
+            energy_range=energy_range,
+            num_points=num_points,
+            sigma=sigma,
+            fermi_shift=True,
+        )
+        return (
+            e_grid.detach().cpu().numpy(),
+            dos.detach().cpu().numpy(),
+        )
+
+    def get_HS(self, atoms=None):
+        """k-resolved Hamiltonian and overlap matrices.
+
+        Returns ``(H, S)`` with shape
+        ``(n_kpoints, n_orbitals, n_orbitals)``. H is in **Hartree** (the
+        SKF native unit) and the basis is non-orthogonal, so band energies
+        come from the generalized problem ``H c = e S c``:
+
+            w = scipy.linalg.eigh(H[k], S[k], eigvals_only=True)
+            eigenvalues_eV = w * 27.211 - calc.get_fermi_energy()
+        """
+        atoms = atoms if atoms is not None else self.atoms
+        calc = self._make_sim(atoms, include_HS=True)
+        calc.calculate()
+        # SimpleDftb stores these as (batch, n_orb, n_orb, n_k); move the
+        # k axis to the front so H[k] is a matrix.
+        H = calc._results["hamiltonian"][0].permute(2, 0, 1)
+        S = calc._results["overlap"][0].permute(2, 0, 1)
+        return (
+            H.detach().cpu().numpy(),
+            S.detach().cpu().numpy(),
+        )
+
+    def _make_sim(self, atoms, include_HS=False):
+        """SimpleDftb on this calculator's mesh, without forces."""
+        geometry = Geometry.from_ase_atoms([atoms])
+        self.set_elements(set(atoms.get_chemical_symbols()))
+        return SimpleDftb(
+            geometry,
+            kpoints=torch.tensor(self.kpoints_for(atoms)),
+            model=_FilteredModel(self._get_filtered_skfs()),
+            compute_forces=False,
+            include_dos_data=False,
+            include_HS=include_HS,
+            alpha=self.alpha,
+            beta=self.beta,
+            device=self.device,
+        )
+
     def _run_calc_with_filtered_skfs(self, atoms, filtered_skfs):
         """Run calculation using only filtered SKF pairs"""
         from slakonet.atoms import Geometry
         from slakonet.main import SimpleDftb
 
-        # Create a temporary filtered model wrapper
-        class FilteredModel:
-            def __init__(self, filtered_skfs):
-                self.filtered_skfs = filtered_skfs
-
-            def get_updated_skfs(self):
-                return self.filtered_skfs
-
-            def to(self, device):
-                return self
-
-            def float(self):
-                return self
-
-            def eval(self):
-                return self
-
         # Create geometry
         geometry = Geometry.from_ase_atoms([atoms])
         geometry.positions.requires_grad_(True)
-        kpoints = torch.tensor(self.kpoints_array)
+        kpoints = torch.tensor(self.kpoints_for(atoms))
 
         # Use filtered model
-        filtered_model = FilteredModel(filtered_skfs)
+        filtered_model = _FilteredModel(filtered_skfs)
 
         # Run SimpleDftb with filtered model
         calc = SimpleDftb(

@@ -295,13 +295,20 @@ def plot_spin_bands(result, fermi_shift_eV=0.0, filename="bands_spin.png"):
     # shape: [Nband, Nk]
     plt.figure(figsize=(8, 6))
     for b in range(eu.shape[0]):
-        plt.plot(eu[b] - fermi_shift_eV, color="tab:red", lw=0.8)
+        plt.plot(
+            eu[b] - fermi_shift_eV, color="tab:red", lw=0.8,
+            label="spin up" if b == 0 else None,
+        )
     for b in range(ed.shape[0]):
-        plt.plot(ed[b] - fermi_shift_eV, color="tab:blue", lw=0.8, ls="--")
-    plt.axhline(0, ls="-.", color="k")
+        plt.plot(
+            ed[b] - fermi_shift_eV, color="tab:blue", lw=0.8, ls="--",
+            label="spin down" if b == 0 else None,
+        )
+    plt.axhline(0, ls="-.", color="k", label="$E_F$")
     plt.xlabel("k-point")
-    plt.ylabel("E (eV)")
+    plt.ylabel(r"E - E$_F$ (eV)")
     plt.title(f"Spin bands (M = {result['total_moment']:.3f})")
+    plt.legend(loc="best", frameon=True)
     plt.tight_layout()
-    plt.savefig(filename)
+    plt.savefig(filename, dpi=150)
     plt.close()

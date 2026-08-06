@@ -54,16 +54,36 @@ try:
     xm.set_rng_state(random_seed)
 except ImportError:
     pass
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 os.environ["PYTHONHASHSEED"] = str(random_seed)
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(":4096:8")
-torch.use_deterministic_algorithms(True)
 
-torch.autograd.set_detect_anomaly(True)
 
-# Optional: Make it raise errors immediately
-torch.set_anomaly_enabled(True)
+def set_debug_mode(deterministic=True, detect_anomaly=True):
+    """Opt in to bit-reproducible + anomaly-checked execution.
+
+    These are process-global torch settings and both are expensive, so
+    they are no longer enabled on import:
+
+    * ``detect_anomaly`` records a Python stack trace for every autograd
+      node. It made a Si energy+force evaluation ~2.3x slower.
+    * ``deterministic`` makes torch raise on any op without a
+      deterministic kernel. SlakoNet's own backward uses such CuBLAS
+      routines, so it broke force evaluation outright - and, because it
+      is global, it broke unrelated calculators (e.g. alignn) sharing
+      the process.
+
+    CUBLAS_WORKSPACE_CONFIG must be set in the environment *before*
+    Python starts for the deterministic path to work at all.
+    """
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(deterministic)
+    torch.autograd.set_detect_anomaly(detect_anomaly)
+
+
+if os.environ.get("SLAKONET_DEBUG"):
+    set_debug_mode()
 
 
 def get_atoms(jid="", dataset=None, id_tag="jid"):
@@ -3394,19 +3414,58 @@ def _smart_load_slakonet_model(stem_or_pt, elements=None, prefer=None):
     return model
 
 
-def default_model(
-    dir_path=None, model_name="slakonet_v1", elements=None, prefer=None
-):
+# Registry of published SlakoNet parameter sets.
+# https://figshare.com/articles/dataset/SlakoNet_parameters/30122215
+SLAKONET_MODELS = {
+    "slakonet_v0": {
+        "file_id": 57945370,
+        "md5": "4b6af7ebf90c43f01e4d954dd22d5394",
+        "description": "Original universal parameter set (paper v1).",
+    },
+    "slakonet_v1": {
+        "file_id": 64744347,
+        "md5": "b7dbdc43ac169ba4f0c107e41d46ef66",
+        "description": "Second-generation universal parameter set.",
+    },
+    "slakonet_v1a": {
+        "file_id": 67253969,
+        "md5": "c656fc974849858342257efed25508cb",
+        "description": "Refined v1 parameter set (v1a).",
+    },
+}
+
+# Default parameter set; override with the SLAKONET_MODEL env variable.
+DEFAULT_MODEL_NAME = os.environ.get("SLAKONET_MODEL", "slakonet_v1a")
+
+
+def model_download_url(model_name):
+    """Figshare download URL for a registered parameter set."""
+    try:
+        file_id = SLAKONET_MODELS[model_name]["file_id"]
+    except KeyError:
+        raise ValueError(
+            f"Unknown SlakoNet model '{model_name}'. "
+            f"Available: {sorted(SLAKONET_MODELS)}"
+        )
+    return f"https://ndownloader.figshare.com/files/{file_id}"
+
+
+def default_model(dir_path=None, model_name=None, elements=None, prefer=None):
     """
     Load or download the SlakoNet model with proper Figshare handling.
 
     Args:
+        model_name: key in SLAKONET_MODELS (e.g. 'slakonet_v0',
+            'slakonet_v1a'). Defaults to DEFAULT_MODEL_NAME, which follows
+            the SLAKONET_MODEL environment variable.
         elements: optional iterable of element symbols. When the
             safetensors-format cache exists, only the matching SKF pairs are
             materialized (fast, low-memory). Has no effect on the legacy
             .pt path.
         prefer: 'safetensors' | 'pt' | None. Overrides SLAKONET_LOADER env.
     """
+    if model_name is None:
+        model_name = DEFAULT_MODEL_NAME
     if dir_path is None:
         dir_path = os.path.join(get_cache_dir("slakonet"), model_name)
         # dir_path = str(os.path.join(os.path.dirname(__file__), model_name))
@@ -3459,10 +3518,8 @@ def default_model(
         return model
 
     # Download from Figshare - use ndownloader subdomain
-    # v0 url = "https://ndownloader.figshare.com/files/57945370"
-    url = "https://ndownloader.figshare.com/files/64744347"
-    # url="https://figshare.com/ndownloader/files/57945370"
-    print(f"Downloading {model_name} model from Figshare...")
+    url = model_download_url(model_name)
+    print(f"Downloading {model_name} model from Figshare ({url})...")
 
     # Create directory if needed
     if not os.path.exists(dir_path):
@@ -3573,7 +3630,7 @@ def default_model_new(dir_path=None, model_name="slakonet_v1"):
             return model
 
     # Download the file
-    url = "https://figshare.com/ndownloader/files/57945370"
+    url = model_download_url(model_name)
     print(f"Downloading {model_name} model...")
 
     # Simple download - no streaming
@@ -3659,7 +3716,7 @@ def default_model_old(dir_path=None, model_name="slakonet_v1"):
             return model
 
     # If we get here, need to download
-    url = "https://figshare.com/ndownloader/files/57945370"
+    url = model_download_url(model_name)
 
     print(f"Downloading and loading {model_name} model from zip...")
     response = requests.get(url, stream=True)

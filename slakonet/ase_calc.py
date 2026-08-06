@@ -49,14 +49,17 @@ class SlaKoNetConfig(BaseModel):
     run can be fully described by a JSON file.
     """
 
-    kpoints: List[int] = [3, 3, 3]   # Monkhorst-Pack grid
-    cutoff: float = 10.0             # Bohr
-    kT: float = 0.025               # Fermi smearing (eV)
-    alpha: float = 0.1              # charge mixing
-    beta: float = 0.1              # force scaling: F = -beta * dE/dx
+    kpoints: List[int] = [3, 3, 3]  # Monkhorst-Pack grid
+    cutoff: float = 10.0  # Bohr
+    kT: float = 0.025  # Fermi smearing (eV)
+    # alpha scales the band-structure energy and beta the forces. Both are
+    # 1.0 for the standard DFTB total energy E = E_band + E_rep and its
+    # exact gradient; changing them breaks energy/force consistency.
+    alpha: float = 1.0
+    beta: float = 1.0
     use_scc: bool = False
     compute_forces: bool = True
-    compute_stress: bool = True     # needs compute_forces + periodic
+    compute_stress: bool = True  # needs compute_forces + periodic
     include_dos: bool = False
     device: Optional[str] = None
 
@@ -259,9 +262,7 @@ class SlaKoNetCalculator(Calculator):
         labels = [""] * len(kpts_frac)
         for name, pt in bp.special_points.items():
             i = int(
-                np.argmin(
-                    np.linalg.norm(kpts_frac - np.asarray(pt), axis=1)
-                )
+                np.argmin(np.linalg.norm(kpts_frac - np.asarray(pt), axis=1))
             )
             labels[i] = (labels[i] + "|" + name) if labels[i] else name
 
@@ -309,8 +310,15 @@ class SlaKoNetCalculator(Calculator):
 
         if savefig:
             self._plot_bands(
-                eigenvalues, labels, mid, gap, atoms,
-                emin, emax, mask_ev, savefig,
+                eigenvalues,
+                labels,
+                mid,
+                gap,
+                atoms,
+                emin,
+                emax,
+                mask_ev,
+                savefig,
             )
         return out
 
@@ -336,9 +344,7 @@ class SlaKoNetCalculator(Calculator):
         ep = np.sort(ep, axis=-1)
         if ep.shape[0] > 1:
             big = np.abs(np.diff(ep, axis=0)) > 2.0
-            nm = np.concatenate(
-                [np.zeros_like(big[:1]), big], 0
-            ).astype(bool)
+            nm = np.concatenate([np.zeros_like(big[:1]), big], 0).astype(bool)
             ep[nm] = np.nan
 
         fig, ax = plt.subplots(figsize=(8, 5))
@@ -397,7 +403,59 @@ class SlaKoNetCalculator(Calculator):
             dos.detach().cpu().numpy(),
         )
 
+    def get_HS(self, atoms=None, kpoints=None):
+        """k-resolved Hamiltonian and overlap matrices.
+
+        Returns ``(H, S)`` as numpy arrays of shape
+        ``(n_kpoints, n_orbitals, n_orbitals)``. H is in **Hartree** (the
+        SKF native unit) and the basis is non-orthogonal, so band energies
+        come from the generalized problem ``H c = e S c``:
+
+            w = scipy.linalg.eigh(H[k], S[k], eigvals_only=True)
+            eigenvalues_eV = w * 27.211 - calc.get_fermi_level()
+
+        The matrices are complex in general and Hermitian at every k.
+
+        `kpoints` overrides the calculator's Monkhorst-Pack mesh for this
+        call only, e.g. ``get_HS(kpoints=(1, 1, 1))`` for Gamma only.
+        """
+        atoms = atoms if atoms is not None else self.atoms
+        mesh = list(kpoints) if kpoints is not None else list(self.kpoints)
+        geo = Geometry.from_ase_atoms([atoms])
+        sim = SimpleDftb(
+            geo,
+            self.model,
+            kpoints=torch.tensor(mesh),
+            device=self.device,
+            with_eigenvectors=False,
+            compute_forces=False,
+            include_dos_data=False,
+            include_HS=True,
+            repulsive=True,
+            alpha=self.alpha,
+            beta=self.beta,
+            kT=self.kT,
+            use_scc=self.use_scc,
+        )
+        sim.calculate()
+        # SimpleDftb stores these as (batch, n_orb, n_orb, n_k); move the
+        # k axis to the front so H[k] is a matrix.
+        H = sim._results["hamiltonian"][0].permute(2, 0, 1)
+        S = sim._results["overlap"][0].permute(2, 0, 1)
+        return (
+            H.detach().cpu().numpy(),
+            S.detach().cpu().numpy(),
+        )
+
     # ---- convenience -----------------------------------------------------
+    def get_bandstructure(self, atoms=None, **kwargs):
+        """Alias for :meth:`band_structure`."""
+        return self.band_structure(atoms=atoms, **kwargs)
+
+    def get_dos(self, atoms=None, **kwargs):
+        """Alias for :meth:`dos`."""
+        return self.dos(atoms=atoms, **kwargs)
+
     def get_bandgap(self, atoms=None):
         if "bandgap" not in self.results:
             self.get_potential_energy(atoms)
