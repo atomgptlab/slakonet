@@ -2818,6 +2818,12 @@ class SlakoNetCalculator(Calculator):
         model=None,
         model_path=None,
         kpoints_array=[1, 1, 1],
+        # Target reciprocal-space sampling in 1/Angstrom. When set, the
+        # Monkhorst-Pack mesh is derived per structure from the cell and
+        # `kpoints_array` is ignored. Strongly preferred when the cell size
+        # varies (bulk vs supercell vs slab): a mesh that is fine for a
+        # 64-atom supercell leaves large spurious forces on a 2-atom cell.
+        kspacing=None,
         device="cuda",
         # alpha scales the band-structure energy and beta the forces.
         # Both are 1.0 for the standard DFTB total energy
@@ -2875,8 +2881,10 @@ class SlakoNetCalculator(Calculator):
         # Store settings
         self.model_path = model_path
         self.kpoints_array = kpoints_array
+        self.kspacing = kspacing
         self.device = device
         self.compute_forces = compute_forces
+        self._last_kpoints = None
         self.alpha = alpha
         self.beta = beta
         self.with_eigenvectors = with_eigenvectors
@@ -2887,6 +2895,36 @@ class SlakoNetCalculator(Calculator):
 
         if elements_needed:
             self.set_elements(elements_needed)
+
+    def kpoints_for(self, atoms):
+        """Monkhorst-Pack divisions to use for `atoms`.
+
+        With `kspacing` set, the mesh is derived from the reciprocal cell so
+        that every structure is sampled to the same density:
+
+            n_i = ceil(|b_i| / kspacing),   b_i = 2*pi * (cell^-1)^T
+
+        Non-periodic directions get a single k-point. Without `kspacing`
+        the fixed `kpoints_array` is returned unchanged.
+        """
+        if self.kspacing is None:
+            return self.kpoints_array
+
+        cell = np.asarray(atoms.get_cell())
+        if abs(np.linalg.det(cell)) < 1e-8:
+            return self.kpoints_array
+        recip = 2.0 * np.pi * np.linalg.inv(cell).T
+        pbc = np.asarray(atoms.get_pbc())
+        mesh = []
+        for i in range(3):
+            if not pbc[i]:
+                mesh.append(1)
+                continue
+            n = int(np.ceil(np.linalg.norm(recip[i]) / self.kspacing - 1e-8))
+            mesh.append(max(1, n))
+        if mesh != self._last_kpoints:
+            self._last_kpoints = mesh
+        return mesh
 
     def set_elements(self, elements_needed):
         """
@@ -3032,7 +3070,7 @@ class SlakoNetCalculator(Calculator):
         # Create geometry
         geometry = Geometry.from_ase_atoms([atoms])
         geometry.positions.requires_grad_(True)
-        kpoints = torch.tensor(self.kpoints_array)
+        kpoints = torch.tensor(self.kpoints_for(atoms))
 
         # Use filtered model
         filtered_model = FilteredModel(filtered_skfs)
