@@ -55,7 +55,7 @@ pip install uv; uv pip install -e .
 
 ### Google Colab example
 
-[Open in Colab](https://colab.research.google.com/github/knc6/jarvis-tools-notebooks/blob/master/jarvis-tools-notebooks/slakonet_example.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/knc6/jarvis-tools-notebooks/blob/master/jarvis-tools-notebooks/slakonet_example.ipynb)
 
 ### Example of Training Models
 
