@@ -109,7 +109,7 @@ model = default_model()
 # Get structure (example with JARVIS ID)
 atoms, opt_gap, mbj_gap = get_atoms("JVASP-107")  
 geometry = Geometry.from_ase_atoms([atoms.ase_converter()])
-shell_dict = generate_shell_dict_upto_Z65()
+shell_dict = generate_shell_dict_upto_Z65(model=model)
 
 # Compute electronic properties
 with torch.no_grad():
@@ -120,9 +120,9 @@ with torch.no_grad():
         device="cuda"
     )
 
-# Access results
-print(f"Band gap: {properties['band_gap_eV']:.3f} eV")
-print(f"Fermi energy: {properties['fermi_energy_eV']:.3f} eV")
+# Access results (all tensors; .item() for scalars)
+print(f"Band gap: {properties['bandgap'].item():.3f} eV")
+print(f"Fermi energy: {properties['fermi_energy'].item():.3f} eV")
 
 # Plot band structure and DOS
 eigenvalues = properties["eigenvalues"]
@@ -160,9 +160,36 @@ bs = calc.band_structure(si, path="GXWKGL", npoints=20,
 e, dos = calc.dos(si)
 print(calc.get_bandgap(), calc.get_fermi_level())
 
+# Hamiltonian and overlap, (n_kpoints, n_orbitals, n_orbitals)
+H, S = calc.get_HS(si)
+
 # reuse on another structure with NO model reload
 ge = bulk("Ge", "diamond", a=5.66); ge.calc = calc
 ge.get_potential_energy()
+```
+
+`get_bandstructure()` and `get_dos()` are aliases of `band_structure()`
+and `dos()`. The same three accessors exist on
+`slakonet.main.SlakoNetCalculator`.
+
+`get_HS` returns the k-resolved Hamiltonian and overlap. **H is in
+Hartree** and the basis is non-orthogonal, so band energies come from
+the generalized eigenproblem:
+
+```python
+import scipy.linalg as sla
+from ase.build import bulk
+from slakonet.optim import default_model
+from slakonet.ase_calc import SlaKoNetCalculator
+
+calc = SlaKoNetCalculator(default_model().float(), kpoints=(3, 3, 3))
+si = bulk("Si", "diamond", a=5.43)
+si.calc = calc
+si.get_potential_energy()                       # sets the Fermi level
+
+H, S = calc.get_HS(si)
+w = sla.eigh(H[0], S[0], eigvals_only=True)     # k-point 0
+eigenvalues_eV = w * 27.211 - calc.get_fermi_level()
 ```
 
 Toggles (constructor keywords): `compute_forces`, `compute_stress`,
