@@ -3435,7 +3435,7 @@ SLAKONET_MODELS = {
 }
 
 # Default parameter set; override with the SLAKONET_MODEL env variable.
-DEFAULT_MODEL_NAME = os.environ.get("SLAKONET_MODEL", "slakonet_v1")
+DEFAULT_MODEL_NAME = os.environ.get("SLAKONET_MODEL", "slakonet_v1a")
 
 
 def model_download_url(model_name):

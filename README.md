@@ -82,7 +82,7 @@ from slakonet.optim import default_model
 model = default_model(model_name="slakonet_v1a")
 ```
 
-`default_model()` with no arguments uses `slakonet_v1`; set the
+`default_model()` with no arguments uses `slakonet_v1a`; set the
 `SLAKONET_MODEL` environment variable to change the default globally, and
 `--model_path slakonet_v1a` selects a set from the command line:
 
