@@ -3564,17 +3564,22 @@ def default_model(dir_path=None, model_name=None, elements=None, prefer=None):
     return model
 
 
-def default_mu(full=False):
-    """Return SlaKoNet's default per-element chemical potentials.
+def default_mu(full=False, model_name=None):
+    """Return SlaKoNet's per-element chemical potentials.
 
-    These are bundled with the package (``slakonet/data/default_mu.json``)
-    and are used to turn total energies into formation energies
-    (``E_form = (E_total - sum_i n_i * mu_i) / N_atoms``). Users who
-    prefer their own calibration can simply load a different JSON.
+    mu_X is the total energy per atom of element X's reference structure,
+    so ``E_form = (E_total - sum_i n_i * mu_i) / N_atoms`` and elemental
+    formation energies come out at zero *for the model mu was calibrated
+    on*. They are therefore model-specific: using v1's mu with v1a gives
+    a per-element offset of several eV/atom (E_form MAE 2.39 vs 0.30
+    eV/atom on an 18-material check).
 
     Args:
         full: if True return the whole JSON dict (model name, calibration
             metrics, etc.); otherwise just the ``{element: mu_eV}`` map.
+        model_name: parameter set to match. Defaults to
+            DEFAULT_MODEL_NAME. Falls back to the legacy bundled file if
+            no per-model calibration ships for that name.
 
     Returns:
         dict -- ``{element: mu_per_atom_eV}`` (default) or the full file.
@@ -3582,7 +3587,14 @@ def default_mu(full=False):
     import json
     from importlib.resources import files
 
-    text = files("slakonet.data").joinpath("default_mu.json").read_text()
+    if model_name is None:
+        model_name = DEFAULT_MODEL_NAME
+    data_dir = files("slakonet.data")
+    candidate = data_dir.joinpath(f"mu_{model_name}.json")
+    try:
+        text = candidate.read_text()
+    except (FileNotFoundError, OSError):
+        text = data_dir.joinpath("default_mu.json").read_text()
     data = json.loads(text)
     return data if full else data["mu_per_atom_eV"]
 
