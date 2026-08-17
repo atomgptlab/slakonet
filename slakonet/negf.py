@@ -195,6 +195,7 @@ class SlakoNetNEGF:
         n_r=5,
         torch_device=None,
         verbose=True,
+        chunk_bytes=768 << 20,
     ):
         self.model = model
         self.axis = axis
@@ -203,6 +204,7 @@ class SlakoNetNEGF:
         self.eta = eta
         self.n_r = n_r
         self.verbose = verbose
+        self.chunk_bytes = chunk_bytes
         self.torch_device = torch_device or (
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -306,8 +308,16 @@ class SlakoNetNEGF:
         return out
 
     # ------------------------------------------------------------------
-    def _transmission_single_k(self, energies_ev, kt, chunk=128):
-        """T(E) at one transverse k-point."""
+    def _transmission_single_k(self, energies_ev, kt, chunk=None):
+        """T(E) at one transverse k-point.
+
+        ``chunk`` is the number of energies solved at once.  Left to
+        ``None`` it is sized from the device dimension so the batched
+        ``[chunk, nD, nD]`` complex128 arrays stay near
+        ``self.chunk_bytes``; a fixed chunk runs out of memory as soon as
+        the device gets large (1620 orbitals x 128 energies is already
+        5 GiB per array, and several are live at once).
+        """
         eb, db = self._blocks(kt)
         dev = self.torch_device
         cdt = torch.complex128
@@ -318,6 +328,10 @@ class SlakoNetNEGF:
 
         n = self.n_orb_elec
         nD = self.n_orb_dev
+        if chunk is None:
+            per_energy = nD * nD * 16  # bytes for one complex128 [nD, nD]
+            chunk = int(self.chunk_bytes // max(per_energy, 1))
+            chunk = max(4, min(128, chunk))
         ident_n = torch.eye(n, dtype=cdt, device=dev)
 
         # columns of the identity picking the last PL (for the corner block)
