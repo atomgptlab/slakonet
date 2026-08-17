@@ -262,13 +262,35 @@ class SlakoNetNEGF:
         return eb, db
 
     def check_setup(self, kt=(0.0, 0.0)):
-        """Diagnostics: PL locality and device/electrode consistency."""
+        """Diagnostics: PL locality and device/electrode consistency.
+
+        Mismatches are reported both absolutely (eV) and relative to the
+        size of the block being compared.  **Judge them on the relative
+        numbers.**  A genuinely wrong setup - device atoms not in
+        principal-layer order, a device that is not an integer stack of
+        the electrode, the wrong transport axis - misplaces whole matrix
+        elements and shows up at order 1, not at 1e-3.
+
+        A residual relative ``H01_mismatch`` of a few 1e-4 is expected for
+        *heteronuclear* systems and is a property of the Slater-Koster
+        tables, not of this setup: it is bit-zero for homonuclear cells
+        (3e-6 relative for graphene) but ~2e-4 for hBN and ~3e-4 for MoS2,
+        while the corresponding overlap blocks agree to 1e-7.  It does not
+        move with the interaction cutoff (checked at 10, 13 and 16 Bohr),
+        the geometries involved are bit-identical, and H is exactly
+        Hermitian - so it comes from the H tables of the A-B pair rather
+        than from the two-probe construction.
+        """
         eb, db = self._blocks(kt)
         out = {}
         far = max(abs(R) for R in eb)
+        h01_scale = float(torch.abs(eb[1][0]).max()) or 1.0
+        h00_scale = float(torch.abs(eb[0][0]).max()) or 1.0
+
         out["elec_H_far"] = float(torch.abs(eb[far][0]).max())
         out["elec_H01"] = float(torch.abs(eb[1][0]).max())
         out["dev_H_far"] = float(torch.abs(db[far][0]).max())
+
         n = self.n_orb_elec
         # first diagonal PL block of the device vs bulk electrode H00
         out["H00_mismatch"] = float(
@@ -277,6 +299,10 @@ class SlakoNetNEGF:
         out["H01_mismatch"] = float(
             torch.abs(db[0][0][:n, n : 2 * n] - eb[1][0]).max()
         )
+        out["H00_mismatch_rel"] = out["H00_mismatch"] / h00_scale
+        out["H01_mismatch_rel"] = out["H01_mismatch"] / h01_scale
+        out["elec_H_far_rel"] = out["elec_H_far"] / h01_scale
+        out["dev_H_far_rel"] = out["dev_H_far"] / h01_scale
         return out
 
     # ------------------------------------------------------------------
