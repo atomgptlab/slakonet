@@ -20,6 +20,7 @@ from jarvis.core.atoms import Atoms
 from slakonet.utils import eighb, pack
 import contextlib
 import functools
+import inspect
 import matplotlib.pyplot as plt
 from jarvis.core.specie import atomic_numbers_to_symbols
 
@@ -274,12 +275,24 @@ class SimpleDftb:
         """
         Build shell_dict entirely from the loaded SKFs — no hardcoded Z<=65 fallback.
         Shells are inferred from the occupation count in each SKF's atomic_data.
+
+        Homonuclear pairs are visited first because they are the only ones
+        carrying atomic_data: an element resolved from a heteronuclear pair
+        has no on_sites/occupations to count and falls back to bounding the
+        basis by that pair's H keys, which can differ. Visiting in plain
+        dict order therefore made the basis depend on the order pairs
+        happened to be stored in the model file — ThO2 came out as spd or
+        sp, a 26 eV swing, purely from that ordering.
         """
         from jarvis.core.specie import Specie
 
         shell_dict = {}
 
-        for pair_key, skf in self.updated_skfs.items():
+        ordered = sorted(
+            self.updated_skfs.items(),
+            key=lambda kv: kv[0].split("-")[0] != kv[0].split("-")[1],
+        )
+        for pair_key, skf in ordered:
             elem1, elem2 = pair_key.split("-")
 
             for symbol in [elem1, elem2]:
@@ -1004,8 +1017,15 @@ class SimpleDftb:
 
         return total_rep_energy  # Now in eV
 
-    def _compute_repulsive_energy(self):
-        """Compute pair repulsive potential energy."""
+    def _compute_repulsive_energy(self, by_pair=False):
+        """Compute pair repulsive potential energy.
+
+        With ``by_pair=True`` return ``{element_pair: energy}`` instead of
+        the total. The repulsive is a sum of independent pair terms, so
+        the breakdown lets a refit reuse one E(V) scan: with E_band and
+        each pair's R_p(V) in hand, the total for any per-pair scaling is
+        arithmetic, and no eigenvalue problem has to be solved again.
+        """
         from jarvis.core.specie import atomic_numbers_to_symbols
 
         # Build atomic number to symbol mapping
@@ -1020,6 +1040,7 @@ class SimpleDftb:
 
         # Initialize total repulsive energy
         total_rep_energy = torch.zeros(1, device=self.device)
+        per_pair = {}
 
         # Get unique atom pairs
         uan = self.periodic.unique_atomic_numbers()
@@ -1121,9 +1142,14 @@ class SimpleDftb:
                 pair_energy[in_tail] = acc
 
             # Accumulate (0.5 to avoid double counting pairs)
-            total_rep_energy = total_rep_energy + 0.5 * pair_energy.sum()
+            contrib = 0.5 * pair_energy.sum()
+            total_rep_energy = total_rep_energy + contrib
+            if by_pair:
+                per_pair[element_pair] = (
+                    per_pair.get(element_pair, 0.0) + contrib
+                )
 
-        return total_rep_energy
+        return per_pair if by_pair else total_rep_energy
 
     def _compute_repulsive_energy_11(self):
         # def _compute_repulsive_energyXX(self):
@@ -2817,6 +2843,43 @@ class FilteredModelView(nn.Module):
         return getattr(self.full_model, name)
 
 
+# Keywords ASE's Calculator base genuinely understands. Everything else
+# arriving in **kwargs is a mistake on the caller's part.
+_ASE_BASE_KWARGS = frozenset(
+    {"restart", "ignore_bad_restart_file", "label", "atoms", "directory"}
+)
+
+
+def _check_calculator_kwargs(cls, kw):
+    """Reject keywords that neither we nor ASE's Calculator implement.
+
+    ``ase.calculators.calculator.Calculator.__init__`` itself ends in
+    ``**kwargs`` and files whatever it does not recognise into
+    ``self.parameters``. Forwarding our own leftover ``**kw`` into it
+    therefore accepts *any* keyword in silence -- it neither takes effect
+    nor raises.
+
+    That is not hypothetical: ``kspacing=`` was silently swallowed by
+    ``SlaKoNetCalculator`` for exactly this reason, so every structure
+    quietly kept the fixed 3x3x3 mesh no matter what was passed. A 3x3x3
+    grid puts a spurious 1.5 eV band gap on fcc Al, and the calculator
+    reported it without complaint. Fail loudly instead.
+    """
+    unknown = sorted(set(kw) - _ASE_BASE_KWARGS)
+    if not unknown:
+        return
+    own = sorted(
+        p.name
+        for p in inspect.signature(cls.__init__).parameters.values()
+        if p.name != "self" and p.kind is not p.VAR_KEYWORD
+    )
+    raise TypeError(
+        f"{cls.__name__} got unexpected keyword argument(s): "
+        f"{', '.join(unknown)}. Accepted here: {', '.join(own)}; "
+        f"plus ASE's {', '.join(sorted(_ASE_BASE_KWARGS))}."
+    )
+
+
 class SlakoNetCalculator(Calculator):
     """ASE Calculator interface for SlakoNet with dynamic element filtering"""
 
@@ -2865,6 +2928,7 @@ class SlakoNetCalculator(Calculator):
             elements_needed: Set of elements to filter (optional, can auto-detect)
             **kwargs: Additional arguments passed to Calculator
         """
+        _check_calculator_kwargs(type(self), kwargs)
         Calculator.__init__(self, **kwargs)
 
         # Load or reuse model

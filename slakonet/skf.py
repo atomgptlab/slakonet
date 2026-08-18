@@ -263,6 +263,156 @@ class Skf:
         return data
 
     @classmethod
+    def from_skf(
+        cls,
+        path: str,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+        smooth_to_zero: bool = True,
+        **kwargs,
+    ) -> "Skf":
+        """Parse and skf file into an `Skf` instance.
+
+        File names should follow the naming convention X-Y.skf where X & Y are
+        the chemical symbols of the associated elements. However, any file
+        which **ends** in X.Y will be successfully parsed (where "." is any
+        character (including no character)).
+
+        Arguments:
+            path: Path to the target skf file.
+            device: Device on which to place tensors. [DEFAULT=None]
+            dtype: dtype to be used for floating point tensors. [DEFAULT=None]
+
+        Returns:
+            skf: Return the arguments in `Skf` object.
+
+        """
+        dd = {"dtype": dtype, "device": device}
+        kwargs_in = {}
+        if not smooth_to_zero:
+            warnings.warn(
+                "`smooth_to_zero` is set as Flase, and there is no"
+                " tail smoothing in interpolation, please make sure"
+                " you understand what you have done."
+            )
+
+        # Identify the elements involved according to the file name
+        e = "[A-Z][a-z]?"
+        try:
+            atom_pair = torch.tensor(
+                [
+                    atomic_numbers[i]
+                    for i in re.findall(
+                        e,
+                        re.search(rf"{e}.?{e}(?=.)", split(path)[-1]).group(0),
+                    )
+                ]
+            )
+        except AttributeError as error:
+            raise ValueError(
+                "Could not parse element names form file."
+            ) from error
+
+        lines = open(path, "r").readlines()
+
+        # Remove the comment line if present
+        lines = lines[1:] if lines[0].startswith("@") else lines
+
+        # 0th line, grid distance and grid points number
+        g_step, n_grids = lines[0].replace(",", " ").split()[:2]
+        g_step, n_grids = float(g_step), int(n_grids)
+        grid = torch.arange(1, n_grids + 1, **dd) * g_step
+        hs_cut = n_grids * g_step - g_step
+
+        # Determine if this is the homo/atomic case (from the file's contents)
+        atomic = len(atom_ln := _s2t(_esr(lines[1]), **dd)) in [10, 13]
+
+        # Read in the mass and polynomial repulsion coefficients
+        mass, r_poly, r_cut = _s2t(_esr(lines[1 + atomic]), **dd)[:10].split(
+            [1, 8, 1]
+        )
+
+        # If polynomial coefficients are valid, create an r_poly object
+        if (r_poly != 0).any():
+            kwargs_in["r_poly"] = cls.RPoly(r_cut, r_poly)
+
+        # Parse hamiltonian/overlap integrals.
+        h_data, s_data = (
+            _s2t(
+                _esr("  ".join(lines[2 + atomic : 2 + atomic + n_grids])), **dd
+            )
+            .view(n_grids, -1)
+            .chunk(2, 1)
+        )
+
+        # H/S tables are reordered so the lowest l comes first, broken up into
+        # into shell-pair chunks, e.g. ss, sp, sd, pp, etc, before finally
+        # being placed into dictionaries.
+        count = h_data.shape[-1]
+        sort = cls._sorter if count == 10 else cls._sorter_e  # ◂──────┐
+        max_l = round(tetrahedral_root(count) - 1)  # ◂─f-orbital catch┘
+
+        # Sort, segmentation and parse the tables into a pair of dictionaries
+        l_pairs = torch.triu_indices(max_l + 1, max_l + 1).T
+        h_data, s_data = [
+            {
+                tuple(l_pair.tolist()): integral
+                for l_pair, integral in
+                #            |   ↓ Sorting ↓   |    ↓ Segmentation by ℓ pair ↓    |
+                zip(
+                    l_pairs,
+                    integrals.T[sort].split((l_pairs[:, 0] + 1).tolist()),
+                )
+                if not (integral == 0.0).all()
+            }  # ← Ignore any dummy interactions
+            for integrals in [h_data, s_data]
+        ]
+
+        # if smooth_to_zero:
+        #     h_data = {ikey: poly_to_zero(
+        #         grid, h_data[ikey]) for ikey in h_data.keys()}
+        #     s_data = {ikey: poly_to_zero(
+        #         grid, s_data[ikey]) for ikey in s_data.keys()}
+
+        if (
+            atomic
+        ):  # Parse homo data; on-site/Hubbard-U/occupations. (skip spe)
+            n = int((len(atom_ln) - 1) / 3)  # -> Number of shells specified
+            occs, hubb_u, _, on_site = atom_ln.flip(0).split([n, n, 1, n])
+            # If integrals were culled; atomic data must be too.
+            max_l = int(triangular_root(len(h_data)) - 1) + 1
+            kwargs_in.update(
+                {
+                    "mass": mass,
+                    "occupations": occs[: max_l + 1],
+                    "on_sites": on_site[:max_l],
+                    "hubbard_us": hubb_u[:max_l],
+                }
+            )
+
+        # Parse repulsive spline (if present). The header is matched on the
+        # stripped line: some skf sets write it as "Spline " with a
+        # trailing space, which an exact "Spline\n" comparison misses --
+        # and silently dropping the repulsive is far worse than failing.
+        headers = [line.strip() for line in lines]
+        if "Spline" in headers:
+            ln = headers.index("Spline") + 2
+            n_int, r_cutoff = lines[ln - 1].split()
+            r_tab = _s2t(lines[ln + 1 : ln + int(n_int)], **dd).view(-1, 6)
+            r_grid = torch.cat((r_tab[:, 0], r_tab[None, -1, 1]))
+            kwargs_in["r_spline"] = cls.RSpline(
+                # Repulsive grid, cutoff & repulsive spline coefficients.
+                r_grid,
+                torch.tensor(float(r_cutoff), **dd),
+                r_tab[:, 2:],
+                # The exponential and tail spline's coefficients.
+                _s2t(lines[ln], **dd),
+                _s2t(lines[ln + int(n_int)], **dd)[2:],
+            )
+
+        return cls(atom_pair, h_data, s_data, grid, hs_cut, **kwargs_in)
+
+    @classmethod
     def from_dict(
         cls,
         data: Dict[str, Any],

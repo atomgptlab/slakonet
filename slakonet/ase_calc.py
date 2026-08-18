@@ -34,7 +34,11 @@ from ase.calculators.calculator import Calculator, all_changes
 from pydantic import BaseModel, field_validator
 
 from slakonet.atoms import Geometry
-from slakonet.main import SimpleDftb, generate_shell_dict_upto_Z65
+from slakonet.main import (
+    SimpleDftb,
+    _check_calculator_kwargs,
+    generate_shell_dict_upto_Z65,
+)
 from slakonet.optim import kpts_to_klines
 
 # eV/Ang^3  <->  GPa  (slakonet returns stress in GPa, Voigt order)
@@ -114,6 +118,7 @@ class SlaKoNetCalculator(Calculator):
         shell_dict=None,
         *,
         kpoints=None,
+        kspacing: Optional[float] = None,
         cutoff: Optional[float] = None,
         kT: Optional[float] = None,
         alpha: Optional[float] = None,
@@ -129,6 +134,7 @@ class SlaKoNetCalculator(Calculator):
         or None. Any explicit keyword (kpoints=, beta=, ...) overrides
         the corresponding config field, so existing call sites that pass
         plain kwargs keep working unchanged."""
+        _check_calculator_kwargs(type(self), kw)
         Calculator.__init__(self, **kw)
         self.model = model  # loaded ONCE; reused across all calls
         self.shell_dict = shell_dict or generate_shell_dict_upto_Z65(
@@ -169,6 +175,11 @@ class SlaKoNetCalculator(Calculator):
         self.cfg = cfg
 
         self.kpoints = tuple(cfg.kpoints)
+        # Density-based mesh, as in SlakoNetCalculator.kpoints_for. Taken
+        # straight from **kw before, which meant ASE's base Calculator
+        # silently absorbed it and every structure kept the fixed mesh --
+        # a 3x3x3 grid puts a spurious 1.5 eV "gap" on fcc Al.
+        self.kspacing = kspacing
         self.cutoff = cfg.cutoff
         self.kT = cfg.kT
         self.alpha = cfg.alpha
@@ -182,6 +193,39 @@ class SlaKoNetCalculator(Calculator):
         )
 
     # ---- ASE entry point -------------------------------------------------
+
+    def kpoints_for(self, atoms):
+        """Monkhorst-Pack divisions for `atoms`.
+
+        With ``kspacing`` set the mesh follows the reciprocal cell so
+        every structure is sampled to the same density,
+        ``n_i = ceil(|b_i| / kspacing)``; non-periodic directions get one
+        k-point. Without it the fixed ``kpoints`` is returned unchanged.
+        """
+        if self.kspacing is None:
+            return list(self.kpoints)
+        cell = np.asarray(atoms.get_cell())
+        if abs(np.linalg.det(cell)) < 1e-8:
+            return list(self.kpoints)
+        recip = 2.0 * np.pi * np.linalg.inv(cell).T
+        pbc = np.asarray(atoms.get_pbc())
+        mesh = []
+        for i in range(3):
+            if not pbc[i]:
+                mesh.append(1)
+                continue
+            mesh.append(
+                max(
+                    1,
+                    int(
+                        np.ceil(
+                            np.linalg.norm(recip[i]) / self.kspacing - 1e-8
+                        )
+                    ),
+                )
+            )
+        return mesh
+
     def calculate(
         self, atoms=None, properties=("energy",), system_changes=all_changes
     ):
@@ -191,7 +235,7 @@ class SlaKoNetCalculator(Calculator):
         sim = SimpleDftb(
             geo,
             self.model,
-            kpoints=torch.tensor(list(self.kpoints)),
+            kpoints=torch.tensor(self.kpoints_for(self.atoms)),
             device=self.device,
             with_eigenvectors=False,
             compute_forces=self.compute_forces,
@@ -380,7 +424,7 @@ class SlaKoNetCalculator(Calculator):
         sim = SimpleDftb(
             geo,
             self.model,
-            kpoints=torch.tensor(list(self.kpoints)),
+            kpoints=torch.tensor(self.kpoints_for(self.atoms)),
             device=self.device,
             with_eigenvectors=False,
             compute_forces=False,

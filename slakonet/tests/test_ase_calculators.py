@@ -179,3 +179,51 @@ def test_model_reuse_across_structures(calc):
     si2.calc = calc
     assert si2.get_potential_energy() == pytest.approx(e_si, abs=1e-6)
     assert e_ge != pytest.approx(e_si, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "cls, kwargs",
+    [
+        (SlaKoNetCalculator, {"model": model}),
+        (SlakoNetCalculator, {"model": model}),
+    ],
+)
+def test_unknown_kwarg_raises(cls, kwargs):
+    """A keyword neither we nor ASE implement must not be swallowed.
+
+    ASE's Calculator base ends in **kwargs and files anything it does
+    not recognise into self.parameters, so an unimplemented keyword used
+    to be accepted in silence -- `kspacing=` did nothing on
+    SlaKoNetCalculator, leaving every structure on the fixed 3x3x3 mesh
+    that puts a spurious 1.5 eV gap on fcc Al.
+    """
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        cls(kspaceing=0.25, **kwargs)  # deliberate typo
+
+
+def test_kspacing_is_honoured_by_both_calculators():
+    """kspacing must actually change the mesh, not just be accepted."""
+    si = _si()
+    coarse = SlaKoNetCalculator(model, kspacing=1.0, device=DEVICE)
+    fine = SlaKoNetCalculator(model, kspacing=0.2, device=DEVICE)
+    assert coarse.kpoints_for(si) != fine.kpoints_for(si)
+    assert all(n >= 8 for n in fine.kpoints_for(si))
+
+    other = SlakoNetCalculator(
+        model=model, kspacing=0.2, kpoints_array=[1, 1, 1], device=DEVICE
+    )
+    assert other.kpoints_for(si) == fine.kpoints_for(si)
+
+
+def test_metal_gap_vanishes_on_a_converged_mesh():
+    """fcc Al is a metal; a coarse mesh invents a gap for it."""
+    al = bulk("Al", "fcc", a=4.05)
+    al.calc = SlaKoNetCalculator(
+        model,
+        kspacing=0.15,
+        device=DEVICE,
+        compute_forces=False,
+        compute_stress=False,
+    )
+    al.get_potential_energy()
+    assert al.calc.get_bandgap() == pytest.approx(0.0, abs=1e-6)

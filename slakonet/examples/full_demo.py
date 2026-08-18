@@ -490,7 +490,8 @@ def task_scc_charges(atoms, model, out):
 
 def task_optimize(atoms, model, out, fmax=0.05, steps=20):
     ase_atoms = atoms.ase_converter()
-    ase_atoms.calc = SlakoNetCalculator(model=model, fmax=None)
+    # fmax belongs to the optimizer (opt.run below), not the calculator.
+    ase_atoms.calc = SlakoNetCalculator(model=model)
     E_before = float(ase_atoms.get_potential_energy())
     positions_before = ase_atoms.get_positions().copy()
     cell_before = np.array(ase_atoms.get_cell()).copy()
