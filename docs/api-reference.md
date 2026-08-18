@@ -16,7 +16,22 @@ Loads (and caches on first use) the trained SlaKoNet model covering 65
 elements. Call once; reuse the returned object everywhere. Often used as
 `default_model().float()`.
 
-### `default_mu(full=False)`
+Pass `model_name=` to pick a specific parameter set:
+
+| Name | Elements | Notes |
+| --- | --- | --- |
+| `slakonet_v0` | 64 | Original universal set (paper v1) |
+| `slakonet_v1` | 75 | Second-generation set; widest coverage, over-stiff EOS |
+| `slakonet_v1a` | 64 | Default. Untrained H/S, untouched repulsive bar 496 refit pairs |
+| `slakonet_base75` | 75 | Untrained reference tables over their full element range |
+| `slakonet_v1a_full` | 75 | `v1a` overlaid on `slakonet_base75` |
+
+The last two are built locally rather than downloaded, from the
+reference skf files on [Zenodo](https://zenodo.org/records/14289468) —
+see `slakonet/examples/build_v1a_extended.py` and `build_v1a_full.py`.
+They land in the same cache directory as the downloaded sets.
+
+### `default_mu(full=False, model_name=None)`
 
 ```python
 from slakonet.optim import default_mu
@@ -25,7 +40,9 @@ meta = default_mu(full=True)   # full record incl. calibration metadata
 ```
 
 Returns the per-element chemical potentials bundled with SlaKoNet, used
-for formation energies. See [Formation energies](guide/formation-energy.md).
+for formation energies. They are calibrated per parameter set, so
+`model_name` must match the set the energies come from. See
+[Formation energies](guide/formation-energy.md).
 
 ## `slakonet.ase_calc`
 

@@ -57,6 +57,48 @@ except ImportError:
 os.environ["PYTHONHASHSEED"] = str(random_seed)
 
 
+def _restore_r_spline(pair_key, r_spline_data, skf_dict):
+    """Rebuild a pair's repulsive spline when loading a compact model.
+
+    Two copies of the repulsive can live in an ultra-compact file:
+
+    * ``r_spline_data[pair_key]`` -- written by ``save_ultra_compact``
+      from the live ``optimizer.r_spline``, so it reflects any repulsive
+      refit. Tensors.
+    * ``skf_dict["r_spline"]`` -- the untouched copy carried along inside
+      ``skf_metadata``, straight from the SKF file. Plain lists/floats.
+
+    Older files only populate the first for the pairs whose repulsive was
+    refit -- slakonet_v1a stores 496 of 4096 -- and the loader used to
+    leave ``optimizer.r_spline`` at None for the other 3600, H-H among
+    them, even though the spline was sitting in ``skf_metadata`` all
+    along. Energies were unaffected (``get_updated_skf`` falls back to
+    ``skf_dict["r_spline"]`` on its own), but anything reading
+    ``optimizer.r_spline`` directly -- repulsive refits, coverage
+    diagnostics, ``save_ultra_compact`` -- saw a model that looked like
+    it had almost no repulsive. Prefer the refit copy, fall back to the
+    SKF copy, and only give up when neither is present.
+
+    Returns an ``Skf.RSpline`` or None.
+    """
+    src = r_spline_data.get(pair_key)
+    if not src:
+        src = (skf_dict or {}).get("r_spline")
+    if not src:
+        return None
+
+    def _t(value):
+        return torch.as_tensor(value).type(torch.get_default_dtype())
+
+    return Skf.RSpline(
+        grid=_t(src["grid"]),
+        cutoff=_t(src["cutoff"]),
+        spline_coef=_t(src["spline_coef"]),
+        exp_coef=_t(src["exp_coef"]),
+        tail_coef=_t(src["tail_coef"]),
+    )
+
+
 def set_debug_mode(deterministic=True, detect_anomaly=True):
     """Opt in to bit-reproducible + anomaly-checked execution.
 
@@ -535,17 +577,9 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             optimizer.atom_pair = skf_dict.get("atom_pair", None)
             optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
 
-            if pair_key in r_spline_data:
-                rspl_data = r_spline_data[pair_key]
-                optimizer.r_spline = Skf.RSpline(
-                    grid=rspl_data["grid"],
-                    cutoff=rspl_data["cutoff"],
-                    spline_coef=rspl_data["spline_coef"],
-                    exp_coef=rspl_data["exp_coef"],
-                    tail_coef=rspl_data["tail_coef"],
-                )
-            else:
-                optimizer.r_spline = None
+            optimizer.r_spline = _restore_r_spline(
+                pair_key, r_spline_data, skf_dict
+            )
 
             instance.skf_optimizers[pair_key] = optimizer
         print(f"⏱️  Optimizer creation took: {time.time()-t5:.2f}s")
@@ -676,17 +710,9 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             optimizer.atom_pair = skf_dict.get("atom_pair", None)
             optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
 
-            if pair_key in r_spline_data:
-                rspl_data = r_spline_data[pair_key]
-                optimizer.r_spline = Skf.RSpline(
-                    grid=rspl_data["grid"],
-                    cutoff=rspl_data["cutoff"],
-                    spline_coef=rspl_data["spline_coef"],
-                    exp_coef=rspl_data["exp_coef"],
-                    tail_coef=rspl_data["tail_coef"],
-                )
-            else:
-                optimizer.r_spline = None
+            optimizer.r_spline = _restore_r_spline(
+                pair_key, r_spline_data, skf_dict
+            )
 
             instance.skf_optimizers[pair_key] = optimizer
 
@@ -1370,17 +1396,9 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
 
             # Restore r_spline if it exists
-            if pair_key in r_spline_data:
-                rspl_data = r_spline_data[pair_key]
-                optimizer.r_spline = Skf.RSpline(
-                    grid=rspl_data["grid"],
-                    cutoff=rspl_data["cutoff"],
-                    spline_coef=rspl_data["spline_coef"],
-                    exp_coef=rspl_data["exp_coef"],
-                    tail_coef=rspl_data["tail_coef"],
-                )
-            else:
-                optimizer.r_spline = None
+            optimizer.r_spline = _restore_r_spline(
+                pair_key, r_spline_data, skf_dict
+            )
 
             instance.skf_optimizers[pair_key] = optimizer
 
@@ -1394,8 +1412,13 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         t2 = time.time()
 
         print(f"✅ Compact model loaded from: {load_file}")
-        if r_spline_data:
-            print(f"   Restored r_spline for {len(r_spline_data)} pairs")
+        n_rspl = sum(
+            1
+            for opt in instance.skf_optimizers.values()
+            if opt.r_spline is not None
+        )
+        if n_rspl:
+            print(f"   Restored r_spline for {n_rspl} pairs")
         print(f"Total time: {t2 - t1:.2f}s")
         return instance
 
@@ -1484,19 +1507,9 @@ class MultiElementSkfParameterOptimizer(nn.Module):
             optimizer.hs_cutoff = skf_dict.get("hs_cutoff", None)
 
             # ADD: Restore r_spline if it exists
-            if pair_key in r_spline_data:
-                from slakonet.skf import Skf
-
-                rspl_data = r_spline_data[pair_key]
-                optimizer.r_spline = Skf.RSpline(
-                    grid=rspl_data["grid"],
-                    cutoff=rspl_data["cutoff"],
-                    spline_coef=rspl_data["spline_coef"],
-                    exp_coef=rspl_data["exp_coef"],
-                    tail_coef=rspl_data["tail_coef"],
-                )
-            else:
-                optimizer.r_spline = None
+            optimizer.r_spline = _restore_r_spline(
+                pair_key, r_spline_data, skf_dict
+            )
 
             instance.skf_optimizers[pair_key] = optimizer
 
@@ -1505,8 +1518,13 @@ class MultiElementSkfParameterOptimizer(nn.Module):
         t2 = time.time()
 
         print(f"✅ Compact model loaded from: {load_file}")
-        if r_spline_data:
-            print(f"   Restored r_spline for {len(r_spline_data)} pairs")
+        n_rspl = sum(
+            1
+            for opt in instance.skf_optimizers.values()
+            if opt.r_spline is not None
+        )
+        if n_rspl:
+            print(f"   Restored r_spline for {n_rspl} pairs")
         print("Time taken:", round(t2 - t1, 3))
         return instance
 
@@ -3432,6 +3450,32 @@ SLAKONET_MODELS = {
         "md5": "c656fc974849858342257efed25508cb",
         "description": "Refined v1 parameter set (v1a).",
     },
+    "slakonet_base75": {
+        "build_script": "slakonet/examples/build_v1a_extended.py",
+        "description": (
+            "Untrained reference Slater-Koster tables over all 75 elements "
+            "they cover. Built locally from the skf files at "
+            "https://zenodo.org/records/14289468 ."
+        ),
+    },
+    "slakonet_v1a_full": {
+        "build_script": "slakonet/examples/build_v1a_full.py",
+        "description": (
+            "v1a over the full 75-element range: untrained H/S everywhere, "
+            "untouched repulsive except the 496 pairs v1a refit. Built "
+            "locally."
+        ),
+    },
+    "slakonet_v2": {
+        "build_script": "slakonet/examples/fit_onsite_gaps.py",
+        "description": (
+            "v1a_full with per-element on-site shifts fitted to ChIPS-TB "
+            "band gaps. Held-out gap MAE 0.41 eV vs 0.63 for v1a_full; the "
+            "equation of state is NOT improved and its stiffness bias is "
+            "somewhat worse, so prefer v1a_full for energetics until the "
+            "repulsive is refit. Built locally."
+        ),
+    },
 }
 
 # Default parameter set; override with the SLAKONET_MODEL env variable.
@@ -3441,13 +3485,20 @@ DEFAULT_MODEL_NAME = os.environ.get("SLAKONET_MODEL", "slakonet_v1a")
 def model_download_url(model_name):
     """Figshare download URL for a registered parameter set."""
     try:
-        file_id = SLAKONET_MODELS[model_name]["file_id"]
+        entry = SLAKONET_MODELS[model_name]
     except KeyError:
         raise ValueError(
             f"Unknown SlakoNet model '{model_name}'. "
             f"Available: {sorted(SLAKONET_MODELS)}"
         )
-    return f"https://ndownloader.figshare.com/files/{file_id}"
+    if "file_id" not in entry:
+        raise ValueError(
+            f"'{model_name}' is not published on Figshare; it is built "
+            f"locally from the other sets. Run "
+            f"`python {entry['build_script']}` and it will land in the "
+            f"slakonet cache directory."
+        )
+    return f"https://ndownloader.figshare.com/files/{entry['file_id']}"
 
 
 def default_model(dir_path=None, model_name=None, elements=None, prefer=None):

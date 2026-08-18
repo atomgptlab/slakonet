@@ -77,11 +77,51 @@ Parameter sets are downloaded from
 [Figshare](https://figshare.com/articles/dataset/SlakoNet_parameters/30122215)
 on first use and cached under `~/.cache/atomgptlab/slakonet/`.
 
-| Name | Description |
-| --- | --- |
-| `slakonet_v0` | Original universal parameter set (paper v1) |
-| `slakonet_v1` | Second-generation universal parameter set |
-| `slakonet_v1a` | Refined v1 parameter set |
+| Name | Elements | Description |
+| --- | --- | --- |
+| `slakonet_v0` | 64 | Original universal parameter set (paper v1) |
+| `slakonet_v1` | 75 | Second-generation universal parameter set |
+| `slakonet_v1a` | 64 | Refined v1 parameter set (default) |
+| `slakonet_base75` | 75 | Untrained reference tables; built locally |
+| `slakonet_v1a_full` | 75 | `v1a` over the full range; built locally |
+| `slakonet_v2` | 75 | `v1a_full` + on-site shifts fitted to ChIPS-TB gaps; built locally |
+
+`slakonet_v1a` is an untrained Slater-Koster set: its H/S are
+bit-identical to the reference tables it was built from, and its
+repulsive is too apart from 496 pairs that were refit. Nothing was
+retrained away from anything else, which is what keeps its equations of
+state physical — Si `B0` = 101 GPa against 89 GPa DFT, where
+`slakonet_v1`'s retrained H/S give 9261 GPa for Al against 69 GPa DFT.
+What `v1a` lacks is reach: it stops at the 64 elements with Z ≤ 65,
+while the reference tables cover 75.
+
+`slakonet_v1a_full` closes that gap without giving up `v1a`: untrained
+H/S for all 5625 pairs, untouched repulsive everywhere except the 496
+pairs `v1a` refit. It reproduces `v1a` energies exactly on shared
+chemistry and adds He, Ne, Ar, Kr, Xe, Rn, Po, At, Ra, Th and Lu. Build
+it from the reference skf files
+([Zenodo](https://zenodo.org/records/14289468) → `complete_set/`):
+
+```bash
+python slakonet/examples/build_v1a_extended.py \
+    --skf-dir /path/to/complete_set --name slakonet_base75
+python slakonet/examples/build_v1a_full.py
+```
+
+Without the skf files, `--base slakonet_v1` merges from the cached sets
+instead, at the cost of `v1`'s retrained parameters for those elements.
+
+`slakonet_v2` adds per-element on-site energy shifts fitted against
+ChIPS-TB band gaps (`slakonet/examples/fit_onsite_gaps.py`). On materials
+held out of the fit it cuts gap MAE from 0.63 to 0.41 eV. It does **not**
+improve the equation of state — bulk-modulus MAE is flat and the
+stiffness bias grows — so use `slakonet_v1a_full` where energetics
+matter, until the repulsive is refit to match. Score any set with:
+
+```bash
+python slakonet/examples/chipstb_eval.py --model slakonet_v2 --kspacing 0.2
+python slakonet/examples/chipstb_compare.py --ours chipstb_eval_slakonet_v2.csv
+```
 
 ```python
 from slakonet.optim import default_model

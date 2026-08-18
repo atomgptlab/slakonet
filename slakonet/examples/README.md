@@ -53,6 +53,14 @@ is the building block for the million-atom regime.
 | --- | --- |
 | `mgb2_fermi_bands.py` | MgB2 (the 39 K superconductor) end-to-end demo of four analyses, matplotlib-only: **(1)** band structure + DOS along a k-path (`-> MgB2_bands_dos.png`); **(2)** 3D band structure — bands near E_F as surfaces over the Brillouin zone (`-> MgB2_bands3d.png`); **(3)** 2D Fermi surface — E=0 contours of the Fermi-crossing bands at kz=0 (`-> MgB2_fermi2d.png`); **(4)** 3D Fermi surface — isosurfaces extracted with marching cubes on a full 3D k-mesh (`-> MgB2_fermi3d.png`, needs `scikit-image`). One shared `kmesh_eigs` helper runs SlaKoNet on a Cartesian k-grid; the model is loaded once. Mirrors the analyses in the SlaKoNet web backend. |
 
+## Parameter-set building
+
+| script | what it does |
+| --- | --- |
+| `build_v1a_extended.py` | Builds a model straight from a directory of reference `.skf` files ([Zenodo](https://zenodo.org/records/14289468)), over all 75 elements they cover. `--check slakonet_v1a` verifies the shared pairs against the cached v1a (they match to 0.000e+00 — v1a's H/S are the untrained tables). |
+| `build_v1a_full.py` | Builds `slakonet_v1a_full` by overlaying `slakonet_v1a` onto the 75-element untrained set: `v1a` wins on all 4096 pairs it defines (so energies match `v1a` exactly, and its 496 refit repulsive splines are preserved), the base fills the other 1529. Result: untrained H/S everywhere, over the full 75-element range. Writes into the slakonet cache, so `default_model("slakonet_v1a_full")` finds it. |
+| `recalibrate_mu.py` | Recalibrate per-element chemical potentials against a given parameter set (they are model-specific). |
+
 ## Training / model building / SKF tooling (developer-oriented)
 
 These build or refit Slater–Koster files, repulsive splines, and
