@@ -118,6 +118,7 @@ class SlaKoNetCalculator(Calculator):
         shell_dict=None,
         *,
         kpoints=None,
+        klines=None,
         kspacing: Optional[float] = None,
         cutoff: Optional[float] = None,
         kT: Optional[float] = None,
@@ -174,7 +175,37 @@ class SlaKoNetCalculator(Calculator):
             cfg = cfg.model_copy(update=overrides)
         self.cfg = cfg
 
+        # A band path and a Brillouin-zone mesh are different objects and
+        # only one can be in force. Silently defaulting to the mesh when a
+        # path was asked for would answer a question nobody posed, so
+        # requesting more than one is an error rather than a precedence
+        # rule to memorise.
+        given = [
+            name
+            for name, val in (
+                ("kpoints", kpoints),
+                ("klines", klines),
+                ("kspacing", kspacing),
+            )
+            if val is not None
+        ]
+        if len(given) > 1:
+            raise ValueError(
+                f"give only one of kpoints, klines, kspacing (got "
+                f"{', '.join(given)}). kpoints/kspacing sample the "
+                f"Brillouin zone for energies; klines walks a band path "
+                f"for eigenvalues and H/S."
+            )
+
         self.kpoints = tuple(cfg.kpoints)
+        # Band path, as (n_segments, 7) rows [k1(3), k2(3), n_points], the
+        # layout slakonet.optim.kpts_to_klines produces. None means the
+        # calculator is in mesh mode.
+        self.klines = (
+            None
+            if klines is None
+            else torch.as_tensor(klines).type(torch.get_default_dtype())
+        )
         # Density-based mesh, as in SlakoNetCalculator.kpoints_for. Taken
         # straight from **kw before, which meant ASE's base Calculator
         # silently absorbed it and every structure kept the fixed mesh --
@@ -230,6 +261,19 @@ class SlaKoNetCalculator(Calculator):
         self, atoms=None, properties=("energy",), system_changes=all_changes
     ):
         Calculator.calculate(self, atoms, properties, system_changes)
+
+        if self.klines is not None:
+            # A band path is not a Brillouin-zone quadrature: its points
+            # are unweighted and follow high-symmetry lines, so occupations
+            # and any energy built on them would be wrong. Refuse rather
+            # than return a number that looks plausible.
+            raise ValueError(
+                "this calculator was built with klines (a band path), "
+                "which cannot integrate the Brillouin zone. Use "
+                "get_HS()/band_structure() for eigenvalues and H/S, or "
+                "construct a second calculator with kpoints=/kspacing= "
+                "for energies, forces and stress."
+            )
 
         geo = Geometry.from_ase_atoms([self.atoms])
         sim = SimpleDftb(
@@ -447,7 +491,7 @@ class SlaKoNetCalculator(Calculator):
             dos.detach().cpu().numpy(),
         )
 
-    def get_HS(self, atoms=None, kpoints=None):
+    def get_HS(self, atoms=None, kpoints=None, klines=None):
         """k-resolved Hamiltonian and overlap matrices.
 
         Returns ``(H, S)`` as numpy arrays of shape
@@ -462,14 +506,39 @@ class SlaKoNetCalculator(Calculator):
 
         `kpoints` overrides the calculator's Monkhorst-Pack mesh for this
         call only, e.g. ``get_HS(kpoints=(1, 1, 1))`` for Gamma only.
+
+        `klines` instead evaluates H(k)/S(k) along an explicit band path,
+        as (n_segments, 7) rows ``[k1(3), k2(3), n_points]``. It defaults
+        to the path given to the constructor, so::
+
+            kp = Kpoints3D().kpath(atoms, line_density=20)
+            calc = SlaKoNetCalculator(model, klines=kpts_to_klines(kp.kpts))
+            H, S = calc.get_HS(atoms.ase_converter())
+
+        returns the matrices at every point along that path.
         """
         atoms = atoms if atoms is not None else self.atoms
-        mesh = list(kpoints) if kpoints is not None else list(self.kpoints)
+        if kpoints is not None and klines is not None:
+            raise ValueError("give only one of kpoints, klines")
+        if klines is None and kpoints is None:
+            klines = self.klines  # constructor path, if any
+
+        if klines is not None:
+            kl = torch.as_tensor(klines).type(torch.get_default_dtype())
+            k_arg = {"klines": kl if kl.dim() == 3 else kl.unsqueeze(0)}
+        else:
+            mesh = (
+                list(kpoints)
+                if kpoints is not None
+                else self.kpoints_for(atoms)
+            )
+            k_arg = {"kpoints": torch.tensor(list(mesh))}
+
         geo = Geometry.from_ase_atoms([atoms])
         sim = SimpleDftb(
             geo,
             self.model,
-            kpoints=torch.tensor(mesh),
+            **k_arg,
             device=self.device,
             with_eigenvectors=False,
             compute_forces=False,

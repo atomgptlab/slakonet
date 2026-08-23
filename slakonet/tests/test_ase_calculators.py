@@ -227,3 +227,44 @@ def test_metal_gap_vanishes_on_a_converged_mesh():
     )
     al.get_potential_energy()
     assert al.calc.get_bandgap() == pytest.approx(0.0, abs=1e-6)
+
+
+def _klines_for(atoms, line_density=10):
+    from jarvis.core.atoms import ase_to_atoms
+    from jarvis.core.kpoints import Kpoints3D
+    from slakonet.optim import kpts_to_klines
+
+    kp = Kpoints3D().kpath(ase_to_atoms(atoms), line_density=line_density)
+    return kpts_to_klines(kp.kpts, default_points=2)
+
+
+def test_get_HS_along_klines():
+    """klines must give H/S at every point of the band path."""
+    si = _si()
+    kl = _klines_for(si)
+    calc = SlaKoNetCalculator(model, klines=kl, device=DEVICE)
+    H, S = calc.get_HS(si)
+    n_k = len(kl) * 2  # default_points=2 per segment
+    assert H.shape == (n_k, S.shape[-1], S.shape[-1])
+    assert H.shape == S.shape
+    # S must stay Hermitian positive-definite along the whole path
+    assert np.allclose(S[0], S[0].conj().T, atol=1e-8)
+    assert np.linalg.eigvalsh(S[0]).min() > 0
+
+
+def test_klines_and_mesh_are_mutually_exclusive():
+    """A band path and a BZ mesh cannot both be in force."""
+    kl = _klines_for(_si())
+    with pytest.raises(ValueError, match="only one of"):
+        SlaKoNetCalculator(model, kpoints=KPTS, klines=kl, device=DEVICE)
+    with pytest.raises(ValueError, match="only one of"):
+        SlaKoNetCalculator(model, klines=kl, kspacing=0.2, device=DEVICE)
+
+
+def test_klines_calculator_refuses_energies():
+    """A band path is not a quadrature; energies from it would be wrong."""
+    si = _si()
+    calc = SlaKoNetCalculator(model, klines=_klines_for(si), device=DEVICE)
+    si.calc = calc
+    with pytest.raises(ValueError, match="cannot integrate"):
+        si.get_potential_energy()
