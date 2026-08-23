@@ -144,16 +144,39 @@ def fermi_search(
     k_weights: torch.Tensor = None,
     kT: float = 0.01,
     max_iter: int = 80,
+    gap_tol: float = 0.05,
 ):
     """
     Robust Fermi energy solver using bisection, including k-point weights.
 
     Args
     ----
-    eigenvalues : tensor [..., kpoints, orbitals]  (in Hartree)
+    eigenvalues : tensor [..., kpoints, orbitals]
     n_electrons : float or tensor (total electron count)
     k_weights   : tensor [..., kpoints]
-    kT          : electronic temperature in eV
+    kT          : electronic temperature, **in the same unit as
+                  ``eigenvalues``** (SimpleDftb passes eV eigenvalues and a
+                  kT in eV).
+    gap_tol     : a band-index gap wider than this (same unit as
+                  ``eigenvalues``) is treated as an insulator.
+
+    Notes
+    -----
+    Two things this has to get right, both of which used to be wrong:
+
+    * **Units.** ``kT`` is applied directly, not divided by ``H2E``.
+      ``SimpleDftb`` converts eigenvalues to eV before calling this, so
+      the old Hartree conversion shrank the smearing by a factor 27.2
+      (0.025 eV -> 0.92 meV).
+    * **Gapped systems.** With the electron count satisfied anywhere in
+      the gap, ``n(mu)`` is a flat plateau and the bisection root is not
+      unique -- at small kT the occupancies clamp to exactly 0 and 1, so
+      which end of the plateau you land on is decided by floating-point
+      noise.  The old tie-break (``n_mid > n_electrons`` false -> raise
+      ``mu_low``) walked mu to the top of the plateau, pinning E_F to the
+      conduction band minimum.  Insulators are now resolved by convention
+      to mid-gap, from band-index counting, and bisection is used only
+      where the count actually varies with mu.
     """
     device = eigenvalues.device
     dtype = eigenvalues.dtype
@@ -178,26 +201,64 @@ def fermi_search(
     else:
         k_weights = k_weights.to(device=device, dtype=dtype)
 
-    # Convert kT from eV to Hartree if needed; here H2E is Hartree->eV
-    # so kT_H = kT / H2E
-    kT_H = torch.tensor(kT / H2E, device=device, dtype=dtype)
+    # kT is taken in the eigenvalue unit -- see the note in the docstring.
+    kT_e = torch.tensor(float(kT), device=device, dtype=dtype)
 
     # Helper: Fermi-Dirac with clamped exponent for numerical stability
     def fermi_dirac_local(E, mu):
         # occupancy = 1 / (exp((E - mu)/kT) + 1)
-        x = (E - mu) / kT_H
+        x = (E - mu) / kT_e
         # clamp to avoid overflow/underflow
         x = torch.clamp(x, -50.0, 50.0)
         return 1.0 / (torch.exp(x) + 1.0)
 
+    # ------------------------------------------------------------------
+    # Insulators: resolve the plateau by convention rather than by noise.
+    # For a non-spin-polarised system the lowest n_electrons/2 bands are
+    # occupied at every k, so VBM = max_k band[nv-1], CBM = min_k band[nv].
+    # If those are separated, every mu in between reproduces the electron
+    # count and the bisection root is degenerate; return mid-gap.
+    # ------------------------------------------------------------------
+    nel_flat = n_electrons.flatten()
+    if nel_flat.numel() == 1:
+        nel_scalar = float(nel_flat[0].item())
+        nv = int(round(nel_scalar / 2.0))
+        n_bands = eig.shape[-1]
+        # Only meaningful when the electrons fill a whole number of doubly
+        # occupied bands.  An odd count is a half-filled band, i.e. metallic
+        # by construction, and must go to the bisection.
+        even = abs(nel_scalar - 2.0 * nv) < 1e-9
+        if even and 0 < nv < n_bands:
+            eig_sorted, _ = torch.sort(eig, dim=-1)
+            vbm = eig_sorted[..., nv - 1].amax(dim=-1)
+            cbm = eig_sorted[..., nv].amin(dim=-1)
+            if bool(((cbm - vbm) > gap_tol).all()):
+                mu_gap = 0.5 * (vbm + cbm)
+                # Guard: mid-gap must actually reproduce the electron count.
+                # Band-index counting assumes the lowest nv bands are the
+                # occupied ones at every k; if some other level intrudes
+                # (overlapping bands, a partially filled manifold) it will
+                # not, and the bisection is the right answer.
+                x = torch.clamp(
+                    (eig - mu_gap.reshape(*orig_shape, 1, 1)) / kT_e,
+                    -50.0,
+                    50.0,
+                )
+                occ = 1.0 / (torch.exp(x) + 1.0)
+                n_gap = 2.0 * (occ * k_weights.unsqueeze(-1)).sum(
+                    dim=(-1, -2)
+                )
+                if bool((torch.abs(n_gap - nel_scalar) < 1e-6).all()):
+                    # same shape convention as the bisection return below
+                    return mu_gap.unsqueeze(-1)
+
     # Compute a bracket [mu_low, mu_high] that surely contains Fermi level
-    # Work in Hartree units (eigenvalues already are)
     emin = eig.amin(dim=(-1, -2), keepdim=True)
     emax = eig.amax(dim=(-1, -2), keepdim=True)
 
     # Extend bracket slightly beyond the band edges
-    mu_low = emin - 10.0 * kT_H
-    mu_high = emax + 10.0 * kT_H
+    mu_low = emin - 10.0 * kT_e
+    mu_high = emax + 10.0 * kT_e
 
     # Bisection iterations
     for _ in range(max_iter):
