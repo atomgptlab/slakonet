@@ -53,6 +53,14 @@ is the building block for the million-atom regime.
 | --- | --- |
 | `mgb2_fermi_bands.py` | MgB2 (the 39 K superconductor) end-to-end demo of four analyses, matplotlib-only: **(1)** band structure + DOS along a k-path (`-> MgB2_bands_dos.png`); **(2)** 3D band structure — bands near E_F as surfaces over the Brillouin zone (`-> MgB2_bands3d.png`); **(3)** 2D Fermi surface — E=0 contours of the Fermi-crossing bands at kz=0 (`-> MgB2_fermi2d.png`); **(4)** 3D Fermi surface — isosurfaces extracted with marching cubes on a full 3D k-mesh (`-> MgB2_fermi3d.png`, needs `scikit-image`). One shared `kmesh_eigs` helper runs SlaKoNet on a Cartesian k-grid; the model is loaded once. Mirrors the analyses in the SlaKoNet web backend. |
 
+## SlaKoNetDB (Hamiltonian/overlap database)
+
+| script | what it does |
+| --- | --- |
+| `slakonetdb_record.py` | Builds one database record: real-space `H(R)`/`S(R)` plus bands, DOS, gap, VBM/CBM, Fermi level, total and formation energy. Archives `H(R)`, not `H(k)`: a uniform Gamma-centred mesh is invertible, so the real-space blocks reproduce **any** k afterwards, while a band path only ever reproduces itself. Two gates decide whether a record is usable, and both are stored. `recon_err` rebuilds `H` at an off-mesh k and compares against a direct evaluation -- the mesh is grown until that holds, since the geometric estimate (`N_i >= 2*cutoff/d_i + 1`, from the *interplanar spacing*, not `|a_i|`) is a lower bound rather than a guarantee. `min_eig_S` rejects a non-positive-definite overlap: `H c = e S c` is then not a valid eigenproblem, and the solver returns eigenvalues reaching 1e5 eV alongside a perfectly plausible band gap. |
+| `slakonetdb_run.py` | Shard runner: one Slurm array task processes a stride slice of the hull-stable set, resumable (skips existing records), logging one JSON line per structure. |
+| `slakonetdb.slurm` | Slurm array template. Pins `OMP_NUM_THREADS` per task -- torch and BLAS otherwise each grab every core and the tasks thrash -- and sets `--mem` per task, without which Slurm hands each task the whole node and only one runs per node. |
+
 ## Parameter-set building
 
 | script | what it does |
