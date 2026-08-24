@@ -11,6 +11,11 @@ import numpy as np
 
 
 def runnable_jids(model_elements, ehull_max=1e-6):
+    """Structures this model can represent, optionally hull-filtered.
+
+    ``ehull_max=float("inf")`` takes the whole database; the default keeps
+    only what sits on the convex hull.
+    """
     from jarvis.db.figshare import data
 
     out = []
@@ -35,6 +40,13 @@ def main():
     ap.add_argument("--model", default="slakonet_v1a_full")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--max-atoms", type=int, default=40)
+    ap.add_argument(
+        "--ehull-max",
+        type=float,
+        default=1e-6,
+        help="keep structures with ehull <= this (eV/atom). Pass inf for "
+        "the whole database rather than the hull-stable subset.",
+    )
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
 
@@ -55,7 +67,7 @@ def main():
     elements = set(model.elements_in_system)
     mu = default_mu(model_name=a.model)
 
-    rows = runnable_jids(elements)
+    rows = runnable_jids(elements, ehull_max=a.ehull_max)
     rows = [r for r in rows if len(r["atoms"]["elements"]) <= a.max_atoms]
     if a.limit:
         rows = rows[: a.limit]
