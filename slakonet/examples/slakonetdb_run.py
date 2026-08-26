@@ -10,26 +10,37 @@ import traceback
 import numpy as np
 
 
-def runnable_jids(model_elements, ehull_max=1e-6):
-    """Structures this model can represent, optionally hull-filtered.
+def dataset_rows(dataset, model_elements, ehull_max=1e-6, id_key=None):
+    """Structures a model can represent, from any jarvis-tools dataset.
 
-    ``ehull_max=float("inf")`` takes the whole database; the default keeps
-    only what sits on the convex hull.
+    Datasets differ in schema: ``dft_3d`` keys records by ``jid`` and
+    carries ``ehull`` plus DFT reference properties, while
+    ``alex_pbe_hull`` keys by ``id``, is on-hull by construction and
+    carries only total energies. Both the id field and the hull filter
+    are therefore discovered rather than assumed, so a dataset without
+    ``ehull`` is not silently emptied by the filter.
     """
     from jarvis.db.figshare import data
 
+    rows = data(dataset)
+    if id_key is None:
+        first = rows[0]
+        id_key = "jid" if "jid" in first else "id"
+    has_ehull = "ehull" in rows[0]
+
     out = []
-    for r in data("dft_3d"):
-        try:
-            e = float(r.get("ehull"))
-        except (TypeError, ValueError):
-            continue
-        if np.isnan(e) or e > ehull_max:
-            continue
+    for r in rows:
+        if has_ehull and np.isfinite(ehull_max):
+            try:
+                e = float(r.get("ehull"))
+            except (TypeError, ValueError):
+                continue
+            if np.isnan(e) or e > ehull_max:
+                continue
         if set(r["atoms"]["elements"]) <= model_elements:
             out.append(r)
-    out.sort(key=lambda r: r["jid"])  # deterministic sharding
-    return out
+    out.sort(key=lambda r: str(r[id_key]))  # deterministic sharding
+    return out, id_key, has_ehull
 
 
 def main():
@@ -37,6 +48,7 @@ def main():
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--nshards", type=int, default=1)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--dataset", default="dft_3d")
     ap.add_argument("--model", default="slakonet_v1a_full")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--max-atoms", type=int, default=40)
@@ -67,7 +79,14 @@ def main():
     elements = set(model.elements_in_system)
     mu = default_mu(model_name=a.model)
 
-    rows = runnable_jids(elements, ehull_max=a.ehull_max)
+    rows, id_key, has_ehull = dataset_rows(
+        a.dataset, elements, ehull_max=a.ehull_max
+    )
+    print(
+        f"[*] dataset {a.dataset}: id field '{id_key}', "
+        f"ehull filter {'applied' if has_ehull else 'not available'}",
+        flush=True,
+    )
     rows = [r for r in rows if len(r["atoms"]["elements"]) <= a.max_atoms]
     if a.limit:
         rows = rows[: a.limit]
@@ -82,7 +101,7 @@ def main():
     done = 0
     with open(logp, "a") as log:
         for i, r in enumerate(mine, 1):
-            jid = r["jid"]
+            jid = str(r[id_key])
             dest = os.path.join(a.out, f"{jid}.npz")
             if os.path.exists(dest):  # resumable
                 continue
@@ -90,18 +109,28 @@ def main():
             try:
                 at = Atoms.from_dict(r["atoms"]).ase_converter()
                 rec = build_record(at, model, device=a.device, mu=mu)
+                # Carry whichever reference fields this dataset actually
+                # has; absent ones stay absent rather than becoming null
+                # columns that look like missing measurements.
                 meta = dict(
                     jid=jid,
+                    dataset=a.dataset,
                     formula=at.get_chemical_formula(),
                     natoms=len(at),
                     model=a.model,
-                    ehull=r.get("ehull"),
-                    ref_gap_optb88vdw=r.get("optb88vdw_bandgap"),
-                    ref_gap_mbj=r.get("mbj_bandgap"),
-                    ref_eform=r.get("formation_energy_peratom"),
-                    ref_bulk_modulus=r.get("bulk_modulus_kv"),
-                    spg=r.get("spg_number"),
                 )
+                for src, dst in (
+                    ("ehull", "ehull"),
+                    ("optb88vdw_bandgap", "ref_gap_optb88vdw"),
+                    ("mbj_bandgap", "ref_gap_mbj"),
+                    ("formation_energy_peratom", "ref_eform"),
+                    ("bulk_modulus_kv", "ref_bulk_modulus"),
+                    ("spg_number", "spg"),
+                    ("energy_total", "ref_energy_total"),
+                    ("energy_corrected", "ref_energy_corrected"),
+                ):
+                    if src in r:
+                        meta[dst] = r[src]
                 write_record(dest, rec, meta)
                 log.write(
                     json.dumps(
