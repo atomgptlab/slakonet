@@ -61,6 +61,12 @@ is the building block for the million-atom regime.
 | `slakonetdb_run.py` | Shard runner: one Slurm array task processes a stride slice of the hull-stable set, resumable (skips existing records), logging one JSON line per structure. |
 | `slakonetdb.slurm` | Slurm array template. Pins `OMP_NUM_THREADS` per task -- torch and BLAS otherwise each grab every core and the tasks thrash -- and sets `--mem` per task, without which Slurm hands each task the whole node and only one runs per node. |
 
+## Export to wannier90 / WannierTools
+
+| script | what it does |
+| --- | --- |
+| `python -m slakonet.hr_export --jid JVASP-1002 --check --wt` | Writes a `wannier90_hr.dat` so a SlaKoNet Hamiltonian can be read by WannierTools, WannierBerri or postw90, plus a `wt.in` template. Two corrections matter. **The basis is orthogonalised first**: `hr.dat` assumes `S = I`, so writing the non-orthogonal `H(R)` directly discards `S` and yields plausible but wrong bands; Löwdin (`H' = S^-1/2 H S^-1/2`) leaves the eigenvalues of `Hc = eSc` exactly unchanged. **The mesh is grown past the `H(R)` estimate**: `S^-1/2` is not short-ranged, so `H'(R)` reaches further than the Slater–Koster interaction — on Si the mesh giving `H(R)` a 1e-7 eV error leaves 6e-2 eV of `H'(R)` on the R-star edge and the bands are off by 5 meV. `--edge-tol` (default 1e-4 eV) drives the growth; metals need it tighter. `--check` re-reads the written file and compares against the generalised solve at off-mesh k-points. |
+
 ## Parameter-set building
 
 | script | what it does |
