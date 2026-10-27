@@ -139,6 +139,10 @@ class SimpleDftb:
         scc_max_iter=60,
         scc_mixing=0.2,
         scc_tol=1e-5,
+        # True: original SCC (U of the highest-l shell, Klopman-Ohno gamma
+        # inside the cell, linear mixing). False: occupied-shell U, periodic
+        # DFTB gamma (Ewald) and Anderson mixing.
+        scc_legacy=False,
         # shell_dict=None,
         # h_feed=None,
         # s_feed=None,
@@ -268,6 +272,7 @@ class SimpleDftb:
         self.scc_max_iter = scc_max_iter
         self.scc_mixing = scc_mixing
         self.scc_tol = scc_tol
+        self.scc_legacy = scc_legacy
         self._scc_info = None
 
     def _generate_shell_dict_from_skfs(self):
@@ -525,7 +530,9 @@ class SimpleDftb:
             if Z <= 0:
                 U_list.append(0.0)
                 continue
-            u = atom_U_from_skf(self.updated_skfs, Z, self.shell_dict)
+            u = atom_U_from_skf(
+                self.updated_skfs, Z, self.shell_dict, legacy=self.scc_legacy
+            )
             U_list.append(u if u is not None else 0.0)
         U_atom = torch.tensor(U_list, dtype=torch.float64, device=self.device)
 
@@ -558,6 +565,12 @@ class SimpleDftb:
             mixing=self.scc_mixing,
             tol=self.scc_tol,
             verbose=False,
+            cell_bohr=(
+                self.geometry.cell[0]
+                if self.geometry.is_periodic and not self.scc_legacy
+                else None
+            ),
+            legacy=self.scc_legacy,
         )
         self._scc_info = {
             "delta_q": info["delta_q"],

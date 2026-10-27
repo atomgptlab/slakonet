@@ -13,6 +13,8 @@ setuptools.setup(
     author_email="kchoudh2@jhu.edu",
     description="slakonet",
     install_requires=requirements,
+    # slakonet -> TB2J exchange (slakonet.tb2j_interface, slakonet.tb2j_ncl)
+    extras_require={"magnetism": ["TB2J>=0.9.19"]},
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/atomgptlab/slakonet",
@@ -23,6 +25,7 @@ setuptools.setup(
         "console_scripts": [
             "predict_slakonet=slakonet.predict_slakonet:main",
             "train_slakonet=slakonet.train_slakonet:main",
+            "slakonet2J=slakonet.tb2j_interface:main",
         ]
     },
     classifiers=[

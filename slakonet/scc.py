@@ -56,12 +56,149 @@ def build_gamma_matrix(positions_bohr, U_per_atom):
     return gamma
 
 
+def _slater_short_range(r, tau_a, tau_b):
+    """Short-range part S(r) = 1/r - gamma(r) of the DFTB (Elstner et al.,
+    PRB 58, 7260 (1998)) Slater-type gamma, tau = 16/5 U. Decays as exp(-tau r).
+    r > 0 (Bohr); tau_a, tau_b scalars (1/Bohr)."""
+    import numpy as np
+
+    if abs(tau_a - tau_b) < 1e-4:
+        tau = 0.5 * (tau_a + tau_b)
+        return np.exp(-tau * r) * (
+            1.0 / r + 11.0 * tau / 16.0 + 3.0 * tau**2 * r / 16.0 + tau**3 * r**2 / 48.0
+        )
+
+    def part(ta, tb):
+        d = ta**2 - tb**2
+        return np.exp(-ta * r) * (
+            tb**4 * ta / (2.0 * d**2) - (tb**6 - 3.0 * tb**4 * ta**2) / (d**3 * r)
+        )
+
+    return part(tau_a, tau_b) + part(tau_b, tau_a)
+
+
+def _lattice_translations(cell, rmax):
+    """Integer translations n with |n @ cell| possibly < rmax (+ cell diagonal)."""
+    import numpy as np
+
+    inv = np.linalg.inv(cell)
+    nmax = np.ceil(rmax * np.linalg.norm(inv, axis=0)).astype(int) + 1
+    grid = np.stack(
+        np.meshgrid(*[np.arange(-n, n + 1) for n in nmax], indexing="ij"), -1
+    ).reshape(-1, 3)
+    return grid
+
+
+def build_gamma_matrix_periodic(positions_bohr, cell_bohr, U_per_atom, tol=1e-10):
+    """Periodic DFTB gamma matrix (Hartree).
+
+        gamma_AB = sum_T' 1/|r_AB + T|  (Ewald, neutralising background)
+                   - sum_T' S(|r_AB + T|)  (Slater short range, absolutely convergent)
+                   + delta_AB U_A
+
+    The primed sums skip T = 0 for A = B. The background constant cancels in
+    the SCC energy and potential because sum_A Delta q_A = 0.
+
+    Parameters
+    ----------
+    positions_bohr : Tensor [Natom, 3]
+    cell_bohr      : Tensor [3, 3]  lattice vectors as rows
+    U_per_atom     : Tensor [Natom]  Hubbard U (Hartree), all > 0
+    """
+    import numpy as np
+    from scipy.special import erfc
+
+    pos = np.asarray(positions_bohr.detach().cpu(), dtype=float)
+    cell = np.asarray(torch.as_tensor(cell_bohr).detach().cpu(), dtype=float).reshape(3, 3)
+    U = np.asarray(U_per_atom.detach().cpu(), dtype=float)
+    if (U <= 0).any():
+        raise ValueError(f"Periodic gamma needs U > 0 on every atom, got {U.tolist()}")
+    tau = 16.0 / 5.0 * U
+    natom = len(pos)
+    volume = abs(np.linalg.det(cell))
+
+    # --- Ewald sum of 1/r -------------------------------------------------
+    alpha = np.sqrt(np.pi) / volume ** (1.0 / 3.0)
+    log_tol = -np.log(tol)
+    r_real = np.sqrt(log_tol) / alpha
+    g_max = 2.0 * alpha * np.sqrt(log_tol)
+    T = _lattice_translations(cell, r_real) @ cell                   # [nT, 3]
+    recip = 2.0 * np.pi * np.linalg.inv(cell).T                       # rows b_i
+    G = _lattice_translations(recip, g_max) @ recip
+    G2 = (G * G).sum(-1)
+    keep = (G2 > 1e-12) & (G2 < g_max**2)
+    G, G2 = G[keep], G2[keep]
+    G_weight = 4.0 * np.pi / volume * np.exp(-G2 / (4.0 * alpha**2)) / G2
+
+    phi = np.zeros((natom, natom))
+    for a in range(natom):
+        for b in range(natom):
+            d = np.linalg.norm(pos[b] - pos[a] + T, axis=1)
+            d = d[d > 1e-8]
+            phi[a, b] = (
+                (erfc(alpha * d) / d).sum()
+                + (G_weight * np.cos(G @ (pos[b] - pos[a]))).sum()
+                - np.pi / (volume * alpha**2)
+            )
+        phi[a, a] -= 2.0 * alpha / np.sqrt(np.pi)
+
+    # --- Slater short-range correction ------------------------------------
+    r_short = (log_tol + 10.0) / tau.min()
+    T_short = _lattice_translations(cell, r_short) @ cell
+    short = np.zeros((natom, natom))
+    for a in range(natom):
+        for b in range(natom):
+            d = np.linalg.norm(pos[b] - pos[a] + T_short, axis=1)
+            d = d[(d > 1e-8) & (d < r_short)]
+            short[a, b] = _slater_short_range(d, tau[a], tau[b]).sum()
+
+    gamma = phi - short + np.diag(U)
+    return torch.as_tensor(0.5 * (gamma + gamma.T), dtype=torch.float64)
+
+
+class AndersonMixer:
+    """Anderson (Pulay) mixing for a fixed-point problem x = f(x).
+
+    ``x_next = mixer(x_in, x_out)``. The history of the last ``history``
+    input vectors and residuals F = x_out - x_in is combined to minimise the
+    residual, then a fraction ``alpha`` of it is added.
+    """
+
+    def __init__(self, alpha=0.2, history=6, regularization=1e-10):
+        self.alpha = alpha
+        self.history = history
+        self.regularization = regularization
+        self._x, self._f = [], []
+
+    def __call__(self, x_in, x_out):
+        x_in = x_in.to(torch.float64)
+        f = x_out.to(torch.float64) - x_in
+        self._x.append(x_in.clone())
+        self._f.append(f.clone())
+        if len(self._x) > self.history:
+            self._x.pop(0)
+            self._f.pop(0)
+        if len(self._x) == 1:
+            return x_in + self.alpha * f
+        dF = torch.stack([f - fi for fi in self._f[:-1]])          # [m, n]
+        A = dF @ dF.T
+        A = A + self.regularization * torch.trace(A).clamp_min(1e-30) * torch.eye(len(A), dtype=A.dtype)
+        theta = torch.linalg.solve(A, dF @ f)
+        x_bar = x_in - theta @ torch.stack([x_in - xi for xi in self._x[:-1]])
+        f_bar = f - theta @ dF
+        return x_bar + self.alpha * f_bar
+
+
 # ---------------------------------------------------------------------------
 # Atom-level helpers
 # ---------------------------------------------------------------------------
-def atom_U_from_skf(updated_skfs, Z, shell_dict):
-    """Pick a single Hubbard U per atom: the U of the highest-l shell present
-    in the atom's basis. Returns Hartree."""
+def atom_U_from_skf(updated_skfs, Z, shell_dict, legacy=False):
+    """Pick a single Hubbard U per atom (Hartree).
+
+    Default: the U of the highest-l shell of the basis that is occupied in
+    the free atom (O, F -> p; 3d metals -> d). ``legacy=True`` keeps the old
+    rule, the highest-l shell of the basis, which gives U = 0 for anions whose
+    basis carries an empty d shell."""
     from jarvis.core.specie import atomic_numbers_to_symbols
     sym = atomic_numbers_to_symbols([Z])[0]
     pair = f"{sym}-{sym}"
@@ -74,6 +211,12 @@ def atom_U_from_skf(updated_skfs, Z, shell_dict):
     if us is None:
         return None
     shells = shell_dict.get(int(Z), [0])
+    if not legacy:
+        occ = ad.get("occupations")
+        if occ is not None:
+            occupied = [l for l in shells if l < len(occ) and float(occ[l]) > 0]
+            if occupied:
+                shells = occupied
     # U is stored in SKF in order of shells available; pick the one matching
     # the highest-l shell the basis uses.
     l_max = max(shells)
@@ -148,7 +291,7 @@ def mulliken_atom_charges(C, S_k, occ, k_weights, on_atoms, Natom):
 def scc_solve(
     H0, S, basis, positions_bohr, U_per_atom, q_ref, nelectron,
     k_weights, kT_Ha=0.001, max_iter=60, mixing=0.2, tol=1e-5,
-    verbose=False,
+    verbose=False, cell_bohr=None, legacy=False,
 ):
     """Iterate delta_q to self-consistency.
 
@@ -160,6 +303,11 @@ def scc_solve(
     nelectron      : scalar (total valence electrons)
     k_weights      : [Nk]
     kT_Ha          : Fermi smearing in Hartree for the Fermi search
+    cell_bohr      : [3, 3] lattice vectors (rows). If given (and not
+                     legacy), the periodic DFTB gamma with Ewald summation
+                     is used; otherwise the cluster Klopman-Ohno gamma.
+    legacy         : True reproduces the original scheme (Klopman-Ohno
+                     gamma inside the cell, linear mixing).
     Returns dict with keys:
         eigenvalues [Nband, Nk] (Ha), eigenvectors, occupations [Nband, Nk],
         delta_q [Natom], E_scc (Ha), converged (bool)
@@ -174,7 +322,13 @@ def scc_solve(
     # orbital -> atom index lookup
     orb_to_atom = on_atoms.to(device).long()
 
-    gamma = build_gamma_matrix(positions_bohr, U_per_atom).to(device)
+    if cell_bohr is not None and not legacy:
+        gamma = build_gamma_matrix_periodic(
+            positions_bohr, cell_bohr, U_per_atom
+        ).to(device)
+    else:
+        gamma = build_gamma_matrix(positions_bohr, U_per_atom).to(device)
+    mixer = None if legacy else AndersonMixer(alpha=mixing)
 
     delta_q = torch.zeros(Natom, dtype=torch.float64, device=device)
 
@@ -210,7 +364,10 @@ def scc_solve(
         if verbose:
             print(f"[SCC] iter {it:3d}  |dq|_inf={diff:.3e}  "
                   f"delta_q={delta_q_new.tolist()}")
-        delta_q = (1.0 - mixing) * delta_q + mixing * delta_q_new
+        if mixer is None:
+            delta_q = (1.0 - mixing) * delta_q + mixing * delta_q_new
+        else:
+            delta_q = mixer(delta_q.cpu(), delta_q_new.cpu()).to(device)
         if diff < tol:
             converged = True
             break
@@ -253,6 +410,8 @@ def _solve_mu(evals, k_weights, n_target, kT):
 
 __all__ = [
     "build_gamma_matrix",
+    "build_gamma_matrix_periodic",
+    "AndersonMixer",
     "atom_U_from_skf",
     "reference_charges",
     "mulliken_atom_charges",

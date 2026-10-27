@@ -53,6 +53,25 @@ is the building block for the million-atom regime.
 | --- | --- |
 | `mgb2_fermi_bands.py` | MgB2 (the 39 K superconductor) end-to-end demo of four analyses, matplotlib-only: **(1)** band structure + DOS along a k-path (`-> MgB2_bands_dos.png`); **(2)** 3D band structure — bands near E_F as surfaces over the Brillouin zone (`-> MgB2_bands3d.png`); **(3)** 2D Fermi surface — E=0 contours of the Fermi-crossing bands at kz=0 (`-> MgB2_fermi2d.png`); **(4)** 3D Fermi surface — isosurfaces extracted with marching cubes on a full 3D k-mesh (`-> MgB2_fermi3d.png`, needs `scikit-image`). One shared `kmesh_eigs` helper runs SlaKoNet on a Cartesian k-grid; the model is loaded once. Mirrors the analyses in the SlaKoNet web backend. |
 
+## Magnetic exchange and magnons (slakonet → TB2J)
+
+Need `pip install TB2J`. Background and equations:
+`docs/guide/magnetic-exchange.md` and `docs/magnetism-technical-report.md`.
+
+| script | what it does |
+| --- | --- |
+| `fe2o3_soc_dmi.py` | **Non-collinear / SOC.** α-Fe2O3 (hematite) in its neutron-scattering AFM order: converges the collinear Stoner + U + SCC model, adds on-site ζL·S (ζ3d from NIST), runs TB2J `ExchangeNCL` with the spin axis along x, y and z and merges them into J_iso, symmetric J_ani and DMI per shell. J3/J4 ≈ +36/+27 meV (INS +32/+25), D = 0 on centrosymmetric bonds, D_ij = −D_ji. `--no-soc` checks that D = J_ani = 0 without SOC; `--quick` for a smoke test. ~1–2 min. |
+| `tb2j_benchmark.py` | Collinear J of the experimental benchmark set against INS spin-wave fits (needs the benchmark database). |
+
+The `slakonet2J` command (installed with the package) runs the collinear
+workflow on a structure file; `slakonet2J --help` lists the options.
+
+Research scripts used to fit the U table and to train the SK corrections
+on in-house VASP DFT+U data (they need that data; read them before running):
+`fit_stoner_table.py`, `fit_with_dft.py`, `collect_dft_exchange.py`,
+`collect_round4.py`, `analyze_dft_uscan.py`, `analyze_round4.py`,
+`train_spin_bands.py`, `analyze_spin_training.py`.
+
 ## Training / model building / SKF tooling (developer-oriented)
 
 These build or refit Slater–Koster files, repulsive splines, and

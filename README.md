@@ -213,6 +213,30 @@ better than 0.5% for bulk Si and SiC), so cell relaxation with
 `slakonet/examples/slakonet_calculator_example.py`. See also the ASE docs
 page *Calculators -> SlaKoNet*.
 
+## Magnetic exchange, DMI and magnons (via TB2J)
+
+SlaKoNet can build a spin-polarized tight-binding model of a 3d magnet and
+pass it to [TB2J](https://github.com/mailhexu/TB2J). TB2J then gives the
+exchange constants J_ij and the magnon spectrum. With spin-orbit coupling it
+also gives the anisotropic exchange and the DMI. The model is an atomic
+Stoner exchange plus a Dudarev +U on the d shell, with self-consistent
+charges. U comes from a table per ligand class, fitted to experimental
+exchange constants, so there is nothing to tune.
+
+```bash
+pip install "slakonet[magnetism]"
+slakonet2J NiO_afm.vasp --elements Ni --magmoms 2 -2 0 0 --magnon   # Ni Ni O O
+```
+
+```python
+from slakonet.tb2j_ncl import gen_exchange_slakonet_soc   # J_iso, J_ani, DMI
+merged, spin_model = gen_exchange_slakonet_soc(atoms, ["Fe"], initial_moments=m0)
+```
+
+- Example: `slakonet/examples/fe2o3_soc_dmi.py`
+- User guide: `docs/guide/magnetic-exchange.md`
+- Equations, data, training and benchmarks: `docs/magnetism-technical-report.md`
+
 ## Supported Materials
 
 - **Elements**: Z = 1-65
@@ -268,7 +292,8 @@ SlakoNet employs a neural network to learn distance-dependent Slater-Koster para
 - Trained on specific meta-GGA DFT (TBmBJ)
 - Discrepancies in conduction band descriptions
 - No self-consistent cycle
-- No spin-orbit coupling or magnetic properties
+- Magnetism: collinear spin polarization on the 3d shell, and spin-orbit
+  coupling only as an on-site, one-shot term (see Magnetic exchange below)
 
 ## Citation
 

@@ -99,8 +99,10 @@ nav:
       - Fermi surfaces: guide/fermi-surface.md
       - Band-gap screening: guide/bandgap-screening.md
       - Formation energies: guide/formation-energy.md
+      - Magnetic exchange (TB2J): guide/magnetic-exchange.md
   - Reference:
       - How it works: methodology.md
+      - "Magnetism: technical report": magnetism-technical-report.md
       - Performance: performance.md
       - API reference: api-reference.md
       - FAQ: faq.md
