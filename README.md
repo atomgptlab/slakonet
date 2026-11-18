@@ -281,6 +281,50 @@ sparse solver is the only option.
 
 ![SlakoNet timing](https://github.com/atomgptlab/slakonet/blob/main/slakonet/examples/timing.png)
 
+### Large cells: cube-and-halo mode
+
+For energies and forces of large periodic cells, `cube_halo=True` cuts
+the cell into cubes of about `cube` Å, solves each cube together with a
+`halo` Å halo as a finite cluster, and keeps the cube's share of the band
+energy and electrons, with one Fermi level for the whole cell
+(`slakonet/cube_halo.py`). H and S are assembled sparsely, so GPU memory
+is set by one piece and time grows linearly with the number of atoms.
+
+```python
+from ase.build import bulk
+from slakonet.optim import default_model
+from slakonet.ase_calc import SlaKoNetCalculator
+
+si = bulk("Si", "diamond", a=5.43, cubic=True).repeat(23)  # 97,336 atoms
+si.calc = SlaKoNetCalculator(default_model().float(), cube_halo=True,
+                             halo=8.0)
+si.get_potential_energy(); si.get_forces()
+```
+
+Unlike the halo of a message-passing force field this is an
+approximation: the error falls with the halo width. Against an exact
+calculation of 1,728 rattled Si atoms (Gamma point):
+
+| halo (Å) | energy error (meV/atom) | force RMSE (meV/Å) |
+| ---: | ---: | ---: |
+| 4 | 34–60 | 71–83 |
+| 6 | 6–10 | 10–13 |
+| 8 | 2.5–4.5 | 4–6 |
+| 10 | 0.7–0.9 | 1.8–2.0 |
+
+On one NVIDIA GB10, 97,336 Si atoms (8 Å halo, 1,728 pieces of up to
+1,000 atoms, float32 eigensolves) took 2.2 h for the energy and 4.5 h
+with forces, with 2.6 GB peak GPU memory; the dense path stops at 2,744
+atoms (energy) and 1,728 atoms (forces) on the same machine. Converge the
+halo for your system: metals and cells with gap states need wider halos.
+The mode is Gamma-like (`kpoints` is ignored), non-SCC, and gives no
+stress. `SparseSlakoNet.gamma_exact` in the same module gives the exact
+single-k-point result for a whole cell with sparse assembly (~10x faster
+and ~3x less memory than the dense path at 1,728 atoms).
+
+Note that `kpoints=(1, 1, 1)` in the dense path samples
+k = (1/2, 1/2, 1/2), not Gamma.
+
 ## Output Properties
 
 - Band structures along high-symmetry k-paths

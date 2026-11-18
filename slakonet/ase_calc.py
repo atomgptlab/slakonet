@@ -22,6 +22,11 @@ Example
     si.get_stress()                     # eV/Ang^3 Voigt(6) -- see note
     bs = calc.band_structure(si, path="GXWKGL", npoints=120)
     e, d = calc.dos(si)
+
+    # large periodic cells (10^4-10^5+ atoms): cube-and-halo mode
+    big = bulk("Si", "diamond", a=5.43, cubic=True).repeat(23)
+    big.calc = SlaKoNetCalculator(model, cube_halo=True, halo=8.0)
+    big.get_potential_energy(); big.get_forces()
 """
 
 from __future__ import annotations
@@ -66,6 +71,16 @@ class SlaKoNetConfig(BaseModel):
     compute_stress: bool = True  # needs compute_forces + periodic
     include_dos: bool = False
     device: Optional[str] = None
+    # Cube-and-halo mode for large periodic cells (slakonet.cube_halo):
+    # the cell is cut into cubes of about ``cube`` A, each solved with a
+    # ``halo`` A halo, with one Fermi level. Memory is set by one piece,
+    # time grows linearly with N. Gamma-like (kpoints is ignored), no
+    # stress, non-SCC; an approximation whose error falls with ``halo``
+    # (Si: ~4 meV/atom and ~5 meV/A at 8 A, <1 meV/atom at 10 A).
+    cube_halo: bool = False
+    halo: float = 8.0  # Angstrom
+    cube: float = 10.0  # target cube edge, Angstrom
+    halo_eig_dtype: str = "float32"  # float32 is ~4x faster on GB10
 
     model_config = {"extra": "forbid"}
 
@@ -107,6 +122,12 @@ class SlaKoNetCalculator(Calculator):
         include_dos: also compute DOS during ``calculate`` (else use the
             on-demand ``dos()`` method).
         device: 'cuda' / 'cpu' (auto if None).
+        cube_halo: large-cell mode (``slakonet.cube_halo``): cubes of
+            about ``cube`` A each solved with a ``halo`` A halo and one
+            Fermi level; memory set by one piece, time linear in N.
+            Gamma-like (kpoints ignored), energy and forces only.
+        halo, cube: halo width and target cube edge in Angstrom.
+        halo_eig_dtype: 'float32' (default, ~4x faster) or 'float64'.
     """
 
     implemented_properties = ["energy", "free_energy", "forces", "stress"]
@@ -129,6 +150,10 @@ class SlaKoNetCalculator(Calculator):
         compute_stress: Optional[bool] = None,
         include_dos: Optional[bool] = None,
         device: Optional[str] = None,
+        cube_halo: Optional[bool] = None,
+        halo: Optional[float] = None,
+        cube: Optional[float] = None,
+        halo_eig_dtype: Optional[str] = None,
         **kw,
     ):
         """``config`` may be a ``SlaKoNetConfig``, a dict, a JSON path,
@@ -168,6 +193,10 @@ class SlaKoNetCalculator(Calculator):
                 compute_stress=compute_stress,
                 include_dos=include_dos,
                 device=device,
+                cube_halo=cube_halo,
+                halo=halo,
+                cube=cube,
+                halo_eig_dtype=halo_eig_dtype,
             ).items()
             if v is not None
         }
@@ -275,6 +304,10 @@ class SlaKoNetCalculator(Calculator):
                 "for energies, forces and stress."
             )
 
+        if self.cfg.cube_halo:
+            self._calculate_cube_halo()
+            return
+
         geo = Geometry.from_ase_atoms([self.atoms])
         sim = SimpleDftb(
             geo,
@@ -321,6 +354,61 @@ class SlaKoNetCalculator(Calculator):
                 r["dos_values_tensor"].detach().cpu().numpy(),
             )
         self._last_result = r
+
+    # ---- cube-and-halo mode ----------------------------------------------
+    def _calculate_cube_halo(self):
+        """Energy/forces by cube-and-halo (``cube_halo=True``)."""
+        from slakonet.cube_halo import SparseSlakoNet
+
+        atoms = self.atoms
+        if not np.all(atoms.get_pbc()):
+            raise ValueError("cube_halo=True needs a cell periodic in x, y, z")
+        cfg = self.cfg
+        syms = tuple(sorted(set(atoms.get_chemical_symbols())))
+        dtype = getattr(torch, cfg.halo_eig_dtype)
+        key = (syms, self.device, cfg.cutoff, dtype)
+        if getattr(self, "_halo_key", None) != key:
+            self._halo = SparseSlakoNet(
+                self.model,
+                syms,
+                device=self.device,
+                cutoff=cfg.cutoff,
+                eig_dtype=dtype,
+            )
+            self._halo_key = key
+        # cubes per axis: edge close to cfg.cube, and box + 2 halo < cell
+        cell = np.array(atoms.cell)
+        vol = abs(np.linalg.det(cell))
+        heights = vol / np.linalg.norm(
+            np.cross(cell[[1, 2, 0]], cell[[2, 0, 1]]), axis=1
+        )
+        ncubes = []
+        for h in heights:
+            n = max(1, int(round(h / cfg.cube)))
+            while 1.0 / n + 2.0 * cfg.halo / h >= 1.0 and n < 1000:
+                n += 1
+            if 1.0 / n + 2.0 * cfg.halo / h >= 1.0:
+                raise ValueError(
+                    f"cell height {h:.1f} A is too small for a "
+                    f"{cfg.halo} A halo; use the default (dense) mode"
+                )
+            ncubes.append(n)
+        r = self._halo.cube_halo(
+            atoms,
+            ncubes=tuple(ncubes),
+            halo=cfg.halo,
+            kT=cfg.kT,
+            forces=cfg.compute_forces,
+        )
+        self.results["energy"] = r["energy"]
+        self.results["free_energy"] = r["energy"]
+        if cfg.compute_forces:
+            self.results["forces"] = r["forces"]
+        self.results["fermi_energy"] = r["mu"]
+        self.results["cube_halo"] = {
+            k: r[k] for k in ("n_pieces", "max_piece_atoms", "seconds", "mu")
+        }
+        self.results["cube_halo"]["ncubes"] = tuple(ncubes)
 
     # ---- band structure --------------------------------------------------
     def band_structure(

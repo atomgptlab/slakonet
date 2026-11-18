@@ -114,6 +114,7 @@ def hs_matrix_sparse(
     coalesce: bool = True,
     kpoint=None,
     assembly: str = "direct",
+    return_coo: bool = False,
 ) -> Tensor:
     """Assemble a sparse (Norb x Norb) H or S matrix.
 
@@ -135,6 +136,10 @@ def hs_matrix_sparse(
         assembly: ``"direct"`` (default, vectorized shell-pair scatter,
             bit-exact and 10-75x faster) or ``"pairwise"`` (per-species-
             pair dense ``hs_matrix`` reuse, kept as a slow reference).
+        return_coo: return ``(rows, cols, values, n_orb)`` instead of a
+            sparse tensor. Duplicate (row, col) entries are not summed;
+            ``values`` keeps the autograd graph to the positions (used by
+            ``slakonet.cube_halo`` for forces).
 
     Returns:
         torch.sparse_coo_tensor (Norb, Norb); real if finite, complex if
@@ -179,6 +184,8 @@ def hs_matrix_sparse(
     if src.numel() == 0:
         idx = torch.empty(2, 0, dtype=torch.long, device=device)
         val = torch.empty(0, dtype=out_dtype, device=device)
+        if return_coo:
+            return idx[0], idx[1], val, n_orb
         H = torch.sparse_coo_tensor(idx, val, (n_orb, n_orb))
         return H.coalesce() if coalesce else H
 
@@ -227,9 +234,11 @@ def hs_matrix_sparse(
             # keep only the off-diagonal atom0xatom1 sub-block. Robust but
             # carries large Python/Tensor overhead from Basis construction.
             n0 = int(n_per_atom[e_src][0])
-            an_b = torch.tensor(
-                [[Zi, Zj]], device=device, dtype=torch.long
-            ).expand(E, 2).contiguous()
+            an_b = (
+                torch.tensor([[Zi, Zj]], device=device, dtype=torch.long)
+                .expand(E, 2)
+                .contiguous()
+            )
             zero = torch.zeros(E, 1, 3, device=device, dtype=dtype)
             pos_b = torch.cat([zero, e_r.view(E, 1, 3)], dim=1)
             geom_b = Geometry(an_b, pos_b, units="bohr")
@@ -246,8 +255,13 @@ def hs_matrix_sparse(
             R = (gi[:, None, None] + roff[None, :, None]).expand(E, ni, nj)
             C = (gj[:, None, None] + coff[None, None, :]).expand(E, ni, nj)
             _emit(
-                rows_all, cols_all, vals_all,
-                R, C, blk, periodic,
+                rows_all,
+                cols_all,
+                vals_all,
+                R,
+                C,
+                blk,
+                periodic,
                 ph_all[em].to(out_dtype) if periodic else None,
             )
 
@@ -274,9 +288,7 @@ def hs_matrix_sparse(
                 t += 2 * int(l) + 1
             gi_atom = atom_orb_start[e_src]
             gj_atom = atom_orb_start[e_dst]
-            ph_group = (
-                ph_all[em].to(out_dtype) if periodic else None
-            )
+            ph_group = ph_all[em].to(out_dtype) if periodic else None
 
             for slot_i, l1 in enumerate(ls_i):
                 l1 = int(l1)
@@ -302,9 +314,7 @@ def hs_matrix_sparse(
                             integrals, dtype=dtype, device=device
                         )
                     else:
-                        integrals = integrals.to(
-                            dtype=dtype, device=device
-                        )
+                        integrals = integrals.to(dtype=dtype, device=device)
                     if integrals.dim() == 1:
                         integrals = integrals.unsqueeze(-1)
                     integrals = integrals[..., :n_int]
@@ -328,8 +338,14 @@ def hs_matrix_sparse(
                         gj_loc[:, None, None] + coff_l[None, None, :]
                     ).expand(E, ni, nj)
                     _emit(
-                        rows_all, cols_all, vals_all,
-                        Rl, Cl, block, periodic, ph_group,
+                        rows_all,
+                        cols_all,
+                        vals_all,
+                        Rl,
+                        Cl,
+                        block,
+                        periodic,
+                        ph_group,
                     )
 
         else:
@@ -347,6 +363,8 @@ def hs_matrix_sparse(
     rows = torch.cat(rows_all)
     cols = torch.cat(cols_all)
     vals = torch.cat(vals_all)
+    if return_coo:
+        return rows, cols, vals, n_orb
     H = torch.sparse_coo_tensor(
         torch.stack([rows, cols]), vals, (n_orb, n_orb)
     )
@@ -413,13 +431,13 @@ def solve_near_gap(
     scale = abs(sigma) + 1.0
     w = v = None
     for j in range(6):
-        s = sigma if j == 0 else sigma + (1e-9 * scale) * (2 ** j) * (
-            -1 if j % 2 else 1
+        s = (
+            sigma
+            if j == 0
+            else sigma + (1e-9 * scale) * (2**j) * (-1 if j % 2 else 1)
         )
         try:
-            w, v = eigsh(
-                H, k=k, M=S, sigma=s, which="LM", mode="normal"
-            )
+            w, v = eigsh(H, k=k, M=S, sigma=s, which="LM", mode="normal")
             break
         except RuntimeError as e:
             if "singular" not in str(e).lower() or j == 5:
